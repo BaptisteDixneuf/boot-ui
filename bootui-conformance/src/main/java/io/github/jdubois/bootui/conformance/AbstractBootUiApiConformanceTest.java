@@ -87,6 +87,27 @@ public abstract class AbstractBootUiApiConformanceTest {
 
     private static final String NO_CACHE = "no-cache";
 
+    @Test
+    void communityFeedbackIsOffByDefaultAndKeepsCanonicalErrorsWithoutEgress() {
+        assumeTrue(isPanelUsableInLiveManifest("runtime-insights"));
+        BootUiHttpProbe probe = probe();
+        Response status = probe.get(api("/runtime-insights/feedback"));
+        assertThat(status.status()).isEqualTo(200);
+        assertThat(status.json().path("enabled").asBoolean()).isFalse();
+        Response disabled = probe.get(api("/runtime-insights/feedback/aggregate?kind=repeated-selects"));
+        assertThat(disabled.status()).isEqualTo(503);
+        assertThat(disabled.json().path("error").asText()).isEqualTo("Community feedback is not configured.");
+        Response invalid = probe.get(api("/runtime-insights/feedback/aggregate?kind=unknown"));
+        assertThat(invalid.status()).isEqualTo(400);
+        assertThat(invalid.json().path("error").asText()).isEqualTo("Unknown insight check.");
+        Map<String, String> headers = new HashMap<>(stateChangingHeaders(probe));
+        headers.put("Content-Type", "application/json");
+        Response invalidVote = probe.request(
+                "POST", api("/runtime-insights/feedback/vote"), headers, "{\"kind\":\"repeated-selects\",\"stars\":6}");
+        assertThat(invalidVote.status()).isEqualTo(400);
+        assertThat(invalidVote.json().path("error").asText()).isEqualTo("Invalid insight feedback.");
+    }
+
     private static final Pattern BUILT_ASSET =
             Pattern.compile("(?:src|href)=\"\\./(assets/[^\"]+-[A-Za-z0-9_-]{8,}\\.[^\"]+)\"");
 

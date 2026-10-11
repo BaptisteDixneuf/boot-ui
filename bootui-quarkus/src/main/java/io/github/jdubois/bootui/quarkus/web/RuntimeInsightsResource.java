@@ -1,5 +1,10 @@
 package io.github.jdubois.bootui.quarkus.web;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import io.github.jdubois.bootui.core.dto.InsightFeedbackAggregateDto;
+import io.github.jdubois.bootui.core.dto.InsightFeedbackVoteDto;
 import io.github.jdubois.bootui.core.dto.RuntimeChangeImpactDto;
 import io.github.jdubois.bootui.core.dto.RuntimeImpactSymbolsDto;
 import io.github.jdubois.bootui.core.dto.RuntimeInsightsReportDto;
@@ -7,6 +12,7 @@ import io.github.jdubois.bootui.core.dto.RuntimeObservationDetailDto;
 import io.github.jdubois.bootui.core.dto.RuntimeResourceProfileDto;
 import io.github.jdubois.bootui.core.dto.RuntimeRunComparisonDto;
 import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
+import io.github.jdubois.bootui.engine.feedback.InsightFeedbackService;
 import io.github.jdubois.bootui.engine.insights.ChangeImpactService;
 import io.github.jdubois.bootui.engine.insights.InsightsStack;
 import io.github.jdubois.bootui.engine.insights.ResourceProfileService;
@@ -33,6 +39,7 @@ import io.github.jdubois.bootui.spi.BeanProvider;
 import io.github.jdubois.bootui.spi.MappingProvider;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
@@ -40,8 +47,11 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import org.eclipse.microprofile.config.Config;
 
 /**
@@ -49,16 +59,26 @@ import org.eclipse.microprofile.config.Config;
  * adapters, served at {@code GET /runtime-insights} and {@code GET /runtime-insights/insights/{id}}, with the run
  * comparison at {@code GET /runtime-insights/comparison}. These are pure reads of what the runtime journal and the run
  * history already hold; only {@code POST /runtime-insights/resource-profile}, which the developer triggers, starts a
- * bounded JFR session. Quarkus records no transactions, so the observations that place
+ * bounded JFR session. The separately configured feedback actions may contact Azure only when requested.
+ * Quarkus records no transactions, so the observations that place
  * work in transactions report themselves not applicable.
  */
 @Path("/bootui/api/runtime-insights")
 public class RuntimeInsightsResource {
 
+    private static final System.Logger LOG = System.getLogger(RuntimeInsightsResource.class.getName());
+    private static final JsonMapper FEEDBACK_MAPPER = JsonMapper.builder()
+            .enable(
+                    DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES,
+                    DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES,
+                    DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
+            .build();
     private final RuntimeInsightsService insights;
     private final RunComparisonService comparison;
     private final ChangeImpactService impact;
     private final ResourceProfileService profile;
+    private final InsightFeedbackService feedback;
 
     @Inject
     public RuntimeInsightsResource(
@@ -151,6 +171,62 @@ public class RuntimeInsightsResource {
                 limit -> codeInventory.isResolvable() ? codeInventory.get().changesWithAccess(limit) : null,
                 wanted -> codePaths.isResolvable() ? codePaths.get().methodRoutes(wanted) : null);
         this.insights.setCodePathsService(() -> codePaths.isResolvable() ? codePaths.get() : null);
+        this.feedback = new InsightFeedbackService(
+                config.getOptionalValue("bootui.runtime-insights.feedback-endpoint", String.class)
+                        .orElse(null),
+                () -> insights.report().checks());
+    }
+
+    @GET
+    @Path("/feedback")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Map<String, Boolean> feedbackStatus() {
+        return Map.of("enabled", feedback.enabled());
+    }
+
+    @GET
+    @Path("/feedback/aggregate")
+    @Produces(MediaType.APPLICATION_JSON)
+    public CompletableFuture<Response> feedbackAggregate(@QueryParam("kind") String kind) {
+        try {
+            return feedback.aggregate(kind).thenApply(exchange -> feedbackResponse(exchange, kind));
+        } catch (IllegalArgumentException e) {
+            return CompletableFuture.completedFuture(Response.status(400)
+                    .entity(Map.of("error", "Unknown insight check."))
+                    .build());
+        }
+    }
+
+    @POST
+    @Path("/feedback/vote")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public CompletableFuture<Response> feedbackVote(InsightFeedbackVoteDto vote) {
+        try {
+            return feedback.vote(vote).thenApply(exchange -> feedbackResponse(exchange, vote.kind()));
+        } catch (IllegalArgumentException e) {
+            return CompletableFuture.completedFuture(Response.status(400)
+                    .entity(Map.of("error", "Invalid insight feedback."))
+                    .build());
+        }
+    }
+
+    static Response feedbackResponse(InsightFeedbackService.Exchange exchange, String kind) {
+        if (exchange.status() != 200) {
+            return Response.status(exchange.status())
+                    .entity(Map.of("error", InsightFeedbackService.errorMessage(exchange.status())))
+                    .build();
+        }
+        try {
+            return Response.ok(InsightFeedbackService.validateAggregate(
+                            FEEDBACK_MAPPER.readValue(exchange.json(), InsightFeedbackAggregateDto.class), kind))
+                    .build();
+        } catch (JsonProcessingException | IllegalArgumentException e) {
+            LOG.log(System.Logger.Level.WARNING, "Community feedback returned an invalid aggregate.");
+            return Response.status(502)
+                    .entity(Map.of("error", "Community feedback returned an invalid response."))
+                    .build();
+        }
     }
 
     /**

@@ -128,6 +128,13 @@ jobs:
       - name: Check Maven formatting
         run: ./mvnw -B -ntp spotless:check
 
+      - name: Test optional insight feedback Function without deployment
+        working-directory: infrastructure/insight-feedback/function
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          bash -n ../provision.sh
+
       # -T 1C: one reactor thread per available CPU core. Safe because every module that triggers Quarkus
       # build-time augmentation declares an explicit provided-scope dependency on bootui-quarkus-deployment
       # (so the reactor always orders it first) and every @QuarkusTest-bearing module pins Surefire's
