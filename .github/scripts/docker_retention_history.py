@@ -43,9 +43,10 @@ class HistoryError(RuntimeError):
 
 
 class APIError(HistoryError):
-    def __init__(self, status):
+    def __init__(self, status, path=None):
         self.status = status
-        super().__init__(f"GitHub Actions request failed (HTTP {status})")
+        detail = f" for {path}" if path else ""
+        super().__init__(f"GitHub Actions request failed (HTTP {status}){detail}")
 
 
 def timestamp(value):
@@ -133,7 +134,7 @@ class GitHub:
                         url = target
                         headers = {"User-Agent": "bootui-retention-history"}
                     else:
-                        raise APIError(error.code) from None
+                        raise APIError(error.code, path) from None
             except (URLError, OSError, ValueError):
                 # Exception bodies/URLs may contain signed credentials.
                 raise HistoryError("GitHub Actions download or connection failed") from None
@@ -227,27 +228,39 @@ def validate_inventory(value, namespace):
     }
 
 
-def restore_inventory(github, namespace, workflow_id, now):
-    artifacts = github.pages("/actions/artifacts", "artifacts")
+def restore_inventory(github, namespace, workflow_id, current_run, now):
     candidates = []
-    for artifact in artifacts:
-        name = artifact.get("name", "")
-        suffixed = re.fullmatch(rf"{ARTIFACT}-([0-9]+)-([0-9]+)", name)
-        if (name != ARTIFACT and not suffixed) or artifact.get("expired") is True:
+    # Inventory artifacts expire after 90 days. Listing artifacts per publish run
+    # avoids paginating every build artifact in the repository. Check the current
+    # run separately to include earlier attempts even if the run itself is older.
+    run_ids = [int(current_run)]
+    runs = github.pages(
+        "/actions/workflows/docker-publish.yml/runs", "workflow_runs",
+        {"branch": "main", "created": f"{iso(now - timedelta(days=90))}..{iso(now)}"},
+    )
+    for publish_run in runs:
+        if publish_run.get("workflow_id") != workflow_id or publish_run.get("head_branch") != "main":
             continue
-        if artifact.get("expired") is not False:
-            raise HistoryError("Artifact expiration metadata is missing")
-        if timestamp(artifact.get("expires_at")) <= now:
-            continue
-        run = artifact.get("workflow_run") or {}
-        if run.get("head_branch") != "main":
-            continue
-        # Run/attempt suffixes let immutable artifact uploads survive reruns.
-        if suffixed and (
-            int(suffixed[1]) != run.get("id") or int(suffixed[2]) < 1
-        ):
-            continue
-        candidates.append(artifact)
+        if publish_run["id"] != int(current_run):
+            run_ids.append(publish_run["id"])
+    for run_id in run_ids:
+        artifacts = github.pages(f"/actions/runs/{run_id}/artifacts", "artifacts")
+        for artifact in artifacts:
+            name = artifact.get("name", "")
+            suffixed = re.fullmatch(rf"{ARTIFACT}-([0-9]+)-([0-9]+)", name)
+            if (name != ARTIFACT and not suffixed) or artifact.get("expired") is True:
+                continue
+            if artifact.get("expired") is not False:
+                raise HistoryError("Artifact expiration metadata is missing")
+            if timestamp(artifact.get("expires_at")) <= now:
+                continue
+            run = artifact.get("workflow_run") or {}
+            if run.get("id") != run_id or run.get("head_branch") != "main":
+                continue
+            # Run/attempt suffixes let immutable artifact uploads survive reruns.
+            if suffixed and (int(suffixed[1]) != run["id"] or int(suffixed[2]) < 1):
+                continue
+            candidates.append(artifact)
     candidates.sort(
         key=lambda item: (timestamp(item.get("created_at")), item["id"]), reverse=True
     )
@@ -472,7 +485,7 @@ def recover(github, namespace, current_run, now=None):
     workflow = github.json("/actions/workflows/docker-publish.yml")
     if workflow.get("path") != WORKFLOW or type(workflow.get("id")) is not int:
         raise HistoryError("Docker publish workflow identity does not match")
-    restored = restore_inventory(github, namespace, workflow["id"], now)
+    restored = restore_inventory(github, namespace, workflow["id"], current_run, now)
     if restored is not None and restored["history_version"] == HISTORY_VERSION:
         return restored
     if restored is not None:
