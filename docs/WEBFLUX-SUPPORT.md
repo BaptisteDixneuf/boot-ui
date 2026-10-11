@@ -23,6 +23,9 @@ the view-only **Code Inventory** panel, and **Code Paths** with its method probe
 (**HTTP Sessions**, §6.7) that stays unavailable for stack reasons. Every available
 action-capable panel behaves identically to the servlet adapter, behind the same shared `LocalhostGuard` write floor.
 
+Runtime Insights' optional community feedback uses the shared controller on WebFlux: its fixed Azure endpoint is
+unset by default, aggregate reads and votes require an explicit click, and votes honor the panel's read-only policy.
+
 **R2DBC statements are not recorded.** BootUI records SQL through a traced JDBC `DataSource`, so an application
 that reaches its database through R2DBC shows no statements, connections, or SQL timings in the runtime journal: the
 SQL Trace panel stays empty, Runtime Insights names this first among its limitations, and its checks that read SQL

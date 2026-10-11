@@ -907,6 +907,27 @@ refresh, and closes an open **Copy for AI** preview and turns **Copy for AI** of
 same facts through the `get_runtime_insights`, `get_runtime_insight`, `get_runtime_impact`, and
 `get_runtime_run_comparison` MCP tools and the `bootui insights` CLI commands ([AI agents](../AI-AGENTS.md#runtime-insights-for-agents)).
 
+### Community feedback
+
+The **Coverage & limits** tab can optionally show community ratings per **check kind**. This is not a diagnostic
+or a correctness verdict, and is not included in the local report, MCP, CLI, or JSON export. Selecting **View
+community ratings** makes one explicit request through the local BootUI API to a configured Azure Function; opening
+the panel, expanding this section, auto-refreshing, and browsing other checks make no community request. Without
+`bootui.runtime-insights.feedback-endpoint`, this optional action reports that feedback is not configured and local
+findings continue working. A failed request also leaves local findings untouched.
+The proxy accepts at most 8 KiB within four seconds, never follows redirects, and rejects
+malformed or inconsistent aggregate counters rather than presenting them as community evidence.
+
+Five star counts and their weighted average appear beside the count of self-reported findings. When you submit a
+1–5-star vote, the confirmation checkbox discloses that BootUI sends **only** the check kind, rating, and that
+check's finding count. An evaluated check with **zero** findings sends `0`; a partial, unavailable, insufficient, or
+not-applicable check sends `null`, not a misleading zero. The cloud service sees the developer server's egress IP
+and uses a keyed digest of that IP, check kind, and UTC day to reject duplicate votes on the same day; it does not
+store raw IPs. Shared NATs may merge users, and IP-based deduplication is not a security guarantee. See
+[privacy](../PRIVACY.md#optional-community-feedback) and the
+[deployment guide](https://github.com/jdubois/boot-ui/tree/v2/infrastructure/insight-feedback) for operational limits. Submitting is disabled
+when the Runtime Insights panel is read-only. Community ratings are never required to see or trust local results.
+
 **Not exercised in this run** lists the application's declared routes that no request of this run reached, so nothing
 in the panel is mistaken for a verdict on a route that never ran. Framework endpoints, such as the error controller,
 Actuator, and Quarkus's own extension and `/q/` endpoints, and catch-all patterns are left out; an application whose

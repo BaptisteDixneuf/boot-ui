@@ -103,8 +103,10 @@ a polished but simple UI, and testable architecture. In addition:
 - **Nothing expensive on page load.** Observations are projections over aggregates the journal maintains as events
   arrive, read the way Live Activity already computes its KPI strip. Opening a panel or calling a read tool never
   starts a capture, a scan, a database read, or a network call.
-- **Nothing leaves the machine.** The journal is local, bounded, and governed by the live exposure policy. BootUI still
-  collects no telemetry about its users.
+- **Nothing leaves the machine by default.** The journal is local, bounded, and governed by the live exposure policy.
+  BootUI collects no automatic telemetry about its users. An optional, separately configured community feedback
+  action sends only a check kind, rating, and self-reported finding count after explicit user consent; it never
+  exports journal evidence ([privacy](PRIVACY.md#optional-community-feedback)).
 - **Honest across stacks.** Spring MVC stays the reference. Spring WebFlux and Quarkus report each capability they
   cannot provide as unavailable, with a reason.
 
