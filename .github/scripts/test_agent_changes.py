@@ -35,6 +35,8 @@ AGENT_EVIDENCE = [
     "bootui-ui/src/main/frontend/src/views/components/CaughtInCode.vue",
     "bootui-spring-sample-app/e2e/tests-agent/work-after-response.spec.js",
     "bootui-spring-sample-app/src/test/java/io/github/jdubois/bootui/sample/AgentOverheadBenchmarkIT.java",
+    "bootui-spring-sample-app/src/test/java/io/github/jdubois/bootui/sample/SampleExecutableJar.java",
+    "bootui-spring-sample-app/src/test/java/io/github/jdubois/bootui/sample/SampleExecutableJarReadinessTests.java",
     "bootui-quarkus-sample-app/e2e/tests-agent/work-after-response.spec.js",
     ".github/workflows/build.yml",
     ".github/workflows/jdk-compatibility.yml",
@@ -51,6 +53,8 @@ UNRELATED = [
     "docs/features/java-agent.md",
     "CHANGELOG.md",
     ".github/scripts/check-release-integrity.sh",
+    "bootui-spring-sample-app/src/test/java/io/github/jdubois/bootui/sample/SampleExecutableJarOtherTests.java",
+    "bootui-spring-sample-app/src/test/java/io/github/jdubois/bootui/sample/SampleExecutableJar.java.bak",
 ]
 
 
@@ -102,6 +106,26 @@ class AgentChangesTests(unittest.TestCase):
             self.outputs({"GITHUB_EVENT_NAME": "pull_request", "PR_LABELS": "documentation,agent"}),
             {"agent": "true", "extras": "true"},
         )
+
+    def test_executable_jar_readiness_changes_run_agent_legs_without_extras(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gh = Path(directory) / "gh"
+            gh.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$TEST_CHANGED_PATH"\n')
+            gh.chmod(0o755)
+            for filename in ["SampleExecutableJar.java", "SampleExecutableJarReadinessTests.java"]:
+                with self.subTest(filename=filename):
+                    path = "bootui-spring-sample-app/src/test/java/io/github/jdubois/bootui/sample/" + filename
+                    self.assertEqual(
+                        self.outputs({
+                            "GITHUB_EVENT_NAME": "pull_request",
+                            "GITHUB_REPOSITORY": "jdubois/boot-ui",
+                            "PR_NUMBER": "1",
+                            "PR_LABELS": "",
+                            "PATH": directory + os.pathsep + os.environ["PATH"],
+                            "TEST_CHANGED_PATH": path,
+                        }),
+                        {"agent": "true", "extras": "false"},
+                    )
 
 
 if __name__ == "__main__":
