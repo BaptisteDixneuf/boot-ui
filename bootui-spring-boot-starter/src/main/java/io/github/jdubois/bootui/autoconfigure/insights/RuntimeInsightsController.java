@@ -5,6 +5,8 @@ import io.github.jdubois.bootui.autoconfigure.config.BootUiExposure;
 import io.github.jdubois.bootui.autoconfigure.javaagent.AgentPropagation;
 import io.github.jdubois.bootui.autoconfigure.journal.SpringAppEventCapture;
 import io.github.jdubois.bootui.autoconfigure.web.DeclaredRouteTemplates;
+import io.github.jdubois.bootui.core.dto.InsightFeedbackAggregateDto;
+import io.github.jdubois.bootui.core.dto.InsightFeedbackVoteDto;
 import io.github.jdubois.bootui.core.dto.RuntimeChangeImpactDto;
 import io.github.jdubois.bootui.core.dto.RuntimeImpactSymbolsDto;
 import io.github.jdubois.bootui.core.dto.RuntimeInsightsReportDto;
@@ -13,6 +15,7 @@ import io.github.jdubois.bootui.core.dto.RuntimeResourceProfileDto;
 import io.github.jdubois.bootui.core.dto.RuntimeRunComparisonDto;
 import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
 import io.github.jdubois.bootui.engine.insights.ChangeImpactService;
+import io.github.jdubois.bootui.engine.insights.InsightFeedbackService;
 import io.github.jdubois.bootui.engine.insights.InsightsStack;
 import io.github.jdubois.bootui.engine.insights.ResourceProfileService;
 import io.github.jdubois.bootui.engine.insights.RunComparisonService;
@@ -29,15 +32,19 @@ import io.github.jdubois.bootui.engine.sideeffects.SideEffectsService;
 import io.github.jdubois.bootui.spi.BeanProvider;
 import io.github.jdubois.bootui.spi.MappingProvider;
 import java.util.List;
+import java.util.Map;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.web.context.reactive.ReactiveWebApplicationContext;
 import org.springframework.context.ApplicationContext;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * The Runtime Insights panel ({@code docs/PLAN-v2.md} §5.5), shared by the Spring MVC and WebFlux adapters:
@@ -56,6 +63,7 @@ public class RuntimeInsightsController {
     private final RunComparisonService comparison;
     private final ChangeImpactService impact;
     private final ResourceProfileService profile;
+    private final InsightFeedbackService feedback;
 
     public RuntimeInsightsController(
             ApplicationContext context,
@@ -176,6 +184,50 @@ public class RuntimeInsightsController {
                     return paths == null ? null : paths.methodRoutes(wanted);
                 });
         this.insights.setCodePathsService(codePaths::getIfUnique);
+        this.feedback = new InsightFeedbackService(
+                properties.getRuntimeInsights().getFeedbackEndpoint(),
+                () -> insights.report().checks());
+    }
+
+    /** Local capability check only: loading the panel never reads the remote aggregate. */
+    @GetMapping("/feedback")
+    public Map<String, Boolean> feedbackStatus() {
+        return Map.of("enabled", feedback.enabled());
+    }
+
+    @GetMapping("/feedback/aggregate")
+    public ResponseEntity<?> feedbackAggregate(@RequestParam String kind) {
+        try {
+            return feedbackResponse(feedback.aggregate(kind));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Unknown insight check."));
+        }
+    }
+
+    @PostMapping("/feedback/vote")
+    public ResponseEntity<?> feedbackVote(@RequestBody InsightFeedbackVoteDto vote) {
+        try {
+            return feedbackResponse(feedback.vote(vote));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid insight feedback."));
+        }
+    }
+
+    private static ResponseEntity<?> feedbackResponse(InsightFeedbackService.Exchange exchange) {
+        if (exchange.status() != 200) {
+            String error =
+                    switch (exchange.status()) {
+                        case 409 -> "Already rated this check today from this network.";
+                        case 503 -> "Community feedback is not configured.";
+                        default -> "Community feedback is temporarily unavailable.";
+                    };
+            return ResponseEntity.status(exchange.status()).body(Map.of("error", error));
+        }
+        try {
+            return ResponseEntity.ok(new ObjectMapper().readValue(exchange.json(), InsightFeedbackAggregateDto.class));
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(502).body(Map.of("error", "Community feedback returned an invalid response."));
+        }
     }
 
     @GetMapping

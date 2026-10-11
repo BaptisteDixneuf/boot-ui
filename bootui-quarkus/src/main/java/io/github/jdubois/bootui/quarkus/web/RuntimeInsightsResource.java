@@ -1,5 +1,8 @@
 package io.github.jdubois.bootui.quarkus.web;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.jdubois.bootui.core.dto.InsightFeedbackAggregateDto;
+import io.github.jdubois.bootui.core.dto.InsightFeedbackVoteDto;
 import io.github.jdubois.bootui.core.dto.RuntimeChangeImpactDto;
 import io.github.jdubois.bootui.core.dto.RuntimeImpactSymbolsDto;
 import io.github.jdubois.bootui.core.dto.RuntimeInsightsReportDto;
@@ -8,6 +11,7 @@ import io.github.jdubois.bootui.core.dto.RuntimeResourceProfileDto;
 import io.github.jdubois.bootui.core.dto.RuntimeRunComparisonDto;
 import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
 import io.github.jdubois.bootui.engine.insights.ChangeImpactService;
+import io.github.jdubois.bootui.engine.insights.InsightFeedbackService;
 import io.github.jdubois.bootui.engine.insights.InsightsStack;
 import io.github.jdubois.bootui.engine.insights.ResourceProfileService;
 import io.github.jdubois.bootui.engine.insights.RunComparisonService;
@@ -33,6 +37,8 @@ import io.github.jdubois.bootui.spi.BeanProvider;
 import io.github.jdubois.bootui.spi.MappingProvider;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.BadRequestException;
+import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
@@ -40,8 +46,10 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import org.eclipse.microprofile.config.Config;
 
 /**
@@ -59,6 +67,7 @@ public class RuntimeInsightsResource {
     private final RunComparisonService comparison;
     private final ChangeImpactService impact;
     private final ResourceProfileService profile;
+    private final InsightFeedbackService feedback;
 
     @Inject
     public RuntimeInsightsResource(
@@ -151,6 +160,62 @@ public class RuntimeInsightsResource {
                 limit -> codeInventory.isResolvable() ? codeInventory.get().changesWithAccess(limit) : null,
                 wanted -> codePaths.isResolvable() ? codePaths.get().methodRoutes(wanted) : null);
         this.insights.setCodePathsService(() -> codePaths.isResolvable() ? codePaths.get() : null);
+        this.feedback = new InsightFeedbackService(
+                config.getOptionalValue("bootui.runtime-insights.feedback-endpoint", String.class)
+                        .orElse(null),
+                () -> insights.report().checks());
+    }
+
+    @GET
+    @Path("/feedback")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Map<String, Boolean> feedbackStatus() {
+        return Map.of("enabled", feedback.enabled());
+    }
+
+    @GET
+    @Path("/feedback/aggregate")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response feedbackAggregate(@QueryParam("kind") String kind) {
+        try {
+            return feedbackResponse(feedback.aggregate(kind));
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException("Unknown insight check.");
+        }
+    }
+
+    @POST
+    @Path("/feedback/vote")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response feedbackVote(InsightFeedbackVoteDto vote) {
+        try {
+            return feedbackResponse(feedback.vote(vote));
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException("Invalid insight feedback.");
+        }
+    }
+
+    private static Response feedbackResponse(InsightFeedbackService.Exchange exchange) {
+        if (exchange.status() != 200) {
+            String error =
+                    switch (exchange.status()) {
+                        case 409 -> "Already rated this check today from this network.";
+                        case 503 -> "Community feedback is not configured.";
+                        default -> "Community feedback is temporarily unavailable.";
+                    };
+            return Response.status(exchange.status())
+                    .entity(Map.of("error", error))
+                    .build();
+        }
+        try {
+            return Response.ok(new ObjectMapper().readValue(exchange.json(), InsightFeedbackAggregateDto.class))
+                    .build();
+        } catch (Exception e) {
+            return Response.status(502)
+                    .entity(Map.of("error", "Community feedback returned an invalid response."))
+                    .build();
+        }
     }
 
     /**
