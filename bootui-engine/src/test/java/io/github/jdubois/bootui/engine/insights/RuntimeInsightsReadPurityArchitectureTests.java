@@ -51,7 +51,6 @@ class RuntimeInsightsReadPurityArchitectureTests {
                             "io.github.jdubois.bootui.engine.graalvm..",
                             "io.github.jdubois.bootui.engine.crac..",
                             "io.github.jdubois.bootui.engine.github..",
-                            "io.github.jdubois.bootui.engine.feedback..",
                             "io.github.jdubois.bootui.engine.heapdump..",
                             "io.github.jdubois.bootui.engine.mysql..",
                             "io.github.jdubois.bootui.engine.postgres..")

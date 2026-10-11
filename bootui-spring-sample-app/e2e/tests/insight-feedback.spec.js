@@ -1,5 +1,0 @@
-// @ts-check
-import {expect, test} from './fixtures.js'
-import {registerInsightFeedbackTests} from '../scenarios/insight-feedback.js'
-
-registerInsightFeedbackTests(test, expect)

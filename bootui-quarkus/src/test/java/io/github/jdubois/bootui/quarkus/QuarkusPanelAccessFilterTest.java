@@ -73,21 +73,6 @@ class QuarkusPanelAccessFilterTest {
     // --- per-panel read-only -------------------------------------------------------------------------
 
     @Test
-    void readOnlyRuntimeInsightsAllowsRatingsReadsButBlocksVotes() {
-        QuarkusPanelAccessFilter filter = newFilter(Map.of("bootui.panels.runtime-insights.read-only", "true"));
-        RoutingContext read = mockRequest("GET", "/bootui/api/runtime-insights/feedback/aggregate");
-        filter.handle(read);
-        verify(read).next();
-        RoutingContext vote = mockRequest("POST", "/bootui/api/runtime-insights/feedback/vote");
-        filter.handle(vote);
-        assertBlocked(
-                vote.response(),
-                "runtime-insights",
-                "Panel is read-only via bootui.panels.runtime-insights.read-only=true");
-        verify(vote, never()).next();
-    }
-
-    @Test
     void allowsReadOnlyPanelReadRequest() {
         RoutingContext rc = mockRequest("GET", "/bootui/api/memory");
         QuarkusPanelAccessFilter filter = newFilter(Map.of("bootui.panels.memory.read-only", "true"));

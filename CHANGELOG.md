@@ -44,8 +44,6 @@ give the details.
 
 ### Added
 
-- **Opt-in community ratings for Runtime Insights.** Developers can explicitly view star distributions and share
-  a check rating with its self-reported finding count, without affecting local findings ([community feedback](docs/features/overview.md#community-feedback)).
 - **Agent guidance for security sinks.** MCP guidance, the skill, and the docs treat sink rows as checks to perform,
   never vulnerability verdicts, and explain how to opt in ([#1336](https://github.com/jdubois/boot-ui/pull/1336)).
 - **Optional arguments for the MCP prompts.** `diagnose_runtime_issue`, `verify_after_change`, `review_application`, and
