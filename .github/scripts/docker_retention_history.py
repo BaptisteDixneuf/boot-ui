@@ -43,9 +43,10 @@ class HistoryError(RuntimeError):
 
 
 class APIError(HistoryError):
-    def __init__(self, status):
+    def __init__(self, status, path=None):
         self.status = status
-        super().__init__(f"GitHub Actions request failed (HTTP {status})")
+        detail = f" for {path}" if path else ""
+        super().__init__(f"GitHub Actions request failed (HTTP {status}){detail}")
 
 
 def timestamp(value):
@@ -133,7 +134,7 @@ class GitHub:
                         url = target
                         headers = {"User-Agent": "bootui-retention-history"}
                     else:
-                        raise APIError(error.code) from None
+                        raise APIError(error.code, path) from None
             except (URLError, OSError, ValueError):
                 # Exception bodies/URLs may contain signed credentials.
                 raise HistoryError("GitHub Actions download or connection failed") from None
@@ -228,26 +229,33 @@ def validate_inventory(value, namespace):
 
 
 def restore_inventory(github, namespace, workflow_id, now):
-    artifacts = github.pages("/actions/artifacts", "artifacts")
     candidates = []
-    for artifact in artifacts:
-        name = artifact.get("name", "")
-        suffixed = re.fullmatch(rf"{ARTIFACT}-([0-9]+)-([0-9]+)", name)
-        if (name != ARTIFACT and not suffixed) or artifact.get("expired") is True:
+    # Inventory artifacts expire after 90 days. Listing artifacts per publish run
+    # avoids paginating every build artifact in the repository.
+    runs = github.pages(
+        "/actions/workflows/docker-publish.yml/runs", "workflow_runs",
+        {"branch": "main", "created": f"{iso(now - timedelta(days=90))}..{iso(now)}"},
+    )
+    for publish_run in runs:
+        if publish_run.get("workflow_id") != workflow_id or publish_run.get("head_branch") != "main":
             continue
-        if artifact.get("expired") is not False:
-            raise HistoryError("Artifact expiration metadata is missing")
-        if timestamp(artifact.get("expires_at")) <= now:
-            continue
-        run = artifact.get("workflow_run") or {}
-        if run.get("head_branch") != "main":
-            continue
-        # Run/attempt suffixes let immutable artifact uploads survive reruns.
-        if suffixed and (
-            int(suffixed[1]) != run.get("id") or int(suffixed[2]) < 1
-        ):
-            continue
-        candidates.append(artifact)
+        artifacts = github.pages(f"/actions/runs/{publish_run['id']}/artifacts", "artifacts")
+        for artifact in artifacts:
+            name = artifact.get("name", "")
+            suffixed = re.fullmatch(rf"{ARTIFACT}-([0-9]+)-([0-9]+)", name)
+            if (name != ARTIFACT and not suffixed) or artifact.get("expired") is True:
+                continue
+            if artifact.get("expired") is not False:
+                raise HistoryError("Artifact expiration metadata is missing")
+            if timestamp(artifact.get("expires_at")) <= now:
+                continue
+            run = artifact.get("workflow_run") or {}
+            if run.get("id") != publish_run["id"] or run.get("head_branch") != "main":
+                continue
+            # Run/attempt suffixes let immutable artifact uploads survive reruns.
+            if suffixed and (int(suffixed[1]) != run["id"] or int(suffixed[2]) < 1):
+                continue
+            candidates.append(artifact)
     candidates.sort(
         key=lambda item: (timestamp(item.get("created_at")), item["id"]), reverse=True
     )

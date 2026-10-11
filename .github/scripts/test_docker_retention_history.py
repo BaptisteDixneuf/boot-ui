@@ -128,6 +128,7 @@ class FakeGitHub:
         self.requested = []
         self.run_reads = []
         self.bounds = None
+        self.page_requests = []
 
     def json(self, path):
         if path == "/actions/workflows/docker-publish.yml":
@@ -137,8 +138,13 @@ class FakeGitHub:
         return next(item for item in self.history if item["id"] == identity)
 
     def pages(self, path, key, params=None):
+        self.page_requests.append((path, key, params))
+        if key == "workflow_runs":
+            return iter(self.history)
         if key == "artifacts":
-            return iter(self.artifacts)
+            identity = int(path.split("/")[-2])
+            return (item for item in self.artifacts
+                    if item["workflow_run"]["id"] == identity)
         identity = int(path.split("/")[-2])
         return iter(self.jobs.get(identity, []))
 
@@ -172,6 +178,14 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(inventory(), self.recover(client))
         self.assertEqual(["/actions/artifacts/1/zip"], client.requested)
         self.assertIsNone(client.bounds)
+        self.assertEqual(
+            [
+                ("/actions/workflows/docker-publish.yml/runs", "workflow_runs",
+                 {"branch": "main", "created": f"{history.iso(NOW - timedelta(days=90))}..{history.iso(NOW)}"}),
+                ("/actions/runs/10/artifacts", "artifacts", None),
+            ],
+            client.page_requests,
+        )
 
     def test_refreshes_legacy_inventory_without_losing_retry_records_or_newer_pushes(self):
         prior = inventory()
@@ -215,6 +229,15 @@ class HistoryTests(unittest.TestCase):
         )
         self.recover(client)
         self.assertEqual(["/actions/artifacts/2/zip"], client.requested)
+
+    def test_freshest_artifact_can_belong_to_older_rerun(self):
+        client = FakeGitHub(
+            [artifact(1, 10, created_at=NEW), artifact(2, 11, created_at=OLD)],
+            [run(11), run(10, conclusion="failure")],
+            downloads={"/actions/artifacts/1/zip": archive(inventory())},
+        )
+        self.assertEqual(inventory(), self.recover(client))
+        self.assertEqual(["/actions/artifacts/1/zip"], client.requested)
 
     def test_accepts_workflow_run_attempt_suffix_without_unrelated_artifacts(self):
         client = FakeGitHub(
@@ -271,8 +294,11 @@ class HistoryTests(unittest.TestCase):
             downloads={"/actions/artifacts/4/zip": archive(inventory())},
         )
         self.assertEqual(inventory(), self.recover(client))
-        self.assertEqual([15, 10], client.run_reads)
+        self.assertEqual([10], client.run_reads)
         self.assertEqual(["/actions/artifacts/4/zip"], client.requested)
+        self.assertNotIn(
+            ("/actions/runs/15/artifacts", "artifacts", None), client.page_requests
+        )
 
     def test_verifies_actual_run_branch_not_only_artifact_branch(self):
         client = FakeGitHub([artifact()], [run(head_branch="feature")])
@@ -638,6 +664,19 @@ class GitHubTests(unittest.TestCase):
                 with self.assertRaises(history.HistoryError):
                     self.client.download("/actions/jobs/20/logs")
                 self.assertTrue(stream.closed)
+
+    def test_http_error_identifies_only_the_locally_constructed_api_path(self):
+        self.client.opener.open = Mock(side_effect=HTTPError(
+            history.API, 500, "error", {}, io.BytesIO(b"signed-secret")
+        ))
+        with self.assertRaises(history.APIError) as caught:
+            self.client.json("/actions/runs/10/artifacts")
+        self.assertEqual(
+            "GitHub Actions request failed (HTTP 500) for "
+            "/repos/jdubois/boot-ui/actions/runs/10/artifacts",
+            str(caught.exception),
+        )
+        self.assertNotIn("signed-secret", str(caught.exception))
 
     def test_transport_errors_never_expose_tokens_signed_urls_or_response_bodies(self):
         for error in (
