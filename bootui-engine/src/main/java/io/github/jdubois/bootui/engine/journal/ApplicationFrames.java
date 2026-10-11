@@ -1,7 +1,7 @@
 package io.github.jdubois.bootui.engine.journal;
 
 import io.github.jdubois.bootui.engine.support.StackFramePrefixes;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Stream;
@@ -153,19 +153,28 @@ public final class ApplicationFrames {
 
     /** These frames, each replaced by the run's shared copy when the dictionary takes it. */
     public ApplicationFrames interned(JournalDictionary dictionary) {
-        List<String> frames = frames();
-        List<String> shared = new ArrayList<>(frames.size());
+        Formatted current = formatted();
+        List<String> frames = current.frames();
+        String[] shared = null;
         int unshared = 0;
-        for (String frame : frames) {
+        for (int i = 0; i < frames.size(); i++) {
+            String frame = frames.get(i);
             String canonical = dictionary.canonical(frame);
             if (canonical == null) {
-                shared.add(frame);
                 unshared += RuntimeEvent.stringBytes(frame);
-            } else {
-                shared.add(canonical);
+                canonical = frame;
+            }
+            if (shared == null && canonical != frame) {
+                shared = frames.toArray(new String[frames.size()]);
+            }
+            if (shared != null) {
+                shared[i] = canonical;
             }
         }
-        return new ApplicationFrames(shared, unshared);
+        if (shared == null && unshared == current.unsharedBytes()) {
+            return this;
+        }
+        return new ApplicationFrames(shared == null ? frames : List.of(shared), unshared);
     }
 
     /** The bytes these frames retain beyond the dictionary: a reference each, and every unshared frame. */
@@ -204,16 +213,19 @@ public final class ApplicationFrames {
             return done;
         }
         StackWalker.StackFrame[] pending = (StackWalker.StackFrame[]) current;
-        List<String> frames = new ArrayList<>(pending.length);
+        String[] frames = new String[pending.length];
+        int count = 0;
         try {
             String site = innermost;
             for (int i = 0; i < pending.length; i++) {
-                frames.add(i == 0 && site != null ? site : format(pending[i]));
+                frames[count] = i == 0 && site != null ? site : format(pending[i]);
+                count++;
             }
         } catch (RuntimeException ex) {
             // Keeps the frames formatted before the one that failed, so the call site stays the innermost frame.
         }
-        Formatted done = new Formatted(List.copyOf(frames), bytesOf(frames));
+        List<String> formatted = List.of(count == frames.length ? frames : Arrays.copyOf(frames, count));
+        Formatted done = new Formatted(formatted, bytesOf(formatted));
         state = done;
         return done;
     }

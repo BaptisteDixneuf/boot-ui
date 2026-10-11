@@ -60,14 +60,24 @@ public record RestClientPayload(
      */
     @Override
     public RuntimeEventPayload interned(JournalDictionary dictionary) {
+        String sharedMethod = dictionary.shared(method);
+        String sharedAuthority = dictionary.shared(authority);
+        String sharedClientType = dictionary.shared(clientType);
+        ApplicationFrames sharedFrames = ApplicationFrames.interned(frames, dictionary);
+        if (sharedMethod == method
+                && sharedAuthority == authority
+                && sharedClientType == clientType
+                && sharedFrames == frames) {
+            return this;
+        }
         return new RestClientPayload(
-                dictionary.shared(method),
-                dictionary.shared(authority),
+                sharedMethod,
+                sharedAuthority,
                 path,
                 status,
-                dictionary.shared(clientType),
+                sharedClientType,
                 failed,
-                ApplicationFrames.interned(frames, dictionary),
+                sharedFrames,
                 completedNanos,
                 codePathStamp);
     }

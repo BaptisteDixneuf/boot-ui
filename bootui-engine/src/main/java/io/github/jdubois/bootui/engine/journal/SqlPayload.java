@@ -126,12 +126,19 @@ public record SqlPayload(
      */
     @Override
     public RuntimeEventPayload interned(JournalDictionary dictionary) {
+        String sharedSql = SqlShapes.shareable(sql) ? dictionary.shared(sql) : sql;
+        String sharedSite = dictionary.shared(callSite());
+        String sharedDataSource = dictionary.shared(dataSource);
+        ApplicationFrames sharedFrames = ApplicationFrames.interned(frames, dictionary);
+        if (sharedSql == sql && sharedSite == callSite && sharedDataSource == dataSource && sharedFrames == frames) {
+            return this;
+        }
         return new SqlPayload(
-                SqlShapes.shareable(sql) ? dictionary.shared(sql) : sql,
-                dictionary.shared(callSite()),
-                dictionary.shared(dataSource),
+                sharedSql,
+                sharedSite,
+                sharedDataSource,
                 failed,
-                ApplicationFrames.interned(frames, dictionary),
+                sharedFrames,
                 phase,
                 completedNanos,
                 codePathStamp,

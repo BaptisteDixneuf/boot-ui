@@ -473,6 +473,10 @@ and the SQL its panels run while serving them, are never recorded. Pausing a pan
 its buffers while the console is idle (`bootui.free-on-idle`), stops only what that panel keeps: the journal keeps
 recording SQL statements, connections, transactions, REST client calls, AI calls, and security events.
 
+Already-canonical SQL, HTTP, REST-client, and cache payloads keep their immutable instances instead of being copied
+again; frame sharing still recalculates byte accounting when the dictionary changes. This does not change the queue's
+reserved share, retained-event bounds, event ordering, or loss reporting.
+
 The journal is enabled by default. In one 2026-10-09 Spring MVC sample-route CI benchmark, its median throughput was
 14.1 % lower than with the journal disabled, against the 5 % target; zero events were dropped. This is a single
 workload, not a universal application estimate. The maintainer decided to keep the default enabled; the
