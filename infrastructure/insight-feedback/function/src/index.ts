@@ -9,7 +9,8 @@ function store(): Container {
     const endpoint = process.env.COSMOS_ENDPOINT
     if (!endpoint || !/^https:\/\/[a-z0-9-]+\.documents\.azure\.com$/i.test(endpoint))
       throw new Error('Cosmos endpoint not configured')
-    container = new CosmosClient({endpoint, aadCredentials: new DefaultAzureCredential()})
+    container = new CosmosClient({endpoint, aadCredentials: new DefaultAzureCredential(),
+      connectionPolicy: {requestTimeout: 2000, retryOptions: {maxRetryAttemptCount: 0}}})
       .database('feedback').container('votes')
   }
   return container
@@ -50,25 +51,30 @@ async function boundedBody(request: HttpRequest): Promise<string> {
 async function aggregate(kind: string, storage: Container): Promise<Aggregate> {
   try {
     const {resource} = await storage.item('aggregate', kind).read<Aggregate>()
-    return resource ?? emptyAggregate(kind)
+    if (!resource) throw new Error('Missing aggregate response')
+    return resource
   } catch (error) {
     if ((error as {code?: number}).code === 404) return emptyAggregate(kind)
     throw error
   }
 }
 
-async function read(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
+export async function read(request: HttpRequest, context: InvocationContext, storage: () => Container = store): Promise<HttpResponseInit> {
   const kind = request.query.get('kind')
   if (!kind || !/^[a-z0-9-]{1,64}$/.test(kind)) return json(400, {error: 'Invalid check kind.'})
   try {
-    return json(200, publicAggregate(await aggregate(kind, store())))
+    return json(200, publicAggregate(await aggregate(kind, storage())))
   } catch (error) {
     context.error('Feedback aggregate read failed', error)
     return json(503, {error: 'Feedback temporarily unavailable.'})
   }
 }
 
-async function submit(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
+export async function submit(
+  request: HttpRequest, context: InvocationContext,
+  storageProvider: () => Container = store, keyProvider: () => Buffer = secret,
+  now: () => Date = () => new Date()
+): Promise<HttpResponseInit> {
   // The platform-provided address is the BootUI server's egress/proxy IP, not a browser identifier.
   const ip = clientIp(request.headers)
   if (!ip) return json(400, {error: 'Client IP unavailable.'})
@@ -77,14 +83,16 @@ async function submit(request: HttpRequest, context: InvocationContext): Promise
     input = JSON.parse(await boundedBody(request))
   } catch (error) {
     if (error instanceof RangeError) return json(413, {error: 'Request too large.'})
-    return json(400, {error: 'Invalid JSON.'})
+    if (error instanceof SyntaxError) return json(400, {error: 'Invalid JSON.'})
+    context.error('Feedback request read failed')
+    return json(503, {error: 'Feedback temporarily unavailable.'})
   }
   const vote = parseVote(input)
   if (!vote) return json(400, {error: 'Invalid feedback vote.'})
   try {
-    const storage = store()
-    const key = secret()
-    const day = new Date().toISOString().slice(0, 10)
+    const storage = storageProvider()
+    const key = keyProvider()
+    const day = now().toISOString().slice(0, 10)
     // Create the aggregate once. This is not the vote: it never includes identifying data.
     try {
       await storage.items.create(emptyAggregate(vote.kind))
@@ -109,7 +117,8 @@ async function submit(request: HttpRequest, context: InvocationContext): Promise
     const result = await storage.items.batch(operations, vote.kind)
     if (result.code === 409 || result.result?.[0]?.statusCode === 409)
       return json(409, {error: 'Already rated this check today from this network.'})
-    if ((result.code ?? 0) < 200 || (result.code ?? 0) >= 300 || result.result?.some((item) => item.statusCode >= 400))
+    if ((result.code ?? 0) < 200 || (result.code ?? 0) >= 300 || result.result?.length !== 2
+      || result.result.some((item) => item.statusCode < 200 || item.statusCode >= 300))
       throw new Error('Cosmos batch failed')
     return json(200, publicAggregate(await aggregate(vote.kind, storage)))
   } catch (error) {
@@ -118,5 +127,7 @@ async function submit(request: HttpRequest, context: InvocationContext): Promise
   }
 }
 
-app.http('insight-feedback-aggregate', {methods: ['GET'], authLevel: 'anonymous', route: 'aggregate', handler: read})
-app.http('insight-feedback-vote', {methods: ['POST'], authLevel: 'anonymous', route: 'vote', handler: submit})
+app.http('insight-feedback-aggregate', {methods: ['GET'], authLevel: 'anonymous', route: 'aggregate',
+  handler: (request, context) => read(request, context)})
+app.http('insight-feedback-vote', {methods: ['POST'], authLevel: 'anonymous', route: 'vote',
+  handler: (request, context) => submit(request, context)})

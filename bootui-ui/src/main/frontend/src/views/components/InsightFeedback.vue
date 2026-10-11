@@ -1,5 +1,5 @@
 <script setup>
-import {ref, watch} from 'vue'
+import {nextTick, onBeforeUnmount, ref, useId, watch} from 'vue'
 import {getJson} from '../../api.js'
 import {formatLoadError} from '../../utils/loadError.js'
 
@@ -14,58 +14,91 @@ const consent = ref(false)
 const busy = ref(false)
 const rated = ref(false)
 const opened = ref(false)
+const viewButton = ref(null)
+const controlId = useId()
+let pending = null
+let generation = 0
+function resetRequest() {
+  generation++
+  pending?.abort()
+  pending = null
+  busy.value = false
+}
 watch(
   () => props.check.kind,
   () => {
+    resetRequest()
     opened.value = false
     aggregate.value = null
     rated.value = false
     consent.value = false
     error.value = ''
+    stars.value = 0
   }
 )
+onBeforeUnmount(resetRequest)
+
+function feedbackError(e, fallback) {
+  return formatLoadError(typeof e?.body?.error === 'string' ? e.body.error : e, fallback)
+}
 
 async function viewRatings() {
   if (busy.value) return
+  const current = generation
+  pending = new AbortController()
   busy.value = true
   error.value = ''
   try {
-    aggregate.value = await getJson(
-      `api/runtime-insights/feedback/aggregate?kind=${encodeURIComponent(props.check.kind)}`
+    const response = await getJson(
+      `api/runtime-insights/feedback/aggregate?kind=${encodeURIComponent(props.check.kind)}`,
+      {signal: pending.signal}
     )
+    if (current !== generation) return
+    aggregate.value = response
     opened.value = true
   } catch (e) {
-    error.value = formatLoadError(e, 'Community ratings are unavailable.')
+    if (current === generation) error.value = feedbackError(e, 'Community ratings are unavailable.')
   } finally {
-    busy.value = false
+    if (current === generation) busy.value = false
   }
 }
 
 async function vote() {
-  if (busy.value || !consent.value || props.readOnly || stars.value < 1 || stars.value > 5) return
+  if (busy.value || rated.value || !consent.value || props.readOnly || stars.value < 1 || stars.value > 5) return
+  const current = generation
+  pending = new AbortController()
   busy.value = true
   error.value = ''
   try {
-    aggregate.value = await getJson('api/runtime-insights/feedback/vote', {
+    const response = await getJson('api/runtime-insights/feedback/vote', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
+      signal: pending.signal,
       body: JSON.stringify({
         kind: props.check.kind,
         stars: stars.value
       })
     })
+    if (current !== generation) return
+    aggregate.value = response
     rated.value = true
   } catch (e) {
-    error.value = formatLoadError(e, 'Could not submit your rating.')
+    if (current === generation) error.value = feedbackError(e, 'Could not submit your rating.')
   } finally {
-    busy.value = false
+    if (current === generation) {
+      busy.value = false
+      if (rated.value) {
+        await nextTick()
+        viewButton.value?.focus()
+      }
+    }
   }
 }
 </script>
 
 <template>
-  <div class="border rounded p-3 mb-2">
-    <h4 class="h6 mb-1">{{ check.title }}</h4>
+  <div class="insight-feedback border rounded p-3 mb-2">
+    <h3 class="h6 mb-1">{{ check.title }}</h3>
     <p class="small text-muted mb-2">
       {{
         check.status === 'EVALUATED'
@@ -79,9 +112,26 @@ async function vote() {
       {{ check.status === 'EVALUATED' ? 'finding count (including zero)' : 'no finding count' }}. No routes, evidence,
       or raw findings are sent.
     </p>
-    <button type="button" class="btn btn-sm btn-outline-secondary" :disabled="busy" @click="viewRatings">
+    <button
+      ref="viewButton"
+      type="button"
+      class="btn btn-sm btn-outline-secondary"
+      :disabled="busy"
+      @click="viewRatings"
+    >
       {{ opened ? 'Refresh community ratings' : 'View community ratings' }}
     </button>
+    <p role="status" class="small mt-2 mb-0">
+      {{
+        busy
+          ? 'Contacting the community service…'
+          : rated
+            ? 'Thank you. Your rating was recorded.'
+            : opened
+              ? 'Community ratings loaded.'
+              : ''
+      }}
+    </p>
     <p v-if="error" role="alert" class="text-danger small mt-2 mb-0">{{ error }}</p>
     <div v-if="opened && aggregate" class="mt-2">
       <p class="small mb-1">
@@ -96,21 +146,42 @@ async function vote() {
       <template v-if="!rated && !readOnly">
         <fieldset class="mb-2">
           <legend class="fs-6 mb-1">Rate this check</legend>
-          <label v-for="number in 5" :key="number" class="me-2 small">
-            <input v-model.number="stars" type="radio" :name="`feedback-${check.kind}`" :value="number" />
+          <label v-for="number in 5" :key="number" class="feedback-choice me-2 small">
+            <input
+              v-model.number="stars"
+              class="form-check-input"
+              type="radio"
+              :name="controlId"
+              :value="number"
+              :disabled="busy"
+            />
             {{ number }} {{ number === 1 ? 'star' : 'stars' }}
           </label>
         </fieldset>
-        <label class="small d-block mb-2">
-          <input v-model="consent" type="checkbox" />
+        <label class="feedback-choice small mb-2">
+          <input v-model="consent" class="form-check-input" type="checkbox" :disabled="busy" />
           I agree to send this rating and the disclosed data to the community service.
         </label>
         <button type="button" class="btn btn-sm btn-primary" :disabled="busy || !consent || !stars" @click="vote">
           Submit rating
         </button>
       </template>
-      <p v-else-if="rated" role="status" class="small mb-0">Thank you. Your rating was recorded.</p>
-      <p v-else class="small text-muted mb-0">This panel is read-only; ratings cannot be submitted.</p>
+      <p v-else-if="readOnly && !rated" class="small text-muted mb-0">
+        This panel is read-only; ratings cannot be submitted.
+      </p>
     </div>
   </div>
 </template>
+
+<style scoped>
+.feedback-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 44px;
+}
+.feedback-choice .form-check-input {
+  flex-shrink: 0;
+  margin-top: 0;
+}
+</style>

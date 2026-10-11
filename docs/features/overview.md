@@ -915,6 +915,8 @@ community ratings** makes one explicit request through the local BootUI API to a
 the panel, expanding this section, auto-refreshing, and browsing other checks make no community request. Without
 `bootui.runtime-insights.feedback-endpoint`, this optional action reports that feedback is not configured and local
 findings continue working. A failed request also leaves local findings untouched.
+The proxy accepts at most 8 KiB within four seconds, never follows redirects, and rejects
+malformed or inconsistent aggregate counters rather than presenting them as community evidence.
 
 Five star counts and their weighted average appear beside the count of self-reported findings. When you submit a
 1–5-star vote, the confirmation checkbox discloses that BootUI sends **only** the check kind, rating, and that

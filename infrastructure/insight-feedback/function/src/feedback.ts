@@ -15,12 +15,12 @@ export type Aggregate = {
   reportedFindings: number
 }
 
-/** Azure App Service normally supplies X-ARR-ClientIP. This is not an authentication signal. */
+/** Linux App Service overwrites client-ip at its front end. Never fall back to client-supplied headers. */
 export function clientIp(headers: {get(name: string): string | null}): string | null {
-  const value = headers.get('x-arr-clientip')
+  const value = headers.get('client-ip')
   // No fallback to untrusted browser-supplied XFF or TCP peer.
   if (!value || value !== value.trim() || validIP(value) === 0) return null
-  return value.toLowerCase()
+  return validIP(value) === 6 ? new URL(`http://[${value}]/`).hostname.slice(1, -1) : value
 }
 
 export function parseVote(value: unknown): Vote | null {

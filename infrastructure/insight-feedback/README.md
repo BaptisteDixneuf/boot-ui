@@ -16,7 +16,8 @@ With Azure CLI authenticated, Node 22+, npm, zip, and OpenSSL:
 bash infrastructure/insight-feedback/provision.sh my-new-feedback-rg eastus
 ```
 
-The script creates a **dedicated resource group**, storage account, serverless Cosmos DB
+The script refuses an existing resource group and builds/tests the Function before creating
+any billable resources. It creates a **dedicated resource group**, storage account, serverless Cosmos DB
 account, `feedback/votes` container partitioned by `/kind`, and a Linux Node Functions app.
 It assigns the app's managed identity the Cosmos DB built-in Data Contributor role, creates
 an HMAC key as an app setting, builds the pinned TypeScript Function, and zip-deploys it.
@@ -29,11 +30,17 @@ route, application identifier, evidence, or secrets. It stores a keyed HMAC of t
 at Azure's edge, day, and check kind. Rotate `FEEDBACK_HMAC_KEY` in Azure app settings to
 reset deduplication (existing vote IDs cannot be recomputed).
 
-**Privacy and limits:** Azure/App Service normally supplies `X-ARR-ClientIP`
+The local proxy bounds a response to 8 KiB and four seconds, does not follow redirects, and
+validates the returned kind, counters, five-star distribution, and weighted average. The
+Function has a ten-second execution limit and two-second Cosmos request timeout without
+throttle retries. Failures leave the local report untouched.
+
+**Privacy and limits:** Linux Azure/App Service overwrites `client-ip` at its front end
 ([App Service headers](https://github.com/Azure/app-service-linux-docs/blob/master/Things_You_Should_Know/headers.md)).
-This value may be absent, altered by a front door or proxy configuration, or spoofed in
-nonstandard deployments. The function rejects missing or invalid addresses rather than
-trusting a browser-supplied XFF. It sees the **BootUI server's** egress or proxy address,
+This value may be absent or altered by a front door or proxy configuration. The function
+rejects missing or invalid addresses rather than trusting a browser-supplied XFF or
+`X-ARR-ClientIP`. Non-App-Service deployments must preserve this trusted ingress boundary.
+It sees the **BootUI server's** egress or proxy address,
 not necessarily the browser's. All users behind one NAT may share a single daily vote,
 and anyone able to change egress IP or bypass the service can evade this best-effort
 deduplication. It is **not an authentication, rate-limit, or security barrier**.

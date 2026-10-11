@@ -17,9 +17,11 @@ test('evaluated zero is distinct from unavailable, and rejects extra fields', ()
 })
 
 test('only a syntactically valid platform header is accepted', () => {
-  assert.equal(clientIp(new Headers({'x-arr-clientip': '2001:db8::1'})), '2001:db8::1')
+  assert.equal(clientIp(new Headers({'client-ip': '2001:db8::1'})), '2001:db8::1')
+  assert.equal(clientIp(new Headers({'client-ip': '2001:0db8:0000:0000:0000:0000:0000:0001'})), '2001:db8::1')
+  assert.equal(clientIp(new Headers({'x-arr-clientip': '198.51.100.3'})), null)
   assert.equal(clientIp(new Headers({'x-forwarded-for': '198.51.100.3'})), null)
-  assert.equal(clientIp(new Headers({'x-arr-clientip': '198.51.100.1, 10.0.0.1'})), null)
+  assert.equal(clientIp(new Headers({'client-ip': '198.51.100.1, 10.0.0.1'})), null)
 })
 
 test('keyed daily identifiers do not expose an address and vary across kinds/days', () => {

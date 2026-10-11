@@ -12,6 +12,8 @@ command -v zip >/dev/null
 command -v openssl >/dev/null
 # Fail before provisioning anything if not signed in. No keys are written into this repository.
 az account show --only-show-errors --output none
+[[ "$(az group exists --name "$GROUP" --only-show-errors --output tsv)" == "false" ]] \
+  || { echo 'Refusing to provision into an existing resource group' >&2; exit 2; }
 
 SUFFIX="$(openssl rand -hex 4)"
 ACCOUNT="buifb${SUFFIX}"
@@ -20,6 +22,10 @@ FUNCTION="buifbfn${SUFFIX}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+cd "$HERE/function"
+npm ci --ignore-scripts
+npm test
 
 az group create --name "$GROUP" --location "$LOCATION" --only-show-errors --output none
 az storage account create --name "$STORAGE" --resource-group "$GROUP" --location "$LOCATION" \
@@ -47,8 +53,6 @@ az functionapp config appsettings set --name "$FUNCTION" --resource-group "$GROU
 unset KEY
 
 cd "$HERE/function"
-npm ci --ignore-scripts
-npm run build
 cp package.json package-lock.json host.json "$TMP/"
 cp -R dist "$TMP/"
 cd "$TMP"

@@ -76,6 +76,18 @@ class ReactivePanelAccessFilterTests {
     }
 
     @Test
+    void readOnlyRuntimeInsightsAllowsRatingsReadsButBlocksVotes() {
+        properties.panel("runtime-insights").setReadOnly(true);
+        MockServerWebExchange read = exchange("GET", "/bootui/api/runtime-insights/feedback/aggregate");
+        filter.filter(read, OK_CHAIN).block(Duration.ofSeconds(5));
+        assertThat(read.getResponse().getStatusCode()).isEqualTo(HttpStatus.OK);
+        MockServerWebExchange vote = exchange("POST", "/bootui/api/runtime-insights/feedback/vote");
+        filter.filter(vote, OK_CHAIN).block(Duration.ofSeconds(5));
+        assertThat(vote.getResponse().getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(bodyAsString(vote)).contains("\"panel\":\"runtime-insights\"");
+    }
+
+    @Test
     void allowsReadOnlyPanelReadRequest() {
         properties.panel("config").setReadOnly(true);
         MockServerWebExchange exchange = exchange("GET", "/bootui/api/config");
