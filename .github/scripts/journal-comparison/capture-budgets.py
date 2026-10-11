@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shlex
 import signal
 import shutil
 import subprocess
@@ -26,6 +27,14 @@ for name, checkout, repository in arms:
     source = checkout / ("bootui-engine/src/test/java/io/github/jdubois/bootui/engine/journal/"
                          "JournalCaptureBudgetBenchmarkTest.java")
     row = {"arm": name, "command": command, "sourceSha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    report = checkout / "bootui-engine/target/capture-budgets/journal.md"
+    xml = checkout / ("bootui-engine/target/surefire-reports/"
+                      "TEST-io.github.jdubois.bootui.engine.journal.JournalCaptureBudgetBenchmarkTest.xml")
+    for existing in [report, xml]:
+        if existing.is_file():
+            preexisting = destination / "preexisting"
+            preexisting.mkdir(exist_ok=True)
+            shutil.move(str(existing), str(preexisting / existing.name))
     with (destination / "command.log").open("w") as log:
         process = subprocess.Popen(command, cwd=checkout, env=environment, stdout=log,
                                    stderr=subprocess.STDOUT, start_new_session=True)
@@ -36,9 +45,6 @@ for name, checkout, repository in arms:
             process.wait(timeout=10)
             row["exitCode"] = 124
             row["failure"] = "Existing capture class exceeded its 180-second command bound"
-    report = checkout / "bootui-engine/target/capture-budgets/journal.md"
-    xml = checkout / ("bootui-engine/target/surefire-reports/"
-                      "TEST-io.github.jdubois.bootui.engine.journal.JournalCaptureBudgetBenchmarkTest.xml")
     if report.is_file():
         shutil.copyfile(report, destination / "journal.md")
         row["reportSha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
@@ -51,10 +57,22 @@ for name, checkout, repository in arms:
         row["xml"] = {k: int(suite.attrib[k]) for k in ["tests", "errors", "failures", "skipped"]}
         row["actualJvmCommand"] = props.get("sun.java.command", "")
         row["java"] = props.get("java.version", "")
+        row["actualXmlProperties"] = {name: props.get(name) for name in [
+            "argLine", "bootui.benchmark", "java.version", "sun.java.command"]}
+        arguments = shlex.split(props.get("argLine", ""))
+        cpu = [argument for argument in arguments if argument.startswith("-XX:ActiveProcessorCount=")]
+        heap = [argument for argument in arguments if argument.startswith("-Xmx")]
+        cases = suite.findall("testcase")
+        row["actualCpuAndHeapCaps"] = cpu == ["-XX:ActiveProcessorCount=4"] and heap == ["-Xmx768m"]
+        row["exactExecutedCase"] = (len(cases) == 1
+                                   and cases[0].attrib.get("name") == "measuresTheJournalCaptureBudgets"
+                                   and not cases[0].findall("skipped"))
         row["oneClassOneFork"] = "jvmRun1" in row["actualJvmCommand"] and "jvmRun2" not in row["actualJvmCommand"]
         row["originalAssertionsPassed"] = (row["exitCode"] == 0 and row["xml"]["tests"] == 1
                                           and not any(row["xml"][k] for k in ["errors", "failures", "skipped"])
                                           and row["oneClassOneFork"] and row["java"].startswith("17.")
+                                          and row["actualCpuAndHeapCaps"] and row["exactExecutedCase"]
+                                          and props.get("bootui.benchmark") == "true"
                                           and report.is_file())
     else:
         row["failure"] = "Original capture XML is missing"
