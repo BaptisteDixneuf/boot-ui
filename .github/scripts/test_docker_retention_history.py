@@ -140,7 +140,9 @@ class FakeGitHub:
     def pages(self, path, key, params=None):
         self.page_requests.append((path, key, params))
         if key == "workflow_runs":
-            return iter(self.history)
+            start, end = (history.timestamp(value) for value in params["created"].split(".."))
+            return (item for item in self.history
+                    if start <= history.timestamp(item["created_at"]) <= end)
         if key == "artifacts":
             identity = int(path.split("/")[-2])
             return (item for item in self.artifacts
@@ -182,6 +184,7 @@ class HistoryTests(unittest.TestCase):
             [
                 ("/actions/workflows/docker-publish.yml/runs", "workflow_runs",
                  {"branch": "main", "created": f"{history.iso(NOW - timedelta(days=90))}..{history.iso(NOW)}"}),
+                ("/actions/runs/999/artifacts", "artifacts", None),
                 ("/actions/runs/10/artifacts", "artifacts", None),
             ],
             client.page_requests,
@@ -279,6 +282,15 @@ class HistoryTests(unittest.TestCase):
         )
         self.assertEqual(inventory(), self.recover(client))
         self.assertIsNone(client.bounds)
+
+    def test_restores_earlier_attempt_when_current_run_predates_history_window(self):
+        client = FakeGitHub(
+            [artifact(run_id=999, name=f"{history.ARTIFACT}-999-1")],
+            [run(999, created_at=history.iso(NOW - timedelta(days=100)))],
+            downloads={"/actions/artifacts/1/zip": archive(inventory())},
+        )
+        self.assertEqual(inventory(), self.recover(client))
+        self.assertEqual(["/actions/artifacts/1/zip"], client.requested)
 
     def test_ignores_other_workflows_branches_and_expired_artifacts(self):
         client = FakeGitHub(

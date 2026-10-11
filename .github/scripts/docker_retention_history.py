@@ -228,10 +228,12 @@ def validate_inventory(value, namespace):
     }
 
 
-def restore_inventory(github, namespace, workflow_id, now):
+def restore_inventory(github, namespace, workflow_id, current_run, now):
     candidates = []
     # Inventory artifacts expire after 90 days. Listing artifacts per publish run
-    # avoids paginating every build artifact in the repository.
+    # avoids paginating every build artifact in the repository. Check the current
+    # run separately to include earlier attempts even if the run itself is older.
+    run_ids = [int(current_run)]
     runs = github.pages(
         "/actions/workflows/docker-publish.yml/runs", "workflow_runs",
         {"branch": "main", "created": f"{iso(now - timedelta(days=90))}..{iso(now)}"},
@@ -239,7 +241,10 @@ def restore_inventory(github, namespace, workflow_id, now):
     for publish_run in runs:
         if publish_run.get("workflow_id") != workflow_id or publish_run.get("head_branch") != "main":
             continue
-        artifacts = github.pages(f"/actions/runs/{publish_run['id']}/artifacts", "artifacts")
+        if publish_run["id"] != int(current_run):
+            run_ids.append(publish_run["id"])
+    for run_id in run_ids:
+        artifacts = github.pages(f"/actions/runs/{run_id}/artifacts", "artifacts")
         for artifact in artifacts:
             name = artifact.get("name", "")
             suffixed = re.fullmatch(rf"{ARTIFACT}-([0-9]+)-([0-9]+)", name)
@@ -250,7 +255,7 @@ def restore_inventory(github, namespace, workflow_id, now):
             if timestamp(artifact.get("expires_at")) <= now:
                 continue
             run = artifact.get("workflow_run") or {}
-            if run.get("id") != publish_run["id"] or run.get("head_branch") != "main":
+            if run.get("id") != run_id or run.get("head_branch") != "main":
                 continue
             # Run/attempt suffixes let immutable artifact uploads survive reruns.
             if suffixed and (int(suffixed[1]) != run["id"] or int(suffixed[2]) < 1):
@@ -480,7 +485,7 @@ def recover(github, namespace, current_run, now=None):
     workflow = github.json("/actions/workflows/docker-publish.yml")
     if workflow.get("path") != WORKFLOW or type(workflow.get("id")) is not int:
         raise HistoryError("Docker publish workflow identity does not match")
-    restored = restore_inventory(github, namespace, workflow["id"], now)
+    restored = restore_inventory(github, namespace, workflow["id"], current_run, now)
     if restored is not None and restored["history_version"] == HISTORY_VERSION:
         return restored
     if restored is not None:
