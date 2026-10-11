@@ -7,21 +7,26 @@ import subprocess
 import sys
 import zipfile
 
-baseline, candidate, output = map(pathlib.Path, sys.argv[1:])
 allowed = {
     "bootui-engine/src/main/java/io/github/jdubois/bootui/engine/journal/" + name + ".java"
     for name in ["ApplicationFrames", "SqlPayload", "HttpPayload", "RestClientPayload", "CachePayload"]
 }
 allowed.update({"bootui-engine/src/test/java/io/github/jdubois/bootui/engine/journal/JournalBuildingBlocksTests.java",
                 "docs/features/overview.md"})
+allowed.update({".github/scripts/journal-comparison/" + name for name in [
+    "JournalPerformanceComparison.java", "DispatchAllocationProbe.java", "verify_inputs.py",
+    "run-allocation.py", "assess.py"]})
+allowed.add(".github/workflows/journal-dispatch-comparison.yml")
 changed = subprocess.check_output(
     ["git", "diff", "--name-only", "233c74f9f6e5165bcd9e710c36ee6f60cbe04b3e", "HEAD"], text=True
 ).splitlines()
-unexpected = [p for p in changed if p not in allowed
-              and not p.startswith(".github/scripts/journal-comparison/")
-              and p != ".github/workflows/journal-dispatch-comparison.yml"]
+unexpected = [p for p in changed if p not in allowed]
 if unexpected:
     raise SystemExit("Unexpected source drift: " + repr(unexpected))
+if sys.argv[1:] == ["--sources-only"]:
+    print("Exact source whitelist passed before builds")
+    raise SystemExit(0)
+baseline, candidate, output = map(pathlib.Path, sys.argv[1:])
 
 def package(path):
     with zipfile.ZipFile(path) as jar:

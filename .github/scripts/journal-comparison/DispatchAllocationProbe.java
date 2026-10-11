@@ -32,6 +32,9 @@ public final class DispatchAllocationProbe {
         long duration = 1_000_000_000L;
         long cpu = ALLOCATION.getCurrentThreadCpuTime();
         long allocated = ALLOCATION.getCurrentThreadAllocatedBytes();
+        if (cpu < 0 || allocated < 0) {
+            throw new IllegalStateException("Negative starting CPU or allocation counter");
+        }
         long started = System.nanoTime();
         int operations = 0;
         while (System.nanoTime() - started < duration) {
@@ -40,8 +43,20 @@ public final class DispatchAllocationProbe {
             }
         }
         double elapsed = (System.nanoTime() - started) / 1e9;
-        long bytes = ALLOCATION.getCurrentThreadAllocatedBytes() - allocated;
-        long nanos = ALLOCATION.getCurrentThreadCpuTime() - cpu;
+        long endAllocated = ALLOCATION.getCurrentThreadAllocatedBytes();
+        long endCpu = ALLOCATION.getCurrentThreadCpuTime();
+        long bytes = endAllocated - allocated;
+        long nanos = endCpu - cpu;
+        if (endAllocated < 0
+                || endCpu < 0
+                || bytes <= 0
+                || nanos <= 0
+                || operations <= 0
+                || operations % 256 != 0
+                || !Double.isFinite(elapsed)
+                || elapsed <= 0) {
+            throw new IllegalStateException("Invalid measured counters or operation count");
+        }
         if (!retainedSql
                         .frames()
                         .frames()
@@ -63,11 +78,13 @@ public final class DispatchAllocationProbe {
         }
         System.out.printf(
                 Locale.ROOT,
-                "label=%s operations=%d allocated_bytes=%d bytes_per_operation=%.6f cpu_ns_per_operation=%.6f"
-                        + " wall_seconds=%.6f dictionary_entries=%d dictionary_bytes=%d java=%s processors=%d%n",
+                "label=%s operations=%d allocated_bytes=%d cpu_nanos=%d bytes_per_operation=%.6f"
+                    + " cpu_ns_per_operation=%.6f wall_seconds=%.6f dictionary_entries=%d dictionary_bytes=%d java=%s"
+                    + " processors=%d%n",
                 args[0],
                 operations,
                 bytes,
+                nanos,
                 bytes / (double) operations,
                 nanos / (double) operations,
                 elapsed,

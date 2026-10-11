@@ -37,6 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p comparison/evidence "$RUNNER_TEMP/journal-baseline"
+          python3 -B .github/scripts/journal-comparison/verify_inputs.py --sources-only
           git archive "$BASELINE" | tar -x -C "$RUNNER_TEMP/journal-baseline"
           git rev-parse HEAD HEAD^{tree} "$CANDIDATE" "$CANDIDATE^{tree}" > comparison/evidence/candidate-source.txt
           git rev-parse "$BASELINE" "$BASELINE^{tree}" > comparison/evidence/baseline-source.txt
