@@ -407,27 +407,26 @@ public final class RuntimeJournal implements RuntimeEventSink, AutoCloseable, Me
     }
 
     private void dispatchLoop() {
-        RuntimeEvent[] batch = new RuntimeEvent[BATCH_SIZE];
+        List<RuntimeEvent> batch = new ArrayList<>(BATCH_SIZE);
         while (running) {
-            int size = 0;
             try {
                 JournalQueue queue = admission;
-                size = queue.poll(batch, dispatcherPollMillis, TimeUnit.MILLISECONDS);
-                if (size == 0) {
+                RuntimeEvent first = queue.poll(dispatcherPollMillis, TimeUnit.MILLISECONDS);
+                if (first == null) {
                     continue;
                 }
                 synchronized (processing) {
                     if (queue != admission) {
                         // Offered before a clear that ran while the dispatcher held it: cleared with the recording.
-                        for (int i = 0; i < size; i++) {
-                            ring.lost(batch[i]);
-                        }
-                        processed.addAndGet(size);
+                        ring.lost(first);
+                        processed.incrementAndGet();
                         continue;
                     }
-                    process(batch, size);
+                    batch.add(first);
+                    queue.drainTo(batch, BATCH_SIZE - 1);
+                    process(batch);
                 }
-                if (size < BATCH_SIZE) {
+                if (batch.size() < BATCH_SIZE) {
                     // Lets the next events gather instead of waking the dispatcher for each one: an offer that wakes
                     // it pays for the unpark on the application thread (M4-18d). A burst ends the pause early.
                     queue.awaitFilling(dispatchLingerNanos);
@@ -439,7 +438,7 @@ public final class RuntimeJournal implements RuntimeEventSink, AutoCloseable, Me
                 // The dispatcher must survive anything a batch throws, or the journal would silently stop recording.
                 log.log(Level.WARNING, "BootUI's runtime journal could not process a batch of events", ex);
             } finally {
-                Arrays.fill(batch, 0, size, null);
+                batch.clear();
             }
         }
     }
@@ -453,22 +452,18 @@ public final class RuntimeJournal implements RuntimeEventSink, AutoCloseable, Me
 
     /** Processes every event of {@code queue}, with {@link #processing} held. */
     private void drain(JournalQueue queue) {
-        RuntimeEvent[] batch = new RuntimeEvent[BATCH_SIZE];
-        int size;
-        while ((size = queue.drainTo(batch)) > 0) {
-            try {
-                process(batch, size);
-            } finally {
-                Arrays.fill(batch, 0, size, null);
-            }
+        List<RuntimeEvent> batch = new ArrayList<>(BATCH_SIZE);
+        while (queue.drainTo(batch, BATCH_SIZE) > 0) {
+            process(batch);
+            batch.clear();
         }
     }
 
-    private void process(RuntimeEvent[] batch, int size) {
-        List<JournalEntry> entries = new ArrayList<>(size);
+    private void process(List<RuntimeEvent> batch) {
+        List<JournalEntry> entries = new ArrayList<>(batch.size());
         try {
-            for (int i = 0; i < size; i++) {
-                RuntimeEvent event = interned(batch[i]);
+            for (RuntimeEvent offered : batch) {
+                RuntimeEvent event = interned(offered);
                 long sequence = lastSequence.get() + 1;
                 JournalEntry entry = new JournalEntry(sequence, event, event.estimatedBytes(dictionary));
                 ring.add(entry);
@@ -489,7 +484,7 @@ public final class RuntimeJournal implements RuntimeEventSink, AutoCloseable, Me
                 }
             }
         } finally {
-            processed.addAndGet(size);
+            processed.addAndGet(batch.size());
         }
     }
 

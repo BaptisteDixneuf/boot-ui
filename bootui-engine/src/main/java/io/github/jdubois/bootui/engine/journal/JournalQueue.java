@@ -1,6 +1,6 @@
 package io.github.jdubois.bootui.engine.journal;
 
-import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -102,10 +102,8 @@ final class JournalQueue {
             items[putIndex] = event;
             putIndex = putIndex + 1 == items.length ? 0 : putIndex + 1;
             count++;
-            if (count == 1) {
-                notEmpty.signal();
-            }
-            if (count == wakeAt) {
+            notEmpty.signal();
+            if (count >= wakeAt) {
                 filling.signal();
             }
             return ACCEPTED;
@@ -115,22 +113,21 @@ final class JournalQueue {
     }
 
     /**
-     * Moves the oldest events into {@code batch} with one lock acquisition, waiting up to {@code timeout} for the first.
-     * Returns zero when none came, or at once when the empty queue is or becomes detached, so the single dispatcher
-     * waiting on it moves to the replacement. Only the returned prefix of the array is written.
+     * The oldest event, waiting up to {@code timeout} for one; {@code null} when none came, or at once when the queue is
+     * or becomes detached, so a dispatcher waiting on it moves to the replacement.
      */
-    int poll(RuntimeEvent[] batch, long timeout, TimeUnit unit) throws InterruptedException {
+    RuntimeEvent poll(long timeout, TimeUnit unit) throws InterruptedException {
         long nanos = unit.toNanos(timeout);
         ReentrantLock lock = this.lock;
         lock.lockInterruptibly();
         try {
             while (count == 0) {
                 if (detached || nanos <= 0L) {
-                    return 0;
+                    return null;
                 }
                 nanos = notEmpty.awaitNanos(nanos);
             }
-            return drain(batch);
+            return take();
         } finally {
             lock.unlock();
         }
@@ -154,12 +151,16 @@ final class JournalQueue {
         }
     }
 
-    /** Moves up to {@code batch.length} of the oldest events into its prefix, in order; returns how many. */
-    int drainTo(RuntimeEvent[] batch) {
+    /** Moves up to {@code max} of the oldest events to {@code batch}, in order; returns how many. */
+    int drainTo(List<RuntimeEvent> batch, int max) {
         ReentrantLock lock = this.lock;
         lock.lock();
         try {
-            return drain(batch);
+            int moved = Math.min(max, count);
+            for (int i = 0; i < moved; i++) {
+                batch.add(take());
+            }
+            return moved;
         } finally {
             lock.unlock();
         }
@@ -236,21 +237,11 @@ final class JournalQueue {
         }
     }
 
-    private int drain(RuntimeEvent[] batch) {
-        int moved = Math.min(batch.length, count);
-        if (moved == 0) {
-            return 0;
-        }
-        int first = Math.min(moved, items.length - takeIndex);
-        System.arraycopy(items, takeIndex, batch, 0, first);
-        Arrays.fill(items, takeIndex, takeIndex + first, null);
-        int remaining = moved - first;
-        if (remaining > 0) {
-            System.arraycopy(items, 0, batch, first, remaining);
-            Arrays.fill(items, 0, remaining, null);
-        }
-        takeIndex = (takeIndex + moved) % items.length;
-        count -= moved;
-        return moved;
+    private RuntimeEvent take() {
+        RuntimeEvent event = items[takeIndex];
+        items[takeIndex] = null;
+        takeIndex = takeIndex + 1 == items.length ? 0 : takeIndex + 1;
+        count--;
+        return event;
     }
 }

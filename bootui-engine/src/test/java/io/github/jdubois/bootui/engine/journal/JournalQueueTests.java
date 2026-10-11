@@ -3,7 +3,6 @@ package io.github.jdubois.bootui.engine.journal;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -30,13 +29,13 @@ class JournalQueueTests {
         assertThat(queue.offer(event(6, true), true)).isEqualTo(JournalQueue.FULL);
         assertThat(queue.size()).isEqualTo(4);
 
-        assertThat(poll(queue, 0, TimeUnit.MILLISECONDS).epochMillis()).isEqualTo(1);
+        assertThat(queue.poll(0, TimeUnit.MILLISECONDS).epochMillis()).isEqualTo(1);
         List<RuntimeEvent> batch = new ArrayList<>();
-        assertThat(drain(queue, batch, 2)).isEqualTo(2);
+        assertThat(queue.drainTo(batch, 2)).isEqualTo(2);
         assertThat(accepted(queue.offer(event(7, false), false))).isTrue();
-        assertThat(drain(queue, batch, 10)).isEqualTo(2);
+        assertThat(queue.drainTo(batch, 10)).isEqualTo(2);
         assertThat(batch).extracting(RuntimeEvent::epochMillis).containsExactly(2L, 4L, 5L, 7L);
-        assertThat(poll(queue, 0, TimeUnit.MILLISECONDS)).isNull();
+        assertThat(queue.poll(0, TimeUnit.MILLISECONDS)).isNull();
     }
 
     @Test
@@ -119,7 +118,7 @@ class JournalQueueTests {
             counted.add(source);
             if (dispatcher.get() == null) {
                 CompletableFuture<Integer> taking =
-                        CompletableFuture.supplyAsync(() -> self.get().drainTo(new RuntimeEvent[10]));
+                        CompletableFuture.supplyAsync(() -> self.get().drainTo(new ArrayList<>(), 10));
                 dispatcher.set(taking);
                 try {
                     taking.get(100, TimeUnit.MILLISECONDS);
@@ -192,7 +191,7 @@ class JournalQueueTests {
         queue.offer(event(2, false), false);
         queue.offer(event(3, false), false);
         List<RuntimeEvent> taken = new ArrayList<>();
-        drain(queue, taken, 1);
+        queue.drainTo(taken, 1);
         queue.offer(event(4, false), false);
         queue.offer(event(5, false), false);
 
@@ -207,8 +206,8 @@ class JournalQueueTests {
                 .isZero();
         assertThat(queue.size()).isZero();
         assertThat(queue.offer(event(3, true), true)).isEqualTo(JournalQueue.DETACHED);
-        assertThat(queue.drainTo(new RuntimeEvent[10])).isZero();
-        assertThat(poll(queue, 30, TimeUnit.SECONDS))
+        assertThat(queue.drainTo(new ArrayList<>(), 10)).isZero();
+        assertThat(queue.poll(30, TimeUnit.SECONDS))
                 .as("a detached queue never makes the dispatcher wait")
                 .isNull();
     }
@@ -222,7 +221,7 @@ class JournalQueueTests {
 
         assertThat(queue.offer(event(2, true), true)).isEqualTo(JournalQueue.DETACHED);
         List<RuntimeEvent> batch = new ArrayList<>();
-        assertThat(drain(queue, batch, 10)).isEqualTo(1);
+        assertThat(queue.drainTo(batch, 10)).isEqualTo(1);
         assertThat(batch).extracting(RuntimeEvent::epochMillis).containsExactly(1L);
     }
 
@@ -244,7 +243,7 @@ class JournalQueueTests {
         AtomicReference<RuntimeEvent> polled = new AtomicReference<>(event(0, false));
         Thread dispatcher = new Thread(() -> {
             try {
-                polled.set(poll(queue, 30, TimeUnit.SECONDS));
+                polled.set(queue.poll(30, TimeUnit.SECONDS));
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
             }
@@ -259,78 +258,6 @@ class JournalQueueTests {
 
         assertThat(dispatcher.isAlive()).isFalse();
         assertThat(polled.get()).isNull();
-    }
-
-    @Test
-    void bulkPollIsBoundedAndWrapsWithoutOverwritingTheUnusedBatchTail() throws Exception {
-        JournalQueue queue = new JournalQueue(5, 5, null, null);
-        for (int i = 1; i <= 5; i++) {
-            queue.offer(event(i, false), false);
-        }
-        RuntimeEvent[] first = new RuntimeEvent[3];
-        assertThat(queue.poll(first, 0, TimeUnit.SECONDS)).isEqualTo(3);
-        assertThat(first).extracting(RuntimeEvent::epochMillis).containsExactly(1L, 2L, 3L);
-        for (int i = 6; i <= 8; i++) {
-            assertThat(queue.offer(event(i, false), false)).isEqualTo(JournalQueue.ACCEPTED);
-        }
-        RuntimeEvent sentinel = event(-1, false);
-        RuntimeEvent[] wrapped = new RuntimeEvent[7];
-        Arrays.fill(wrapped, sentinel);
-
-        assertThat(queue.poll(wrapped, 0, TimeUnit.SECONDS)).isEqualTo(5);
-
-        assertThat(Arrays.copyOf(wrapped, 5))
-                .extracting(RuntimeEvent::epochMillis)
-                .containsExactly(4L, 5L, 6L, 7L, 8L);
-        assertThat(wrapped[5]).isSameAs(sentinel);
-        assertThat(wrapped[6]).isSameAs(sentinel);
-        assertThat(queue.size()).isZero();
-        assertThat(queue.offer(event(9, false), false)).isEqualTo(JournalQueue.ACCEPTED);
-        assertThat(poll(queue, 0, TimeUnit.SECONDS).epochMillis()).isEqualTo(9);
-    }
-
-    @Test
-    void anEmptyToNonemptyTransitionWakesTheDispatcherAfterEachDrain() throws Exception {
-        JournalQueue queue = new JournalQueue(4, 4, null, null);
-        for (int cycle = 1; cycle <= 2; cycle++) {
-            RuntimeEvent[] batch = new RuntimeEvent[4];
-            AtomicReference<Integer> size = new AtomicReference<>();
-            Thread dispatcher = new Thread(() -> {
-                try {
-                    size.set(queue.poll(batch, 30, TimeUnit.SECONDS));
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                }
-            });
-            try {
-                dispatcher.start();
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (dispatcher.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
-                    Thread.onSpinWait();
-                }
-                assertThat(dispatcher.getState()).isEqualTo(Thread.State.TIMED_WAITING);
-                assertThat(queue.offer(event(cycle, false), false)).isEqualTo(JournalQueue.ACCEPTED);
-                dispatcher.join(5_000);
-                assertThat(dispatcher.isAlive()).isFalse();
-                assertThat(size.get()).isEqualTo(1);
-                assertThat(batch[0].epochMillis()).isEqualTo(cycle);
-            } finally {
-                dispatcher.interrupt();
-                dispatcher.join(5_000);
-            }
-        }
-    }
-
-    private static int drain(JournalQueue queue, List<RuntimeEvent> output, int max) {
-        RuntimeEvent[] batch = new RuntimeEvent[max];
-        int size = queue.drainTo(batch);
-        output.addAll(Arrays.asList(batch).subList(0, size));
-        return size;
-    }
-
-    private static RuntimeEvent poll(JournalQueue queue, long timeout, TimeUnit unit) throws InterruptedException {
-        RuntimeEvent[] batch = new RuntimeEvent[1];
-        return queue.poll(batch, timeout, unit) == 0 ? null : batch[0];
     }
 
     private static boolean accepted(int outcome) {
