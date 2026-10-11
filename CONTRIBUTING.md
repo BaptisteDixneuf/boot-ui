@@ -331,6 +331,15 @@ CI runs it with fifteen pairs as the runtime journal leg of `build.yml`'s `agent
 pushes, manual runs, and pull requests labelled `agent`; the `agent-overhead` job publishes the report to its summary,
 and the leg never fails the build.
 
+Executable-jar benchmarks enable Actuator health probes and wait for both the BootUI Java Agent API to answer with
+HTTP 200 and `/actuator/health/readiness` to answer with HTTP 200 and a textual `status` of `UP`. The BootUI endpoint
+alone can answer before `ApplicationRunner` seed work finishes. Readiness does not prove that arbitrary background
+work or journal dispatch has finished: capture comparisons must also reconcile completed SQL/HTTP evidence with
+the global admission counters before and after their request window. Readiness probes are application HTTP, not
+BootUI self-traffic; keep their pre-window admissions visible rather than subtracting them or selecting only
+successfully attributed SQL. Earlier measurements retain their original source and protocol qualifications; this
+readiness correction does not rescore them or establish a throughput improvement.
+
 The agent overhead benchmark (`AgentOverheadBenchmarkIT`) measures the BootUI agent's cumulative cost against
 [PLAN-v2.md](docs/PLAN-v2.md) §8's budget: the Spring sample's executable jar, BootUI on in both configurations, without
 the agent and with every default sensor claimed (`executors`, `inventory`, `code-paths`, `processes`, `network`,
