@@ -56,14 +56,15 @@ public record HttpPayload(
     @Override
     public RuntimeEventPayload interned(JournalDictionary dictionary) {
         String template = dictionary.shared(routeTemplate);
-        String sharedMethod = dictionary.shared(method);
-        String sharedPath = path != null && path.equals(routeTemplate) ? template : path;
-        String sharedOperation = dictionary.shared(operation);
-        if (sharedMethod == method && sharedPath == path && template == routeTemplate && sharedOperation == operation) {
-            return this;
-        }
         return new HttpPayload(
-                sharedMethod, sharedPath, template, sharedOperation, status, resources, timing, asyncStarted);
+                dictionary.shared(method),
+                path != null && path.equals(routeTemplate) ? template : path,
+                template,
+                dictionary.shared(operation),
+                status,
+                resources,
+                timing,
+                asyncStarted);
     }
 
     /** Its fixed part and its strings, each counted as the payload's own. */

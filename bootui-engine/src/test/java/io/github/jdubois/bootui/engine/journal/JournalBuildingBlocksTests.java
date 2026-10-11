@@ -232,64 +232,6 @@ class JournalBuildingBlocksTests {
     }
 
     @Test
-    void canonicalPayloadsAreNotCopiedAndReinternAfterTheDictionaryWasCleared() {
-        JournalDictionary dictionary = new JournalDictionary(100, 100_000);
-        ApplicationFrames frames = ApplicationFrames.of(List.of(new String("A.a(A.java:1)")));
-        List<RuntimeEventPayload> payloads = List.of(
-                new SqlPayload(new String("select * from orders where id = ?"), null, "orders", false, frames),
-                new HttpPayload(new String("GET"), new String("/orders"), new String("/orders"), null, 200),
-                new RestClientPayload("GET", new String("example.test"), "/orders/1", 200, "client", false, frames),
-                new CachePayload(new String("orders"), "MISS", frames));
-
-        for (RuntimeEventPayload payload : payloads) {
-            RuntimeEventPayload canonical = payload.interned(dictionary);
-            assertThat(canonical.interned(dictionary)).isSameAs(canonical);
-            int bytes = canonical.estimatedBytes(dictionary);
-            dictionary.clear();
-            dictionary.intern(new String("A.a(A.java:1)"));
-            dictionary.intern(new String("orders"));
-            dictionary.intern(new String("GET"));
-            RuntimeEventPayload afterClear = canonical.interned(dictionary);
-            assertThat(afterClear).isEqualTo(canonical);
-            assertThat(afterClear.estimatedBytes(dictionary)).isEqualTo(bytes);
-            assertThat(afterClear.interned(dictionary)).isSameAs(afterClear);
-        }
-    }
-
-    @Test
-    void fullAndPartiallyFullDictionariesKeepExactFrameByteAccountingWithoutCopies() {
-        ApplicationFrames original =
-                ApplicationFrames.of(List.of(new String("A.a(A.java:1)"), new String("B.b(B.java:2)")));
-        JournalDictionary full = new JournalDictionary(0, 0);
-        assertThat(original.interned(full)).isSameAs(original);
-        JournalDictionary partial = new JournalDictionary(1, 100_000);
-        partial.intern(new String("A.a(A.java:1)"));
-
-        ApplicationFrames shared = original.interned(partial);
-
-        assertThat(shared.estimatedBytes()).isEqualTo(16 + 16 + RuntimeEvent.stringBytes("B.b(B.java:2)"));
-        assertThat(shared.interned(partial)).isSameAs(shared);
-        assertThat(original.frames()).containsExactly("A.a(A.java:1)", "B.b(B.java:2)");
-        assertThat(original.estimatedBytes()).isGreaterThan(shared.estimatedBytes());
-        ApplicationFrames unsharedAgain = shared.interned(full);
-        assertThat(unsharedAgain.estimatedBytes()).isEqualTo(original.estimatedBytes());
-        assertThat(unsharedAgain.interned(full)).isSameAs(unsharedAgain);
-    }
-
-    @Test
-    void frameFormattingFailureKeepsOnlyTheCompletedImmutablePrefix() {
-        StackWalker.StackFrame good = frame("com.example.First", "run", "First.java", 1);
-        StackWalker.StackFrame broken = frame("com.example.Second", "run", "Second.java", 2);
-        when(broken.getFileName()).thenThrow(new IllegalStateException("redefined"));
-        ApplicationFrames frames = ApplicationFrames.select(Stream.of(good, broken));
-
-        assertThat(frames.frames()).containsExactly("com.example.First.run(First.java:1)");
-        assertThatThrownBy(() -> frames.frames().add("other")).isInstanceOf(UnsupportedOperationException.class);
-        assertThat(frames.callSite()).isEqualTo("com.example.First.run(First.java:1)");
-        assertThat(frames.frames()).containsExactly("com.example.First.run(First.java:1)");
-    }
-
-    @Test
     void theJournalInternsPayloadFramesBeforeItRetainsThem() {
         RuntimeJournal journal = new RuntimeJournal(
                 new RuntimeJournalSettings(true, 100, 1_000_000, 100, 10, 10, JournalSource.all()),

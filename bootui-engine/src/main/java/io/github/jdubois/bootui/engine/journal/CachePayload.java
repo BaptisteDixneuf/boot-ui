@@ -24,13 +24,11 @@ public record CachePayload(String cacheName, String operation, ApplicationFrames
     /** This access with its cache name, operation, and frames replaced by the run's shared copies. */
     @Override
     public RuntimeEventPayload interned(JournalDictionary dictionary) {
-        String sharedName = dictionary.shared(cacheName);
-        String sharedOperation = dictionary.shared(operation);
-        ApplicationFrames sharedFrames = ApplicationFrames.interned(frames, dictionary);
-        if (sharedName == cacheName && sharedOperation == operation && sharedFrames == frames) {
-            return this;
-        }
-        return new CachePayload(sharedName, sharedOperation, sharedFrames, codePathStamp);
+        return new CachePayload(
+                dictionary.shared(cacheName),
+                dictionary.shared(operation),
+                ApplicationFrames.interned(frames, dictionary),
+                codePathStamp);
     }
 
     /** Its fixed part and its strings, each counted as the payload's own. */

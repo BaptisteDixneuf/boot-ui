@@ -1,7 +1,7 @@
 package io.github.jdubois.bootui.engine.journal;
 
 import io.github.jdubois.bootui.engine.support.StackFramePrefixes;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Stream;
@@ -153,28 +153,19 @@ public final class ApplicationFrames {
 
     /** These frames, each replaced by the run's shared copy when the dictionary takes it. */
     public ApplicationFrames interned(JournalDictionary dictionary) {
-        Formatted current = formatted();
-        List<String> frames = current.frames();
-        String[] shared = null;
+        List<String> frames = frames();
+        List<String> shared = new ArrayList<>(frames.size());
         int unshared = 0;
-        for (int i = 0; i < frames.size(); i++) {
-            String frame = frames.get(i);
+        for (String frame : frames) {
             String canonical = dictionary.canonical(frame);
             if (canonical == null) {
+                shared.add(frame);
                 unshared += RuntimeEvent.stringBytes(frame);
-                canonical = frame;
-            }
-            if (shared == null && canonical != frame) {
-                shared = frames.toArray(new String[frames.size()]);
-            }
-            if (shared != null) {
-                shared[i] = canonical;
+            } else {
+                shared.add(canonical);
             }
         }
-        if (shared == null && unshared == current.unsharedBytes()) {
-            return this;
-        }
-        return new ApplicationFrames(shared == null ? frames : List.of(shared), unshared);
+        return new ApplicationFrames(shared, unshared);
     }
 
     /** The bytes these frames retain beyond the dictionary: a reference each, and every unshared frame. */
@@ -213,19 +204,16 @@ public final class ApplicationFrames {
             return done;
         }
         StackWalker.StackFrame[] pending = (StackWalker.StackFrame[]) current;
-        String[] frames = new String[pending.length];
-        int count = 0;
+        List<String> frames = new ArrayList<>(pending.length);
         try {
             String site = innermost;
             for (int i = 0; i < pending.length; i++) {
-                frames[count] = i == 0 && site != null ? site : format(pending[i]);
-                count++;
+                frames.add(i == 0 && site != null ? site : format(pending[i]));
             }
         } catch (RuntimeException ex) {
             // Keeps the frames formatted before the one that failed, so the call site stays the innermost frame.
         }
-        List<String> formatted = List.of(count == frames.length ? frames : Arrays.copyOf(frames, count));
-        Formatted done = new Formatted(formatted, bytesOf(formatted));
+        Formatted done = new Formatted(List.copyOf(frames), bytesOf(frames));
         state = done;
         return done;
     }
