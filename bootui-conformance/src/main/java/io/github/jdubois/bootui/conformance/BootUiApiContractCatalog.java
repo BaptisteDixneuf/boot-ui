@@ -863,7 +863,6 @@ public final class BootUiApiContractCatalog {
                 "runtime-insights",
                 "POST",
                 "/runtime-insights/resource-profile/stop");
-        all(actions, "runtime-insights.feedback.vote", "runtime-insights", "POST", "/runtime-insights/feedback/vote");
         spring(actions, "graalvm.scan.cancel", "graalvm", "POST", "/graalvm/scan/cancel");
         spring(actions, "graalvm.scan", "graalvm", "POST", "/graalvm/scan");
         spring(actions, "graalvm.install", "graalvm", "POST", "/graalvm/install");

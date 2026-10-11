@@ -24,7 +24,6 @@ import ChangeImpact from './components/ChangeImpact.vue'
 import InsightCheckLimits from './components/InsightCheckLimits.vue'
 import InsightCoverage from './components/InsightCoverage.vue'
 import InsightDetail from './components/InsightDetail.vue'
-import InsightFeedback from './components/InsightFeedback.vue'
 import InsightNotExercised from './components/InsightNotExercised.vue'
 import PanelHeader from './components/PanelHeader.vue'
 import PanelSkeleton from './components/PanelSkeleton.vue'
@@ -640,28 +639,6 @@ provide(
                   <h2 id="insight-unrun-title" class="h6 mb-2">Checks and their limits</h2>
                   <InsightCheckLimits v-if="unrun.length" />
                   <p v-else class="small text-muted mb-0">Every check ran without a caveat.</p>
-                </div>
-              </section>
-            </div>
-            <div class="col-12">
-              <section class="card" aria-labelledby="insight-feedback-title">
-                <div class="card-body">
-                  <h2 id="insight-feedback-title" class="h6">Community feedback (optional)</h2>
-                  <p class="small text-muted">
-                    Local findings above never depend on this service. No community data is requested until you select
-                    View community ratings for a check.
-                  </p>
-                  <details>
-                    <summary>Choose a check to rate or view community ratings</summary>
-                    <div class="mt-3">
-                      <InsightFeedback
-                        v-for="check in report.checks"
-                        :key="check.kind"
-                        :check="check"
-                        :read-only="readOnly"
-                      />
-                    </div>
-                  </details>
                 </div>
               </section>
             </div>

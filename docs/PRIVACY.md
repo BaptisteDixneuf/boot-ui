@@ -10,8 +10,8 @@ This page describes what the BootUI documentation site collects, and how to chan
 
 ## The BootUI console sends no analytics
 
-BootUI is a local-only developer console. It runs inside your own application, rejects non-loopback requests by default,
-and never automatically sends usage telemetry or analytics to BootUI or an analytics provider. It does collect local diagnostic evidence from your
+BootUI is a local-only developer console. It runs inside your own application, rejects non-loopback requests by default, and never sends
+usage telemetry or analytics to BootUI or an analytics provider. It does collect local diagnostic evidence from your
 application: requests, SQL, logs, exceptions, traces, and optional agent sensor metadata. Masking reduces disclosure;
 it does not guarantee that all sensitive data is removed.
 
@@ -20,30 +20,13 @@ startup opt-in `bootui.agent.security-sinks.request-values=true` can hold bounde
 transiently in memory while requests run; reports redact those values. Method-probe shapes are separately opt-in and
 stay in the browser panel, never MCP or CLI answers.
 
-Explicit actions can contact external services, such as dependency scans querying OSV.dev/FIRST, GitHub refreshes, and
-the separately configured community feedback action described below.
+Explicit actions can contact external services, such as dependency scans querying OSV.dev/FIRST and GitHub refreshes.
 Configured durable activity persistence and baseline files can save diagnostic metadata; heap capture saves a raw dump
 that may contain secrets, with raw download disabled by default. MCP and CLI expose evidence only when called, but a
 coding agent may send its answers to its model provider: a local endpoint does not mean local model processing.
 See [Properties](PROPERTIES.md) and the [AI-agent disclosure boundary](AI-AGENTS.md#boundaries).
 
 The analytics consent controls below apply only to this documentation website, not to the console.
-
-## Optional community feedback
-
-The BootUI console's Runtime Insights panel can show anonymous, self-reported star ratings for a check, but only
-after an operator configures `bootui.runtime-insights.feedback-endpoint` to an HTTPS Azure Functions origin. Merely
-enabling it or opening the panel makes no outbound community request. Clicking **View community ratings** retrieves
-that check's aggregate through the local BootUI server; explicitly choosing a rating and checking the disclosure
-box submits the check kind, 1–5 stars, and the local check's finding count (including zero if evaluated, or null
-otherwise). No application names, routes, raw findings, or diagnostic evidence are sent.
-
-The Function sees the **server's** public egress IP or its proxy's IP and stores only an HMAC digest of the address,
-check kind, and UTC day to deduplicate votes; vote documents expire after two days and aggregate counters persist.
-IP-based deduplication can conflate users behind one NAT or be evaded. Azure's infrastructure may independently
-log request addresses. This console control is separate from this documentation site's cookie preference below.
-See [community feedback](features/overview.md#community-feedback) and the
-[deployment guide](https://github.com/jdubois/boot-ui/tree/v2/infrastructure/insight-feedback).
 
 ## Analytics on this website
 

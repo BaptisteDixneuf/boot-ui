@@ -4,11 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 
-import io.github.jdubois.bootui.core.dto.InsightFeedbackAggregateDto;
-import io.github.jdubois.bootui.core.dto.InsightFeedbackVoteDto;
 import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
 import io.github.jdubois.bootui.engine.correlation.RunIdentity;
-import io.github.jdubois.bootui.engine.feedback.InsightFeedbackService;
 import io.github.jdubois.bootui.engine.inventory.CodeInventoryService;
 import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
 import io.github.jdubois.bootui.engine.journal.HttpPayload;
@@ -78,73 +75,6 @@ class RuntimeInsightsResourceComparisonTests {
     @AfterEach
     void closeMocks() throws Exception {
         mocks.close();
-    }
-
-    @Test
-    void feedbackDefaultsOffAndRejectsInvalidInputWithCanonicalJson() {
-        RuntimeJournal journal = new RuntimeJournal(
-                new RuntimeJournalSettings(true, 100, 1_000_000, 100, 10, 10, JournalSource.all()),
-                RunIdentity.start());
-        try {
-            when(journals.isResolvable()).thenReturn(true);
-            when(journals.get()).thenReturn(journal);
-            when(aggregates.isResolvable()).thenReturn(true);
-            when(aggregates.get()).thenReturn(new JournalAggregates());
-            when(panels.isPanelEnabled(anyString())).thenReturn(true);
-            when(panels.isPanelAvailable(anyString())).thenReturn(true);
-            RuntimeInsightsResource resource = new RuntimeInsightsResource(
-                    journals,
-                    aggregates,
-                    panels,
-                    mappings,
-                    beans,
-                    agents,
-                    inventory,
-                    codePaths,
-                    sideEffects,
-                    sql,
-                    exposure,
-                    new SmallRyeConfigBuilder().build());
-            assertThat(resource.feedbackStatus()).containsEntry("enabled", false);
-            assertThat(resource.feedbackAggregate("repeated-selects").join().getStatus())
-                    .isEqualTo(503);
-            assertThat(resource.feedbackAggregate("unknown").join().getEntity())
-                    .isEqualTo(java.util.Map.of("error", "Unknown insight check."));
-            assertThat(resource.feedbackVote(null).join().getEntity())
-                    .isEqualTo(java.util.Map.of("error", "Invalid insight feedback."));
-            assertThat(resource.feedbackVote(new InsightFeedbackVoteDto("repeated-selects", 0))
-                            .join()
-                            .getStatus())
-                    .isEqualTo(400);
-        } finally {
-            journal.close();
-        }
-    }
-
-    @Test
-    void feedbackDecoderRejectsIncompleteMismatchedAndMalformedRemoteAggregates() {
-        String valid = "{\"kind\":\"repeated-selects\",\"votes\":2,\"stars\":[0,0,0,1,1],"
-                + "\"average\":4.5,\"evaluatedVotes\":1,\"reportedFindings\":0}";
-        assertThat(RuntimeInsightsResource.feedbackResponse(
-                                new InsightFeedbackService.Exchange(200, valid), "repeated-selects")
-                        .getEntity())
-                .isInstanceOf(InsightFeedbackAggregateDto.class);
-        for (String invalid : List.of(
-                "null",
-                "{}",
-                "{\"kind\":\"repeated-selects\"}",
-                valid + "{}",
-                valid.replace("\"votes\":2", "\"votes\":null"),
-                valid.replace("\"votes\":2", "\"votes\":2.5"),
-                valid.replace("\"average\":4.5", "\"average\":1"))) {
-            assertThat(RuntimeInsightsResource.feedbackResponse(
-                                    new InsightFeedbackService.Exchange(200, invalid), "repeated-selects")
-                            .getStatus())
-                    .isEqualTo(502);
-        }
-        assertThat(RuntimeInsightsResource.feedbackResponse(new InsightFeedbackService.Exchange(200, valid), "other")
-                        .getStatus())
-                .isEqualTo(502);
     }
 
     @Test

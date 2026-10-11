@@ -118,18 +118,6 @@ class PanelAccessFilterTests {
     }
 
     @Test
-    void readOnlyRuntimeInsightsAllowsRatingsReadsButBlocksVotes() throws Exception {
-        properties.panel("runtime-insights").setReadOnly(true);
-        MockHttpServletResponse read = new MockHttpServletResponse();
-        filter.doFilter(request("GET", "/bootui/api/runtime-insights/feedback/aggregate"), read, new MockFilterChain());
-        assertThat(read.getStatus()).isEqualTo(200);
-        MockHttpServletResponse vote = new MockHttpServletResponse();
-        filter.doFilter(request("POST", "/bootui/api/runtime-insights/feedback/vote"), vote, new MockFilterChain());
-        assertThat(vote.getStatus()).isEqualTo(403);
-        assertThat(vote.getContentAsString()).contains("\"panel\":\"runtime-insights\"");
-    }
-
-    @Test
     void allowsReadOnlyPanelReadRequest() throws Exception {
         properties.panel("config").setReadOnly(true);
         MockHttpServletRequest request = request("GET", "/bootui/api/config");

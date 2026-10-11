@@ -2655,16 +2655,6 @@ public class BootUiProperties {
      */
     /** Runtime Insights ({@code docs/PLAN-v2.md} §5.5), which reads the runtime journal. */
     public static class RuntimeInsights {
-        /** HTTPS Azure Functions origin for explicitly requested community ratings; unset disables all egress. */
-        private String feedbackEndpoint;
-
-        public String getFeedbackEndpoint() {
-            return feedbackEndpoint;
-        }
-
-        public void setFeedbackEndpoint(String feedbackEndpoint) {
-            this.feedbackEndpoint = feedbackEndpoint;
-        }
 
         /**
          * Tokens of one model call above which AI usage by route reports the route from that call alone, rather than

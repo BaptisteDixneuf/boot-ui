@@ -15,9 +15,6 @@ running console is always the authoritative answer for your own application.
 
 ## 1. Goal
 
-Runtime Insights' optional community feedback has the same explicitly triggered, off-by-default Azure proxy as
-Spring MVC and WebFlux. It uses the shared validation policy, and panel read-only blocks votes but not aggregate reads.
-
 Run the **same BootUI developer console — same Vue UI, same REST contract, same DTOs — on a Quarkus dev application**,
 sharing as much code as possible with the Spring Boot implementation. Each framework contributes only a thin adapter
 layer; the bulk of BootUI's logic lives in framework-neutral shared modules.

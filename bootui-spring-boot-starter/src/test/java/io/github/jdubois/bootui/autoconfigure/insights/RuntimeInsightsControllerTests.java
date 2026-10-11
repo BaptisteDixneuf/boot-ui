@@ -8,13 +8,10 @@ import static org.springframework.test.web.servlet.setup.MockMvcBuilders.standal
 
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
-import io.github.jdubois.bootui.core.dto.InsightFeedbackAggregateDto;
-import io.github.jdubois.bootui.core.dto.InsightFeedbackVoteDto;
 import io.github.jdubois.bootui.core.dto.MappingDto;
 import io.github.jdubois.bootui.core.dto.RuntimeInsightCheckDto;
 import io.github.jdubois.bootui.core.dto.RuntimeInsightsReportDto;
 import io.github.jdubois.bootui.engine.correlation.RunIdentity;
-import io.github.jdubois.bootui.engine.feedback.InsightFeedbackService;
 import io.github.jdubois.bootui.engine.insights.EventLoopBlocking;
 import io.github.jdubois.bootui.engine.insights.RepeatedSelects;
 import io.github.jdubois.bootui.engine.insights.RouteTimeBreakdown;
@@ -43,64 +40,6 @@ import org.springframework.jdbc.datasource.SimpleDriverDataSource;
 import org.springframework.test.web.servlet.MockMvc;
 
 class RuntimeInsightsControllerTests {
-
-    @Test
-    void feedbackDefaultsOffAndInvalidInputHasCanonicalJsonErrorsOnBothSpringStacks() {
-        try (GenericApplicationContext servlet = new GenericApplicationContext();
-                GenericReactiveWebApplicationContext reactive = new GenericReactiveWebApplicationContext()) {
-            for (GenericApplicationContext context : List.of(servlet, reactive)) {
-                context.registerBean(RuntimeJournal.class, () -> journal);
-                context.registerBean(JournalAggregates.class, this::recordingAggregates);
-                context.refresh();
-                RuntimeInsightsController controller = controller(context);
-                assertThat(controller.feedbackStatus()).containsEntry("enabled", false);
-                assertThat(controller
-                                .feedbackAggregate("repeated-selects")
-                                .join()
-                                .getStatusCode()
-                                .value())
-                        .isEqualTo(503);
-                assertThat(controller.feedbackAggregate("unknown").join().getBody())
-                        .isEqualTo(java.util.Map.of("error", "Unknown insight check."));
-                assertThat(controller.feedbackVote(null).join().getBody())
-                        .isEqualTo(java.util.Map.of("error", "Invalid insight feedback."));
-                assertThat(controller
-                                .feedbackVote(new InsightFeedbackVoteDto("repeated-selects", 6))
-                                .join()
-                                .getStatusCode()
-                                .value())
-                        .isEqualTo(400);
-            }
-        }
-    }
-
-    @Test
-    void feedbackDecoderRejectsIncompleteMismatchedAndMalformedRemoteAggregates() {
-        String valid = "{\"kind\":\"repeated-selects\",\"votes\":2,\"stars\":[0,0,0,1,1],"
-                + "\"average\":4.5,\"evaluatedVotes\":1,\"reportedFindings\":0}";
-        assertThat(RuntimeInsightsController.feedbackResponse(
-                                new InsightFeedbackService.Exchange(200, valid), "repeated-selects")
-                        .getBody())
-                .isInstanceOf(InsightFeedbackAggregateDto.class);
-        for (String invalid : List.of(
-                "null",
-                "{}",
-                "{\"kind\":\"repeated-selects\"}",
-                valid + "{}",
-                valid.replace("\"votes\":2", "\"votes\":null"),
-                valid.replace("\"votes\":2", "\"votes\":2.5"),
-                valid.replace("\"average\":4.5", "\"average\":1"))) {
-            assertThat(RuntimeInsightsController.feedbackResponse(
-                                    new InsightFeedbackService.Exchange(200, invalid), "repeated-selects")
-                            .getStatusCode()
-                            .value())
-                    .isEqualTo(502);
-        }
-        assertThat(RuntimeInsightsController.feedbackResponse(new InsightFeedbackService.Exchange(200, valid), "other")
-                        .getStatusCode()
-                        .value())
-                .isEqualTo(502);
-    }
 
     private final RuntimeJournal journal = new RuntimeJournal(
             new RuntimeJournalSettings(true, 1_000, 10_000_000, 1_000, 10, 10, JournalSource.all()),
