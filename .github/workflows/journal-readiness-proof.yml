@@ -1,0 +1,84 @@
+name: Temporary source-specific readiness and narrow format proof
+
+on:
+  push:
+    branches: [jdubois-performance-budget-research]
+    paths: [.github/workflows/journal-readiness-proof.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BASELINE: f6366a306e55d98223fe81b34cda9b417615da48
+      HARNESS: 65c765af81548f73f41760d26b607bad0daa7509
+      NARROW_ORIGIN: fe08bb6573cbfac532122a4968a837fe4bbb0fab
+      MAVEN_OPTS: >-
+        -XX:ActiveProcessorCount=4 -Xmx768m
+        -Daether.transport.http.connectTimeout=30000
+        -Daether.transport.http.requestTimeout=120000
+        -Daether.transport.http.retryHandler.count=5
+        -Daether.transport.http.retryHandler.interval=10000
+        -Daether.transport.http.retryHandler.intervalMax=60000
+        -Daether.transport.http.retryHandler.serviceUnavailable=429,500,502,503,504
+    steps:
+      - name: Check out exact temporary proof
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Freeze baseline and common readiness sources
+        run: |
+          set -euo pipefail
+          mkdir -p comparison/evidence "$RUNNER_TEMP/journal-baseline"
+          python3 -B .github/scripts/journal-readiness-proof/verify_inputs.py sources
+          git archive "$HARNESS" | tar -x -C "$RUNNER_TEMP/journal-baseline"
+          test "$(getconf _NPROCESSORS_ONLN)" -ge 4
+          lscpu > comparison/evidence/cpu.txt
+          java -version 2> comparison/evidence/java.txt
+      - name: Build the one immutable baseline jar
+        working-directory: ${{ runner.temp }}/journal-baseline
+        run: |
+          set -euo pipefail
+          ./mvnw -B -ntp -Dmaven.repo.local="$RUNNER_TEMP/baseline-m2" -pl bootui-spring-sample-app -am -DskipTests install > "$GITHUB_WORKSPACE/comparison/evidence/baseline-build.log" 2>&1
+          cp bootui-spring-sample-app/target/bootui-spring-sample-app-1.21.0.jar "$GITHUB_WORKSPACE/comparison/baseline.jar"
+          ./mvnw -B -ntp -Dmaven.repo.local="$RUNNER_TEMP/baseline-m2" -pl bootui-spring-sample-app dependency:build-classpath -Dmdep.includeScope=test -Dmdep.outputFile="$GITHUB_WORKSPACE/comparison/classpath.txt" > "$GITHUB_WORKSPACE/comparison/evidence/classpath-build.log" 2>&1
+      - name: Run A/A prerequisite then gated narrow proof serially
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 65m bash -euo pipefail <<'PROOF'
+          cp="$RUNNER_TEMP/journal-baseline/bootui-spring-sample-app/target/test-classes:$RUNNER_TEMP/journal-baseline/bootui-spring-sample-app/target/classes:$(cat comparison/classpath.txt)"
+          mkdir -p comparison/classes
+          javac --release 17 -cp "$cp" -d comparison/classes .github/scripts/journal-readiness-proof/JournalPerformanceComparison.java
+          java -XX:ActiveProcessorCount=4 -Xmx768m -cp "comparison/classes:$cp" io.github.jdubois.bootui.sample.JournalPerformanceComparison aa "$GITHUB_WORKSPACE/comparison/baseline.jar" "$GITHUB_WORKSPACE/comparison/baseline.jar" "$GITHUB_WORKSPACE/comparison/evidence/aa" > comparison/evidence/aa-standalone.log 2>&1
+          python3 -B .github/scripts/journal-readiness-proof/verify_inputs.py candidate-source
+          (cd "$RUNNER_TEMP/journal-candidate" && ./mvnw -B -ntp -Dmaven.repo.local="$RUNNER_TEMP/candidate-m2" -pl bootui-spring-sample-app -am -DskipTests install) > comparison/evidence/candidate-build.log 2>&1
+          cp "$RUNNER_TEMP/journal-candidate/bootui-spring-sample-app/target/bootui-spring-sample-app-1.21.0.jar" comparison/candidate.jar
+          python3 -B .github/scripts/journal-readiness-proof/verify_inputs.py packages
+          python3 -B .github/scripts/journal-readiness-proof/run-allocation.py
+          python3 -B .github/scripts/journal-readiness-proof/capture-budgets.py
+          java -XX:ActiveProcessorCount=4 -Xmx768m -cp "comparison/classes:$cp" io.github.jdubois.bootui.sample.JournalPerformanceComparison candidate "$GITHUB_WORKSPACE/comparison/baseline.jar" "$GITHUB_WORKSPACE/comparison/candidate.jar" "$GITHUB_WORKSPACE/comparison/evidence/candidate" > comparison/evidence/candidate-standalone.log 2>&1
+          PROOF
+      - name: Assess only actually emitted stages
+        if: always()
+        run: python3 -B .github/scripts/journal-readiness-proof/assess.py
+      - name: Preserve every emitted measurement and failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: journal-readiness-aa-narrow-proof
+          path: |
+            comparison/evidence/
+            comparison/baseline.jar
+            comparison/candidate.jar
+            comparison/classes/
+            target/executable-jar/journal-direct-*/sample.log
+          if-no-files-found: error
+          retention-days: 14
