@@ -30,7 +30,7 @@ final class SampleExecutableJar implements AutoCloseable {
 
     /**
      * Starts the jar with these JVM options, on a free port, with the Docker-free {@code dev} profile on a private
-     * in-memory database, and waits, bounded, until BootUI answers.
+     * in-memory database, and waits, bounded, for BootUI and application readiness.
      */
     static SampleExecutableJar start(String name, List<String> jvmOptions, List<String> applicationArguments)
             throws Exception {
@@ -61,6 +61,7 @@ final class SampleExecutableJar implements AutoCloseable {
                             + ";DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=false",
                     "--bootui.show-banner=false",
                     "--bootui.overrides-file=" + directory.resolve("overrides.properties"),
+                    "--management.endpoint.health.probes.enabled=true",
                     "--management.tracing.export.enabled=false"));
             command.addAll(applicationArguments);
             Process process = new ProcessBuilder(command)
@@ -89,7 +90,7 @@ final class SampleExecutableJar implements AutoCloseable {
                 throw new IllegalStateException("The sample exited with " + process.exitValue() + ": " + tail());
             }
             try {
-                if (probe.get("/bootui/api/java-agent").status() == 200) {
+                if (isReady(probe)) {
                     return;
                 }
             } catch (RuntimeException notYet) {
@@ -100,6 +101,26 @@ final class SampleExecutableJar implements AutoCloseable {
             }
             Thread.sleep(250);
         }
+    }
+
+    /**
+     * BootUI answers once the web server starts, before ApplicationRunners finish. The readiness health group stays
+     * down until Spring declares the application ready, so ApplicationRunners finish before load begins.
+     */
+    static boolean isReady(BootUiHttpProbe probe) {
+        if (probe.get("/bootui/api/java-agent").status() != 200) {
+            return false;
+        }
+        BootUiHttpProbe.Response readiness = probe.get("/actuator/health/readiness");
+        if (readiness.status() != 200) {
+            return false;
+        }
+        var body = readiness.json();
+        if (body == null || !body.isObject()) {
+            return false;
+        }
+        var status = body.path("status");
+        return status.isTextual() && "UP".equals(status.textValue());
     }
 
     int port() {
