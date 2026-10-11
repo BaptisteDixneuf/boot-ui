@@ -2,6 +2,7 @@ package io.github.jdubois.bootui.engine.journal;
 
 import io.github.jdubois.bootui.engine.support.StackFramePrefixes;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Stream;
@@ -204,16 +205,19 @@ public final class ApplicationFrames {
             return done;
         }
         StackWalker.StackFrame[] pending = (StackWalker.StackFrame[]) current;
-        List<String> frames = new ArrayList<>(pending.length);
+        String[] frames = new String[pending.length];
+        int count = 0;
         try {
             String site = innermost;
             for (int i = 0; i < pending.length; i++) {
-                frames.add(i == 0 && site != null ? site : format(pending[i]));
+                frames[count] = i == 0 && site != null ? site : format(pending[i]);
+                count++;
             }
         } catch (RuntimeException ex) {
             // Keeps the frames formatted before the one that failed, so the call site stays the innermost frame.
         }
-        Formatted done = new Formatted(List.copyOf(frames), bytesOf(frames));
+        List<String> formatted = List.of(count == frames.length ? frames : Arrays.copyOf(frames, count));
+        Formatted done = new Formatted(formatted, bytesOf(formatted));
         state = done;
         return done;
     }

@@ -13,6 +13,9 @@ import io.github.jdubois.bootui.engine.web.CorrelationTier;
 import io.github.jdubois.bootui.spi.CorrelationContext;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
@@ -229,6 +232,72 @@ class JournalBuildingBlocksTests {
         assertThat(first.estimatedBytes()).isGreaterThan(sharedFirst.estimatedBytes());
         ApplicationFrames full = first.interned(new JournalDictionary(0, 0));
         assertThat(full.estimatedBytes()).isEqualTo(first.estimatedBytes());
+    }
+
+    @Test
+    void frameFormattingFailureKeepsOnlyTheCompletedImmutablePrefix() {
+        StackWalker.StackFrame good = frame("com.example.First", "run", "First.java", 1);
+        StackWalker.StackFrame broken = frame("com.example.Second", "run", "Second.java", 2);
+        when(broken.getFileName()).thenThrow(new IllegalStateException("redefined"));
+        ApplicationFrames frames = ApplicationFrames.select(Stream.of(good, broken));
+
+        assertThat(frames.frames()).containsExactly("com.example.First.run(First.java:1)");
+        assertThatThrownBy(() -> frames.frames().add("other")).isInstanceOf(UnsupportedOperationException.class);
+        assertThat(frames.callSite()).isEqualTo("com.example.First.run(First.java:1)");
+        assertThat(frames.frames()).containsExactly("com.example.First.run(First.java:1)");
+    }
+
+    @Test
+    void retainedFramesStayFrozenWhileAnEarlierFormatterFinishes() throws Exception {
+        Thread application = Thread.currentThread();
+        CountDownLatch formatting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        StackWalker.StackFrame first = frame("com.example.First", "run", "First.java", 1);
+        StackWalker.StackFrame second = frame("com.example.Second", "run", "Second.java", 2);
+        when(first.getFileName()).thenAnswer(call -> {
+            if (Thread.currentThread() != application) {
+                formatting.countDown();
+                assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            }
+            return "First.java";
+        });
+        when(second.getFileName()).thenAnswer(call -> {
+            if (Thread.currentThread() == application) {
+                throw new IllegalStateException("redefined on the application reader");
+            }
+            return "Second.java";
+        });
+        ApplicationFrames original = ApplicationFrames.select(Stream.of(first, second));
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread earlier = new Thread(() -> {
+            try {
+                original.frames();
+            } catch (Throwable ex) {
+                failure.set(ex);
+            }
+        });
+        earlier.start();
+        SqlPayload retained;
+        int bytes;
+        try {
+            assertThat(formatting.await(5, TimeUnit.SECONDS)).isTrue();
+            JournalDictionary full = new JournalDictionary(0, 0);
+            retained = (SqlPayload) new SqlPayload("select ?", null, "orders", false, original).interned(full);
+            assertThat(retained.frames().frames()).containsExactly("com.example.First.run(First.java:1)");
+            bytes = retained.estimatedBytes(full);
+        } finally {
+            release.countDown();
+            earlier.join(5_000);
+        }
+        assertThat(earlier.isAlive()).isFalse();
+        assertThat(failure.get()).isNull();
+        assertThat(original.frames())
+                .as("the earlier formatter really replaced the origin's formatted state")
+                .containsExactly("com.example.First.run(First.java:1)", "com.example.Second.run(Second.java:2)");
+        assertThat(retained.frames().frames())
+                .as("retained evidence is frozen independently of its capture wrapper")
+                .containsExactly("com.example.First.run(First.java:1)");
+        assertThat(retained.estimatedBytes(new JournalDictionary(0, 0))).isEqualTo(bytes);
     }
 
     @Test
