@@ -3,9 +3,6 @@
 BootUI ships as a Quarkus extension. It serves the same console and the same JSON contract as the Spring starter,
 backed by the Quarkus build of the framework-neutral engine.
 
-Before publication, use the [locally built v2 artifacts](../V2-EARLY-ADOPTERS.md): the branch still uses the
-released line's `1.21.0` version, so keep that build in an isolated repository.
-
 ## Prerequisites
 
 - Java 17 or later

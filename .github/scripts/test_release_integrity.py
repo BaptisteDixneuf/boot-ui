@@ -813,7 +813,8 @@ class ReleaseIntegrityTests(unittest.TestCase):
                 result = self.check(root_files={".github/release-line": f"# test\n{line}\n"})
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 if expected:
-                    self.assertIn("contains bootui-agent", result.stderr)
+                    # Once the project version is 2.x the version check rejects line 1 before the agent check.
+                    self.assertRegex(result.stderr, "contains bootui-agent|does not match project version")
 
     def test_gate_steps_must_be_whole_lines(self):
         forced = GATE_RUN + "; echo publish=true >> \"$GITHUB_OUTPUT\""
