@@ -30,7 +30,7 @@ onBeforeUnmount(() => document.removeEventListener('click', watchVideo))
 
 <template>
   <section :id="ANCHOR" ref="section" class="bootui-showcase-video" aria-labelledby="bootui-showcase-video-title">
-    <h2 id="bootui-showcase-video-title" class="bootui-showcase-video-title">See BootUI 2.0 in action</h2>
+    <h2 id="bootui-showcase-video-title" class="bootui-showcase-video-title">See BootUI in four minutes</h2>
     <div class="bootui-showcase-video-frame">
       <video
         ref="player"
@@ -49,8 +49,8 @@ onBeforeUnmount(() => document.removeEventListener('click', watchVideo))
       </video>
     </div>
     <p id="bootui-showcase-video-caption" class="bootui-showcase-video-caption">
-      Explore advisors, exact request correlation, Runtime Insights, JVM diagnostics, and AI-assisted investigations in
-      the running sample application.
+      The Spring Boot sample app from start-up to fix: advisors, Live Activity, runtime panels, and an AI agent
+      verifying its change over MCP.
     </p>
   </section>
 </template>

@@ -117,9 +117,11 @@ to get past a timeout.
 ### Showcase video
 
 The homepage MP4 lives outside Git as `bootui-showcase.mp4` on a media-only GitHub Release. Each branch selects
-that release in `docs/.vuepress/showcase-video.json`: the 1.x site uses `showcase-video`, and the 2.0 site uses
-`showcase-video-v2-r2`. Keep the v1 release and asset intact. These media tags do not start with `v`, so they do not
-trigger the Maven Release workflow or count as a product version.
+that release in `docs/.vuepress/showcase-video.json`. For now, both the 1.x and 2.0 sites retain the original
+`showcase-video`, with its matching v1 poster, captions, and player copy, at the maintainer's request.
+`showcase-video-v2-r2` remains hosted but is not selected for the homepage. Keep all published media releases and
+assets intact. These media tags do not start with `v`, so they do not trigger the Maven Release workflow or count
+as a product version. A new product release does not require changing the showcase video.
 
 Published media releases can be immutable. If an approved correction is needed, publish a new revisioned media
 release, such as `showcase-video-v2-r2`, and update the manifest after verifying its assets. Do not delete or move
@@ -131,8 +133,9 @@ documentation branch; do not pair the new narration with old captions. Pages dow
 the site build, fails on a missing config or asset, and checks all three assets in the generated site.
 
 Keep `pages.yml` byte-identical on `main` and `v2` as required by the rehearsal: backport the config-driven
-download step to `main` together with a manifest selecting `showcase-video`, while `v2` selects
-the approved v2 media revision. This preserves the current v1 homepage. The normal release-line gate still prevents
+download step to `main` together with a manifest selecting `showcase-video`. The `v2` manifest currently selects
+the same original video; any later switch must include the selected video's matching poster, captions, and copy.
+This preserves the current v1 homepage. The normal release-line gate still prevents
 deploying the v2 homepage before 2.0.0 is published; uploading a media asset is not permission to bypass that gate.
 
 ### Release sign-off format
