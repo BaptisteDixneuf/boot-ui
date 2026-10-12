@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The Database advisor's `DB-RUNTIME-001` no longer counts executions that differ only in the length of a bound
+  `IN (?, ?)` list as distinct texts, and `get_sql_traces` accepts the
+  reported shape id as its `query`.
+
 ## [2.0.0] - 2026-10-12
 
 ### Upgrading from 1.x
