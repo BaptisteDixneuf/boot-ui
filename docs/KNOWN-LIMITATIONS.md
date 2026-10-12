@@ -158,6 +158,8 @@ on for one Spring MVC sample route, against the then-current 5 % target; its 96 
 journal enabled by default despite this measured miss; see the [validation report](V2-VALIDATION-REPORT.md#release-sign-off).
 
 On 2026-10-12 the maintainer increased the journal throughput target to 10 %, without changing the workload or
-historical results. The latest validated source (`58e4936`, CI run `38167277335`) measured 10.1 % overhead, with a
-96.5 % interval of 8.0–12.7 % and zero reported drops, so it still misses the revised median target. This is not a
-throughput improvement or release approval; the capture-p99, memory and agent budgets remain unchanged.
+historical results. Source `58e4936` (CI run `38167277335`) measured 10.1 % overhead, with a 96.5 % interval of
+8.0–12.7 %. The later source `60749f232` (CI run `38229746745`) measured **12.1 %**, with a 96.5 % interval of
+8.8–16.0 %, median p99 25.81 ms on versus 23.30 ms off, and zero reported drops. It still misses the 10 % target.
+The maintainer accepted this measured 12.1 % exception on 2026-10-12; that is not a throughput improvement,
+a universal overhead bound, or overall release approval. The capture-p99, memory and agent budgets remain unchanged.

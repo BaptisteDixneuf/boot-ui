@@ -254,8 +254,15 @@ before proceeding.
    Tag-entry and `skip_build` runs do that from the immutable tagged checkout before uploading instead; a successful
    pre-tag smoke is not repeated after the tag. Publication, availability checks, published-consumer smoke and the site
    deployment all use the commit peeled from the verified signed tag.
-10. **After the release.** Confirm that the site shows 2.0 (deployed from the v2.0.0 tag), that
-   `jbang bootui@jdubois/boot-ui` and the installers resolve 2.0.0, and that the next daily Docker run publishes 2.x
-   images. Narrow the `github-pages` tag rule to `v2.*`. After the first 1.x patch that follows, confirm that
+10. **After the release.** Confirm that the site shows 2.0 (deployed from the v2.0.0 tag), and that
+   `jbang bootui@jdubois/boot-ui` and the installers resolve 2.0.0. Once 2.0.0 is available on Maven Central,
+   explicitly run **Publish Docker images** (`docker-publish.yml`) from `main`, with `cleanup_only=false`,
+   rather than waiting for the daily schedule. Before Central availability, the gate must still skip the build
+   and publication; never bypass it to test new images early. Require all six variants (JVM, AOT, CRaC, native,
+   WebFlux, and Quarkus) on both architectures to pass the workflow's native-runner smoke tests, including
+   readiness, BootUI API/UI, AOT advisor checks, and CRaC checkpoint/restore. Verify the published multi-arch
+   manifests and exact tested digests, then pull and exercise the published images on available platforms;
+   report any platform not additionally exercised rather than claiming local cross-architecture coverage.
+   Narrow the `github-pages` tag rule to `v2.*`. After the first 1.x patch that follows, confirm that
    Maven Central's `maven-metadata.xml` for `bootui-cli` still lists a 2.x `<release>`, which the installers and the
    CLI's update check read.

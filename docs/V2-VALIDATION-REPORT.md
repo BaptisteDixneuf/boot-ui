@@ -419,13 +419,30 @@ enforcement, capture-p99 target, retained-memory bound and agent budgets are unc
 retain their original measured values, targets and verdicts; this is a prospective policy change, not a performance
 optimization or a rescore of earlier experiments.
 
-The latest validated source is `58e4936ef9e2f178392aa8b3253186abec504d80`, version `1.21.0`.
+The source validated when the budget changed was `58e4936ef9e2f178392aa8b3253186abec504d80`, version `1.21.0`.
 Its [Java 17 build](https://github.com/jdubois/boot-ui/actions/runs/38167277335) completed 37 jobs successfully,
 and its [JDK compatibility run](https://github.com/jdubois/boot-ui/actions/runs/38167277348) completed six.
 The journal benchmark measured **10.1 % median overhead**, a **96.5 % interval of 8.0–12.7 %**,
 p99 28.67 ms on versus 26.44 ms off, and zero reported drops. Its original report says FAIL against 5 %;
 10.1 % also exceeds the revised 10 % target. No new measurement, universal bound, release exception acceptance
 or release approval is supplied by changing the budget.
+
+### Measured journal exception accepted, 2026-10-12
+
+Source `60749f232d7df5913e30bfe0c8fb069d508b96c4`, version `1.21.0`, passed all 37 jobs in its
+[Java 17 build](https://github.com/jdubois/boot-ui/actions/runs/38229746745) and all six jobs in its
+[JDK compatibility run](https://github.com/jdubois/boot-ui/actions/runs/38229746741). Its fifteen alternating
+journal-on/off pairs measured **12.1 % median overhead against the unchanged 10 % target: Not met**,
+with a **96.5 % distribution-free interval of 8.8–16.0 %**, median p99 25.81 ms on versus 23.30 ms off,
+and zero reported drops. The `journal-overhead` artifact retains the report and properties. This is the same
+Spring MVC sample route and concurrency level, with BootUI enabled without the agent in both arms, not a
+universal application estimate or evidence of an optimization.
+
+The maintainer explicitly accepted this measured exception: **"Yes I sign off for the 12.1% overhead"**.
+The journal stays enabled by default. The benchmark's FAIL verdict, 10 % target, report-only enforcement,
+capture-p99 and memory bounds, agent budgets, and all historical results remain unchanged. This acceptance
+does not accept every other missed target, select a final candidate, fill the maintainer metadata, or
+authorize the overall 2.0.0 release; the release decision below remains `PENDING`.
 
 ## Release sign-off
 
@@ -459,7 +476,7 @@ One row per §2.2 measure. **Result** is the measured value; **Status** is **Met
 | --- | --- | --- | --- | --- |
 | Exact correlation | ≥ 99 % of request-thread events carry their request id on Spring MVC and Quarkus, with and without tracing; WebFlux reports its measured coverage | The concurrency scenario on the sample apps, in CI | CI run [37893526010](https://github.com/jdubois/boot-ui/actions/runs/37893526010), source `6cefe135f698cfcae75e1880f1b9229a63034613`: Spring MVC passed with tracing on and off; Quarkus passed its 100 % SQL/exception nesting floors with tracing on and off; WebFlux measured 100 % SQL/cache correlation with tracing on. Per-source evidence and limits below | **Met on the exercised sample sources**; refresh the evidence on the final candidate |
 | Capture overhead, application thread | < 2 µs p99 for the full application-thread path on a reference machine | The timed engine test | Local `JournalCaptureBudgetBenchmarkTest` (2026-10-09, JDK 27, macOS aarch64, 10 processors): snapshot, envelope, and offer p99 was 0.67 µs with one producer and 51.04 µs with eight | **Not met** at eight producers |
-| Capture overhead, throughput | Sample-app throughput within 10 % with the journal on versus off (D52, revised 2026-10-12) | The sample-app benchmark scenario, BootUI on in both runs | CI run [37887180472](https://github.com/jdubois/boot-ui/actions/runs/37887180472): journal-on median throughput was 85.9 % of journal-off (14.1 % lower); 96 % distribution-free interval for overhead 9–16 %; median p99 24.31 ms on versus 22.20 ms off; zero drops. This historical run used the original 5 % target; the latest source-qualified 10.1 % measurement is recorded above | **Not met** under either target (one sample workload; not a universal application estimate) |
+| Capture overhead, throughput | Sample-app throughput within 10 % with the journal on versus off (D52, revised 2026-10-12) | The sample-app benchmark scenario, BootUI on in both runs | CI run [38229746745](https://github.com/jdubois/boot-ui/actions/runs/38229746745), source `60749f232`: 12.1 % median overhead; 96.5 % interval 8.8–16.0 %; median p99 25.81 ms on versus 23.30 ms off; zero drops. Earlier 14.1 % and 10.1 % measurements retain their own sources and verdicts above | **Not met**; maintainer accepted this measured 12.1 % exception on 2026-10-12 (one sample workload; not a universal application estimate). Overall release approval remains pending |
 | Java agent overhead | Sample-app throughput within 10 % with the default sensors claimed | The `agent-overhead` job | In CI run [37887180472](https://github.com/jdubois/boot-ui/actions/runs/37887180472), default sensors reduced median throughput by 6.0 %; 96 % distribution-free interval −1.0 to 14.9 % | **Met on the median only**; interval crosses the 10 % target |
 | External validity, tuned applications | ≥ 70 % of default-visible distinct facts judged actionable or informative by both reviewers, none misleading | The rerun on the five tuned applications | 7 of 20 facts (35 %) useful to both reviewers; 0 misleading after adjudication (4 judged misleading by one reviewer, all adjudicated otherwise) | **Not met** (35 % < 70 %) |
 | External validity, holdout applications | The same target, scored apart | The rerun on the two holdout applications | 3 of 11 facts (27.3 %) useful to both; 2 misleading after adjudication: the bookstore's `connections-per-request` (both reviewers) and Timeless's `ai-usage-by-route` (adjudicated) | **Not met** |
@@ -543,7 +560,7 @@ definition and criterion-by-criterion grades remain preserved as session artifac
 | After M1 | Exact correlation ≥ 95 % on Spring MVC and Quarkus | Passed: 100 % on every stack (M1-6f) | Recorded |
 | After M3, global | Default-visible score ≥ 30 %, otherwise every kind missing its per-kind gate folds and Runtime Insights is presented as a Live Activity view | 10 of 31 default-visible facts on the seven applications (32.3 %) useful to both reviewers | Passed: no escalation |
 | After M3, holdouts | Holdout applications no more than 20 points below the tuned ones, with the same consequence | Tuned 35 % (7 of 20), holdouts 27.3 % (3 of 11): 7.7 points below; neither holdout is empty | Passed: no escalation |
-| Before 2.0.0, overhead | Journal throughput within 10 % (D52) | Historical sample-app measurement: 14.1 % median lower throughput, with a 9–16 % 96 % interval for overhead, against the original 5 % target. Latest validated source: 10.1 % median overhead, 8.0–12.7 % interval | **Not met**; maintainer-directed default-on exception recorded below, release approval still pending |
+| Before 2.0.0, overhead | Journal throughput within 10 % (D52) | Source `60749f232`, CI run `38229746745`: 12.1 % median overhead, 96.5 % interval 8.8–16.0 %. Historical 14.1 % and 10.1 % measurements retain their own sources above | **Not met**; maintainer accepted the measured 12.1 % exception and retained the default enabled. Overall release approval is still pending |
 
 **Measuring the journal's overhead.** Both overhead rows, "Capture overhead, throughput" and "Before 2.0.0, overhead",
 read one measurement: `JournalOverheadBenchmarkIT`, a paired A/B on the Spring sample's executable jar with BootUI on
@@ -566,12 +583,13 @@ It writes `bootui-spring-sample-app/target/journal-overhead/spring-mvc-journal.m
 (`overheadPercent`, `lowOverheadPercent` and `highOverheadPercent` for the interval, `p99OnMillis`, `p99OffMillis`). Each
 run starts on a free port of its own. A loaded machine widens the interval.
 
-The result above is from CI run `37887180472` (Java 17.0.20.1, four processors), not a cross-application estimate:
+The latest journal result above is from CI run `38229746745` (Java 17.0.20.1, four processors); the historical
+14.1 % result is from `37887180472`. Neither is a cross-application estimate:
 one Spring MVC sample route, one concurrency level, and one CI runner provide no universal application overhead
 figure. The journal remains enabled by default by explicit maintainer direction; the missed target and that exception
 are both recorded rather than treating the benchmark as a reason to change the default.
 
-**Supplementary agent measurements.** In the same CI run, the default-sensor A/B used the same Spring MVC benchmark
+**Supplementary agent measurements.** In historical CI run `37887180472`, the default-sensor A/B used the same Spring MVC benchmark
 route, 15 alternating pairs, and BootUI enabled in both arms. The median throughput reduction was 6.0 %; its 96 %
 distribution-free interval was −1.0 to 14.9 %, so the median is within the 10 % target but the interval crosses it.
 The opt-in `thread-activity` sensor's route-specific A/B measured 12.1 % incremental median overhead over the default
