@@ -71,7 +71,7 @@ Install it as a real command with `jbang app install bootui@jdubois/boot-ui`, an
 **Or download the jar and run it directly:**
 
 ```bash
-VERSION=1.21.0
+VERSION=2.0.0
 BASE=https://repo1.maven.org/maven2/com/julien-dubois/bootui/bootui-cli
 curl -fLO "${BASE}/${VERSION}/bootui-cli-${VERSION}-all.jar"
 java -jar "bootui-cli-${VERSION}-all.jar" beans

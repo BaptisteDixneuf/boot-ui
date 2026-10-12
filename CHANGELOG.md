@@ -7,6 +7,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-12
+
 ### Upgrading from 1.x
 
 BootUI 2.0 changes a few defaults and dependencies. Most applications only need the first point; the entries below
@@ -2889,7 +2891,8 @@ First tagged BootUI alpha. Highlights of the harden-all-visible-panels scope:
   request history, distributed tracing, multi-service orchestration, and live
   Docker Compose lifecycle control are intentionally out of scope for the alpha.
 
-[Unreleased]: https://github.com/jdubois/boot-ui/compare/v1.20.0...HEAD
+[Unreleased]: https://github.com/jdubois/boot-ui/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jdubois/boot-ui/compare/v1.21.0...v2.0.0
 [1.20.0]: https://github.com/jdubois/boot-ui/compare/v1.19.0...v1.20.0
 [1.19.0]: https://github.com/jdubois/boot-ui/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/jdubois/boot-ui/compare/v1.17.0...v1.18.0

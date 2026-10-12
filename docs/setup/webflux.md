@@ -27,7 +27,7 @@ WebFlux application into a servlet one.
 <dependency>
   <groupId>com.julien-dubois.bootui</groupId>
   <artifactId>bootui-spring-boot-starter</artifactId>
-  <version>1.21.0</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
@@ -35,12 +35,12 @@ WebFlux application into a servlet one.
 
 ```groovy
 // Groovy DSL (build.gradle)
-runtimeOnly 'com.julien-dubois.bootui:bootui-spring-boot-starter:1.21.0'
+runtimeOnly 'com.julien-dubois.bootui:bootui-spring-boot-starter:2.0.0'
 ```
 
 ```kotlin
 // Kotlin DSL (build.gradle.kts)
-runtimeOnly("com.julien-dubois.bootui:bootui-spring-boot-starter:1.21.0")
+runtimeOnly("com.julien-dubois.bootui:bootui-spring-boot-starter:2.0.0")
 ```
 
 :::
