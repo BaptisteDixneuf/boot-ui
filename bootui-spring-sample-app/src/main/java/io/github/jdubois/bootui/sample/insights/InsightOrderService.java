@@ -16,6 +16,8 @@ import org.springframework.web.client.RestClient;
 @Service
 public class InsightOrderService {
 
+    private static final int REMOTE_PRICE_LATENCY_MILLIS = 40;
+
     private final JdbcTemplate jdbc;
     private final InsightAuditWriter audit;
     private final InsightSeedTables tables;
@@ -131,10 +133,12 @@ public class InsightOrderService {
 
     private String remotePrice() {
         String port = environment.getProperty("local.server.port", environment.getProperty("server.port", "8080"));
+        // A deliberately slow remote service: the check only reports a call of at least 20 ms, and a plain
+        // local call can be faster than that (as with the Redis-backed cache of the docker profile).
         return restClients
                 .build()
                 .get()
-                .uri("http://localhost:" + port + "/api/sample/hello")
+                .uri("http://localhost:" + port + "/api/sample/slow?ms=" + REMOTE_PRICE_LATENCY_MILLIS)
                 .retrieve()
                 .body(String.class);
     }

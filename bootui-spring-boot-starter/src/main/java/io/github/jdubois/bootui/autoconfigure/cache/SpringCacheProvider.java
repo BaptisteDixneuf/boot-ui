@@ -254,20 +254,26 @@ public class SpringCacheProvider implements CacheProvider {
             return CacheOperationDiscovery.empty();
         }
 
-        List<String> beanNames = Arrays.stream(BeanFactoryUtils.beanNamesIncludingAncestors(factory))
-                .sorted()
-                .toList();
+        // Application beans come first so that the scan budget is never spent on framework beans, which would
+        // hide the application's own annotated methods in an app with many auto-configured beans.
+        List<Map.Entry<String, Class<?>>> candidates = new ArrayList<>();
+        for (String beanName : BeanFactoryUtils.beanNamesIncludingAncestors(factory)) {
+            Class<?> type = safeGetType(factory, beanName);
+            if (type != null) {
+                candidates.add(Map.entry(beanName, ClassUtils.getUserClass(type)));
+            }
+        }
+        candidates.sort(Comparator.<Map.Entry<String, Class<?>>>comparingInt(
+                        candidate -> isFrameworkType(candidate.getValue()) ? 1 : 0)
+                .thenComparing(Map.Entry::getKey));
         List<CacheOperationDto> operations = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         int scannedMethods = 0;
 
         scan:
-        for (String beanName : beanNames) {
-            Class<?> type = safeGetType(factory, beanName);
-            if (type == null) {
-                continue;
-            }
-            Class<?> userType = ClassUtils.getUserClass(type);
+        for (Map.Entry<String, Class<?>> candidate : candidates) {
+            String beanName = candidate.getKey();
+            Class<?> userType = candidate.getValue();
             if (!selfDataFilter.shouldIncludeCacheOperation(beanName, userType)) {
                 continue;
             }
@@ -313,6 +319,20 @@ public class SpringCacheProvider implements CacheProvider {
                 .thenComparing(CacheOperationDto::method)
                 .thenComparing(CacheOperationDto::operation));
         return new CacheOperationDiscovery(operations, warnings);
+    }
+
+    private static boolean isFrameworkType(Class<?> type) {
+        String name = type.getName();
+        return name.startsWith("org.springframework.")
+                || name.startsWith("org.apache.")
+                || name.startsWith("org.hibernate.")
+                || name.startsWith("io.micrometer.")
+                || name.startsWith("io.netty.")
+                || name.startsWith("io.lettuce.")
+                || name.startsWith("com.fasterxml.")
+                || name.startsWith("tools.jackson.")
+                || name.startsWith("jakarta.")
+                || name.startsWith("ch.qos.");
     }
 
     private Class<?> safeGetType(ListableBeanFactory factory, String beanName) {

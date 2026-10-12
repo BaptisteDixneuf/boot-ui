@@ -28,13 +28,17 @@ class SpringCacheProviderTests {
 
     @SuppressWarnings("unchecked")
     private static SpringCacheProvider provider(ListableBeanFactory factory) {
+        return provider(factory, BootUiSelfDataFilter.defaults());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static SpringCacheProvider provider(ListableBeanFactory factory, BootUiSelfDataFilter filter) {
         ObjectProvider<ListableBeanFactory> factoryProvider = mock(ObjectProvider.class);
         when(factoryProvider.getIfAvailable()).thenReturn(factory);
         ObjectProvider<CacheOperationSource> operationSourceProvider = mock(ObjectProvider.class);
         when(operationSourceProvider.orderedStream())
                 .thenReturn(java.util.stream.Stream.of(new AnnotationCacheOperationSource()));
-        return new SpringCacheProvider(
-                factoryProvider, operationSourceProvider, new BootUiProperties(), BootUiSelfDataFilter.defaults());
+        return new SpringCacheProvider(factoryProvider, operationSourceProvider, new BootUiProperties(), filter);
     }
 
     @Test
@@ -50,6 +54,30 @@ class SpringCacheProviderTests {
         assertThat(managers).hasSize(1);
         assertThat(managers.get(0).type()).isEqualTo(ConcurrentMapCacheManager.class.getName());
         assertThat(managers.get(0).noOp()).isFalse();
+    }
+
+    @Test
+    void scansApplicationBeansBeforeFrameworkBeansSoTheScanBudgetIsNeverSpentOnFramework() {
+        StaticListableBeanFactory factory = new StaticListableBeanFactory();
+        // Sorting before the application bean: together they exceed the 5,000-method scan budget.
+        for (int i = 0; i < 40; i++) {
+            factory.addBean(
+                    "aaaFramework" + i, new org.springframework.beans.factory.support.DefaultListableBeanFactory());
+        }
+        factory.addBean("zzCatalog", new Catalog());
+
+        var discovery = provider(factory, BootUiSelfDataFilter.disabled()).operations();
+
+        assertThat(discovery.operations())
+                .extracting(operation -> operation.beanName())
+                .containsExactly("zzCatalog");
+    }
+
+    static class Catalog {
+        @org.springframework.cache.annotation.Cacheable("products")
+        public String products() {
+            return "";
+        }
     }
 
     @Test
