@@ -46,11 +46,16 @@ class McpDispatcherTests {
         AtomicInteger invocations = new AtomicInteger();
         McpDispatcher dispatcher = advisorDispatcher(250, args -> invocations.incrementAndGet());
         assertThat(dispatcher.dispatch(advisorRequest(" ", "scan", 0, 10)))
-                .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, McpProtocol.MISSING_ID_ARGUMENT_MESSAGE));
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Missing required argument: id (a rule id and the violationDetails.scanId from"
+                                + " get_architecture_report)"));
         for (String scanId : new String[] {null, "", " "}) {
             assertThat(dispatcher.dispatch(advisorRequest("RULE-1", scanId, 0, 10)))
                     .isEqualTo(new ProtocolError(
-                            McpProtocol.INVALID_PARAMS, McpProtocol.MISSING_SCAN_ID_ARGUMENT_MESSAGE));
+                            McpProtocol.INVALID_PARAMS,
+                            McpProtocol.MISSING_SCAN_ID_ARGUMENT_MESSAGE
+                                    + " (a rule id and the violationDetails.scanId from get_architecture_report)"));
         }
         assertThat(dispatcher.dispatch(advisorRequest("RULE-1", "scan", -1, 10)))
                 .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, "Argument 'offset' must be at least 0"));
@@ -187,6 +192,22 @@ class McpDispatcherTests {
     }
 
     @Test
+    void modernRequestsDiscoverTheServerAndHaveNoHandshakeOrPing() {
+        McpDispatcher dispatcher = dispatcher();
+        assertThat(dispatcher.dispatch(modern("server/discover")))
+                .isEqualTo(new McpDispatchOutcome.DiscoverResult(
+                        List.of("2026-07-28", "2025-06-18"), "bootui", "1.2.3", "instructions text"));
+        assertThat(dispatcher.dispatch(modern("ping")))
+                .isEqualTo(new ProtocolError(McpProtocol.METHOD_NOT_FOUND, "Unknown method: ping"));
+        assertThat(dispatcher.dispatch(modern("initialize")))
+                .isEqualTo(new ProtocolError(McpProtocol.METHOD_NOT_FOUND, "Unknown method: initialize"));
+        assertThat(dispatcher.dispatch(modern("tools/list"))).isInstanceOf(ToolsListResult.class);
+        assertThat(dispatcher.dispatch(method("server/discover")))
+                .as("legacy clients never see the modern discovery method")
+                .isEqualTo(new ProtocolError(McpProtocol.METHOD_NOT_FOUND, "Unknown method: server/discover"));
+    }
+
+    @Test
     void pingReturnsPingResult() {
         assertThat(dispatcher().dispatch(method("ping"))).isInstanceOf(PingResult.class);
     }
@@ -231,6 +252,89 @@ class McpDispatcherTests {
     }
 
     @Test
+    void promptsGetRendersDeclaredArgumentsAndRefusesUndeclaredOnes() {
+        McpPrompt focused = new McpPrompt(
+                "focus",
+                "Focus an investigation.",
+                "Inspect runtime evidence.",
+                List.of(
+                        new McpPrompt.Argument("symptom", "What failed.", "The symptom"),
+                        new McpPrompt.Argument("route", "Where.", "The route")));
+        McpDispatcher dispatcher = new McpDispatcher(
+                List.of(overview), List.of(focused), policy, "1.2.3", "instructions text", 50, 20, diagnostics);
+
+        assertThat(dispatcher.dispatch(prompt("focus", Map.of())))
+                .as("every argument is optional")
+                .isEqualTo(new PromptGetResult(focused, "Inspect runtime evidence."));
+        PromptGetResult rendered = (PromptGetResult)
+                dispatcher.dispatch(prompt("focus", Map.of("route", " GET /orders ", "symptom", "500s")));
+        assertThat(rendered.text())
+                .startsWith("Inspect runtime evidence.\n\n")
+                .endsWith("\n- The symptom: 500s\n- The route: GET /orders");
+        assertThat(((PromptGetResult) dispatcher.dispatch(prompt("focus", Map.of("route", "  ")))).text())
+                .as("a blank value adds no context")
+                .isEqualTo("Inspect runtime evidence.");
+        assertThat(((PromptGetResult) dispatcher.dispatch(prompt("focus", Map.of("symptom", "x".repeat(600))))).text())
+                .as("a value is bounded")
+                .endsWith("x".repeat(McpPrompt.MAX_ARGUMENT_LENGTH) + "...");
+        assertThat(dispatcher.dispatch(prompt("focus", Map.of("sympton", "typo"))))
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Unknown argument for prompt focus: sympton. It takes route, symptom."));
+        assertThat(dispatcher().dispatch(prompt("diagnose", Map.of("symptom", "x"))))
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Unknown argument for prompt diagnose: symptom. It takes no arguments."));
+        McpRequest malformed = new McpRequest(
+                JSONRPC,
+                "prompts/get",
+                false,
+                null,
+                "focus",
+                null,
+                null,
+                null,
+                Set.of(),
+                McpProtocol.PROMPT_ARGUMENTS_OBJECT_MESSAGE,
+                null,
+                null);
+        assertThat(dispatcher.dispatch(malformed))
+                .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, McpProtocol.PROMPT_ARGUMENTS_OBJECT_MESSAGE));
+    }
+
+    @Test
+    void aBoundedPromptArgumentNeverSplitsASurrogatePair() {
+        String emoji = "\uD83D\uDE00";
+        String split = "x".repeat(McpPrompt.MAX_ARGUMENT_LENGTH - 1) + emoji + "tail";
+        assertThat(McpPrompt.bounded(split)).isEqualTo("x".repeat(McpPrompt.MAX_ARGUMENT_LENGTH - 1) + "...");
+        String whole = "x".repeat(McpPrompt.MAX_ARGUMENT_LENGTH - 2) + emoji + "tail";
+        assertThat(McpPrompt.bounded(whole)).isEqualTo(whole.substring(0, McpPrompt.MAX_ARGUMENT_LENGTH) + "...");
+        assertThat(McpPrompt.bounded("short")).isEqualTo("short");
+    }
+
+    private static McpRequest prompt(String name, Map<String, String> arguments) {
+        return new McpRequest(
+                JSONRPC,
+                "prompts/get",
+                false,
+                null,
+                name,
+                null,
+                null,
+                null,
+                Set.of(),
+                null,
+                null,
+                null,
+                McpEra.LEGACY,
+                null,
+                null,
+                null,
+                null,
+                arguments);
+    }
+
+    @Test
     void toolsCallReturnsPayload() {
         McpDispatchOutcome outcome = dispatcher().dispatch(call("get_overview"));
 
@@ -256,6 +360,28 @@ class McpDispatcherTests {
     }
 
     @Test
+    void toolsCallWithoutLimitGetsACompactedToolsShortDefaultPage() {
+        McpTool insights = new McpTool(
+                "get_runtime_insights",
+                "Runtime Insights for agents.",
+                McpToolSchema.QUERY_LIMIT,
+                "runtime-insights",
+                false,
+                args -> Map.of("limit", args.limit()));
+        McpDispatcher dispatcher = new McpDispatcher(
+                List.of(insights), List.of(), policy, "1.2.3", "instructions text", 50, 20, diagnostics);
+
+        assertThat(((ToolCallResult) dispatcher.dispatch(new McpRequest(
+                                JSONRPC, "tools/call", false, null, "get_runtime_insights", null, null, null)))
+                        .payload())
+                .isEqualTo(Map.of("limit", 8));
+        assertThat(((ToolCallResult) dispatcher.dispatch(new McpRequest(
+                                JSONRPC, "tools/call", false, null, "get_runtime_insights", null, 20, null)))
+                        .payload())
+                .isEqualTo(Map.of("limit", 20));
+    }
+
+    @Test
     void toolsCallWithIdSchemaPassesTrimmedIdToHandler() {
         McpDispatchOutcome outcome = dispatcher()
                 .dispatch(new McpRequest(
@@ -269,7 +395,10 @@ class McpDispatcherTests {
         McpDispatchOutcome outcome = dispatcher().dispatch(call("get_exception_detail"));
 
         assertThat(outcome)
-                .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, McpProtocol.MISSING_ID_ARGUMENT_MESSAGE));
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Missing required argument: id (an exception group id from get_exceptions or"
+                                + " get_live_activity)"));
     }
 
     @Test
@@ -279,7 +408,10 @@ class McpDispatcherTests {
                         new McpRequest(JSONRPC, "tools/call", false, null, "get_exception_detail", null, null, "   "));
 
         assertThat(outcome)
-                .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, McpProtocol.MISSING_ID_ARGUMENT_MESSAGE));
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Missing required argument: id (an exception group id from get_exceptions or"
+                                + " get_live_activity)"));
     }
 
     @Test
@@ -289,6 +421,36 @@ class McpDispatcherTests {
 
         assertThat(dispatcher().dispatch(request))
                 .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, "Unexpected tool arguments: extra, query"));
+    }
+
+    @Test
+    void aQueryOnlyToolIgnoresTheLimitAnOlderCliStillSendsButRejectsOtherArguments() {
+        McpTool agent = new McpTool(
+                "get_agent_status",
+                "Agent status.",
+                McpToolSchema.QUERY,
+                "java-agent",
+                false,
+                args -> Map.of("query", String.valueOf(args.query())));
+        McpDispatcher dispatcher =
+                new McpDispatcher(List.of(agent), List.of(), policy, "1.2.3", "instructions text", 50, 20, diagnostics);
+
+        McpRequest withLimit = new McpRequest(
+                JSONRPC,
+                "tools/call",
+                false,
+                null,
+                "get_agent_status",
+                "exec",
+                1,
+                null,
+                Set.of("query", "limit"),
+                null);
+        assertThat(((ToolCallResult) dispatcher.dispatch(withLimit)).payload()).isEqualTo(Map.of("query", "exec"));
+        McpRequest withId = new McpRequest(
+                JSONRPC, "tools/call", false, null, "get_agent_status", null, null, "x", Set.of("id"), null);
+        assertThat(dispatcher.dispatch(withId))
+                .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, "Unexpected tool argument: id"));
     }
 
     @Test
@@ -322,6 +484,98 @@ class McpDispatcherTests {
         McpDispatchOutcome outcome = dispatcher().dispatch(call("does_not_exist"));
 
         assertThat(outcome).isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, "Unknown tool: does_not_exist"));
+    }
+
+    @Test
+    void aCatalogToolThisServerDoesNotAdvertiseSaysWhyItsPanelIsUnavailable() {
+        McpDispatcher dispatcher = new McpDispatcher(
+                () -> List.of(overview),
+                List.of(),
+                policy,
+                "1.2.3",
+                "",
+                50,
+                20,
+                1_000,
+                diagnostics,
+                panelId -> panelId.equals("kafka") ? "No KafkaTemplate bean is available" : null);
+
+        assertThat(dispatcher.dispatch(call("get_kafka_activity")))
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Tool not available in this application: get_kafka_activity. Its Kafka panel is unavailable:"
+                                + " No KafkaTemplate bean is available.",
+                        Map.of(
+                                "tool",
+                                "get_kafka_activity",
+                                "panel",
+                                "kafka",
+                                "reason",
+                                "No KafkaTemplate bean is available")));
+        assertThat(dispatcher.dispatch(call("get_conditions")))
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Tool not available in this application: get_conditions. Only Spring MVC and Spring WebFlux"
+                                + " advertise it.",
+                        Map.of("tool", "get_conditions", "panel", "conditions")));
+        assertThat(dispatcher.dispatch(call("get_emails")))
+                .isEqualTo(new ProtocolError(
+                        McpProtocol.INVALID_PARAMS,
+                        "Tool not available in this application: get_emails. Its Email panel does not provide it in"
+                                + " this application.",
+                        Map.of("tool", "get_emails", "panel", "email")));
+        assertThat(dispatcher.dispatch(call("does_not_exist")))
+                .isEqualTo(new ProtocolError(McpProtocol.INVALID_PARAMS, "Unknown tool: does_not_exist"));
+        assertThat(diagnostics.count()).isZero();
+    }
+
+    @Test
+    void aCatalogToolMissingBecauseItsPanelIsDisabledGetsTheDisabledRefusal() {
+        policy.disabled.add("websockets");
+        McpDispatcher dispatcher = new McpDispatcher(
+                () -> List.of(overview),
+                List.of(),
+                policy,
+                "1.2.3",
+                "",
+                50,
+                20,
+                1_000,
+                diagnostics,
+                panelId -> "No WebSocket support is on the classpath.");
+
+        assertThat(dispatcher.dispatch(call("get_websockets")))
+                .isEqualTo(new ToolCallError("disabled:websockets", McpDispatchOutcome.ToolErrorReason.PANEL_DISABLED));
+    }
+
+    @Test
+    void aFailingAvailabilityLookupStillAnswersAndIsReported() {
+        McpDispatcher dispatcher = new McpDispatcher(
+                () -> List.of(overview), List.of(), policy, "1.2.3", "", 50, 20, 1_000, diagnostics, panelId -> {
+                    throw new IllegalStateException("boom");
+                });
+
+        assertThat(dispatcher.dispatch(call("get_kafka_activity")))
+                .isInstanceOfSatisfying(
+                        ProtocolError.class,
+                        error -> assertThat(error.message())
+                                .startsWith(McpProtocol.UNAVAILABLE_TOOL_PREFIX + "get_kafka_activity."));
+        assertThat(diagnostics.count()).isEqualTo(1);
+    }
+
+    @Test
+    void toolsListCarriesHintsAndPerToolArgumentSchemas() {
+        ToolsListResult result = (ToolsListResult) dispatcher().dispatch(method("tools/list"));
+
+        assertThat(result.tools().get(0).annotations()).isEqualTo(new McpToolAnnotations(true, false, true, false));
+        assertThat(result.tools().get(1).annotations()).isEqualTo(new McpToolAnnotations(false, false, false, false));
+        McpToolInputSchema config = result.tools().get(2).inputSchema();
+        assertThat(config.properties())
+                .extracting(McpToolInputSchema.Property::name)
+                .containsExactly("query", "limit");
+        // get_config's agent page, below the dispatcher's max-results of 50.
+        assertThat(config.properties().get(1).defaultValue()).isEqualTo(McpAgentViews.INVENTORY_DEFAULT_LIMIT);
+        assertThat(result.tools().get(3).inputSchema().required()).containsExactly("id");
     }
 
     @Test
@@ -486,6 +740,78 @@ class McpDispatcherTests {
         assertThat(diagnostics.count()).isEqualTo(1);
         assertThat(diagnostics.failure()).isSameAs(failure);
         assertThat(diagnostics.operation()).isEqualTo("dispatching a request");
+    }
+
+    @Test
+    void aCancelledToolIsNotReportedAsAServerFault() {
+        McpTool cancelled = new McpTool("cancelled", "Cancelled.", McpToolSchema.NONE, "overview", false, args -> {
+            throw new io.github.jdubois.bootui.engine.progress.OperationCancelledException();
+        });
+        McpDispatcher dispatcher =
+                new McpDispatcher(List.of(cancelled), List.of(), policy, "1.0", "x", 50, 20, diagnostics);
+
+        assertThat(dispatcher.dispatch(call("cancelled"))).isEqualTo(new McpDispatchOutcome.Cancelled());
+        assertThat(diagnostics.count()).isZero();
+        assertThat(dispatcher.runtimeStats().snapshot().cancellations()).isEqualTo(1);
+    }
+
+    @Test
+    void aCancellationHandleStopsTheRunningToolAndReleasesItsPermitOnce() throws Exception {
+        CountDownLatch running = new CountDownLatch(1);
+        CountDownLatch stopped = new CountDownLatch(1);
+        AtomicReference<Boolean> sawCancellation = new AtomicReference<>();
+        McpTool slow = new McpTool("slow", "Slow.", McpToolSchema.NONE, "overview", false, args -> {
+            io.github.jdubois.bootui.engine.progress.OperationProgress progress =
+                    io.github.jdubois.bootui.engine.progress.OperationProgress.current();
+            try {
+                running.countDown();
+                Thread.sleep(30_000);
+                return "never";
+            } catch (InterruptedException interrupted) {
+                sawCancellation.set(progress.cancelled());
+                return "interrupted";
+            } finally {
+                stopped.countDown();
+            }
+        });
+        McpDispatcher dispatcher = new McpDispatcher(List.of(slow), List.of(), policy, "1.0", "x", 50, 1, diagnostics);
+        McpCancellation cancellation = new McpCancellation();
+        AtomicReference<McpDispatchOutcome> outcome = new AtomicReference<>();
+        Thread caller = new Thread(() -> outcome.set(dispatcher.dispatch(call("slow"), cancellation)));
+        caller.start();
+        assertThat(running.await(5, TimeUnit.SECONDS)).isTrue();
+
+        cancellation.cancel();
+        cancellation.cancel();
+        caller.join(5_000);
+
+        assertThat(outcome.get()).isEqualTo(new McpDispatchOutcome.Cancelled());
+        assertThat(stopped.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(sawCancellation.get())
+                .as("the tool's progress is cancelled too")
+                .isTrue();
+        McpRuntimeStats.Snapshot stats = dispatcher.runtimeStats().snapshot();
+        assertThat(stats.cancellations()).isEqualTo(1);
+        assertThat(stats.timeouts()).isZero();
+        assertThat(stats.callCount()).isEqualTo(1);
+        assertThat(diagnostics.count()).isZero();
+        // The tool thread releases the permit after its finally block has run, so wait for it rather than racing it.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (dispatcher.availableCallPermits() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(dispatcher.availableCallPermits()).isEqualTo(1);
+        assertThat(dispatcher.dispatch(call("slow"), cancelledBeforeStart()))
+                .as("the single permit is free again, and a handle cancelled first stops the call at once")
+                .isEqualTo(new McpDispatchOutcome.Cancelled());
+        assertThat(dispatcher.runtimeStats().snapshot().callCount()).isEqualTo(2);
+        cancellation.cancel();
+    }
+
+    private static McpCancellation cancelledBeforeStart() {
+        McpCancellation cancellation = new McpCancellation();
+        cancellation.cancel();
+        return cancellation;
     }
 
     @Test
@@ -655,6 +981,11 @@ class McpDispatcherTests {
 
     private static McpRequest method(String method) {
         return new McpRequest(JSONRPC, method, false, null, null, null, null, null);
+    }
+
+    private static McpRequest modern(String method) {
+        return new McpRequest(
+                JSONRPC, method, false, null, null, null, null, null, Set.of(), null, null, null, McpEra.MODERN, null);
     }
 
     private static McpRequest call(String toolName) {

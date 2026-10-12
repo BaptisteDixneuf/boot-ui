@@ -1,5 +1,6 @@
 // @ts-check
-import {expect, test} from '@playwright/test'
+import {expect, test} from '../tests/fixtures.js'
+import {registerResourceLedgerTests} from '../scenarios/resource-ledger.js'
 
 async function expandAllSidebarGroups(page) {
   const toggles = page.locator('aside .bootui-nav-group__toggle')
@@ -73,9 +74,9 @@ test.describe('BootUI on Spring WebFlux', () => {
     })
   })
 
-  test('redirects the root path to /overview', async ({page}) => {
+  test('redirects the root path to /scorecard', async ({page}) => {
     await page.goto('/bootui/')
-    await expect(page).toHaveURL(/\/bootui\/#\/overview$/)
+    await expect(page).toHaveURL(/\/bootui\/#\/scorecard$/)
   })
 
   test('a representative sample of ported panels render', async ({page}) => {
@@ -111,6 +112,10 @@ test.describe('BootUI on Spring WebFlux', () => {
         .filter({hasText: /^MCP Server/})
         .first()
     ).toBeVisible({timeout: 15_000})
+    const protocols = page.locator('[data-testid="mcp-protocols"]')
+    await expect(protocols).toContainText('2026-07-28')
+    await expect(protocols).toContainText('2025-06-18')
+    await expect(page.locator('[data-testid="mcp-call-stats"]')).toHaveText(/^\d+ · \d+ timed out · \d+ cancelled$/)
 
     await expect(page.getByRole('tablist', {name: 'MCP client'})).toHaveCount(1)
     await expect(page.locator('#mcp-client-vscode-panel .config-block')).toContainText('"servers"')
@@ -152,7 +157,7 @@ test.describe('BootUI on Spring WebFlux', () => {
     await expect(page.locator('.activity-table')).toBeVisible()
   })
 
-  test('profiles a traced request with trace-id-only tiers on the reactive stack', async ({
+  test('profiles a traced request with exact tiers only on the reactive stack', async ({
     browserName,
     context,
     page,
@@ -173,6 +178,7 @@ test.describe('BootUI on Spring WebFlux', () => {
     const traced = await request.get(`${baseURL}/api/greetings/Grace`, {
       headers: {traceparent: `00-${traceId}-00f067aa0ba902b7-01`}
     })
+
     expect(traced.ok()).toBeTruthy()
 
     const activity = await request.get(`${baseURL}/bootui/api/activity`)
@@ -188,24 +194,93 @@ test.describe('BootUI on Spring WebFlux', () => {
 
     const drawer = page.locator('.activity-drawer')
     await expect(drawer).toBeVisible()
-    await expect(drawer).toContainText('reduced, trace-id-only profile')
+    await expect(drawer).toContainText('This is a reduced profile')
     await expect(drawer.getByRole('heading', {name: /^REST client calls/})).toBeVisible()
     await expect(drawer.getByRole('heading', {name: /^Cache accesses/})).toBeVisible()
     await expect(drawer).toContainText('Serving thread and time window correlation are unavailable on this adapter')
     await expect(drawer.getByRole('button', {name: /Copy profile/})).toBeVisible()
+    const journal = drawer.locator('.request-journal')
+    await expect(journal.getByRole('heading', {name: 'Recorded by the runtime journal'})).toHaveCount(1)
+    await expect(journal).toContainText('GET /api/greetings/{name}')
 
     // Copy for AI renders the same reactive profile through the shared Markdown helper.
     await drawer.getByRole('button', {name: 'Copy for AI'}).click()
     const preview = drawer.getByRole('textbox', {name: 'Markdown export preview'})
     await expect(preview).toHaveValue(/# BootUI request profile: `GET \/api\/greetings\/Grace`/)
     await expect(preview).toHaveValue(new RegExp(`- \\*\\*Trace id:\\*\\* \`${traceId}\``))
-    await expect(preview).toHaveValue(/reduced, trace-id-only profile/)
+    await expect(preview).toHaveValue(/time window correlation are unavailable on this adapter/)
     await drawer.getByRole('button', {name: 'Copy Markdown'}).click()
     await expect(drawer.getByRole('button', {name: 'Copied'})).toBeVisible()
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await preview.inputValue())
 
     await page.keyboard.press('Escape')
     await expect(drawer).toHaveCount(0)
+  })
+
+  test('opens the reactive journal profile when its HTTP exchange has left the buffer', async ({
+    page,
+    request,
+    baseURL
+  }) => {
+    const traffic = await request.get(`${baseURL}/api/greetings/Grace`)
+    expect(traffic.ok()).toBeTruthy()
+    const activity = await request.get(`${baseURL}/bootui/api/activity?source=journal`)
+    const exemplar = (await activity.json()).entries.find(
+      (entry) => entry.type === 'REQUEST' && entry.path === '/api/greetings/Grace'
+    )
+    expect(exemplar?.id).toBeTruthy()
+
+    await page.route('**/api/activity/request/*', async (route) => {
+      if (route.request().url().endsWith('/journal')) return route.continue()
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          available: false,
+          unavailableReason: `Request ${exemplar.id} is no longer in the buffer.`
+        })
+      })
+    })
+    await page.goto(`/bootui/#/activity?request=${encodeURIComponent(exemplar.id)}`)
+    const drawer = page.locator('.activity-drawer')
+    await expect(drawer.locator('.request-journal')).toContainText('GET /api/greetings/{name}')
+    await expect(drawer).toContainText('HTTP-exchange details unavailable')
+  })
+
+  test('opens the runtime journal status, which records the reactive requests', async ({page, request, baseURL}) => {
+    const notes = await request.get(`${baseURL}/api/notes`)
+    expect(notes.ok()).toBeTruthy()
+
+    await page.goto('/bootui/#/activity')
+    const toggle = page.getByRole('button', {name: 'Recording', exact: true})
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+
+    const journal = page.locator('#activity-runtime-journal')
+    await expect(page.getByRole('heading', {name: 'Runtime journal'})).toHaveCount(1)
+    await expect(journal.locator('code', {hasText: /^http$/})).toBeVisible()
+    await expect(journal.locator('code', {hasText: /^sql$/})).toBeVisible()
+    await expect(journal).toContainText('Previous runs')
+  })
+
+  test("profiles a request's SQL exactly by its BootUI request id", async ({request, baseURL}) => {
+    // BootUI's own request id follows the request across Reactor hops to its blocking SQL, and it decides
+    // before the trace id, so the SQL is correlated by it whether or not the request is traced.
+    const notes = await request.get(`${baseURL}/api/notes`)
+    expect(notes.ok()).toBeTruthy()
+
+    const activity = await request.get(`${baseURL}/bootui/api/activity`)
+    const entry = (await activity.json()).entries.find(
+      (candidate) => candidate.type === 'REQUEST' && candidate.path === '/api/notes'
+    )
+    expect(entry?.profileable).toBe(true)
+
+    const profile = await (await request.get(`${baseURL}/bootui/api/activity/request/${entry.id}`)).json()
+    expect(profile.available).toBe(true)
+    expect(profile.approximate).toBe(false)
+    expect(profile.sql.length).toBeGreaterThan(0)
+    expect(profile.sections.find((section) => section.type === 'SQL').tier).toBe('REQUEST_ID')
   })
 
   test('raw Spring Security panel exposes reactive chains and mappings without blocking', async ({
@@ -417,4 +492,6 @@ test.describe('BootUI on Spring WebFlux', () => {
     await page.goto('/bootui/#/http-sessions')
     await expect(page.locator('.panel-availability-alert')).toContainText('Not applicable on Spring WebFlux')
   })
+
+  registerResourceLedgerTests(test, expect)
 })

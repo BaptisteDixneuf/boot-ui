@@ -1,0 +1,1955 @@
+package io.github.jdubois.bootui.autoconfigure.activity;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.exceptions.ExceptionsController;
+import io.github.jdubois.bootui.autoconfigure.mail.EmailController;
+import io.github.jdubois.bootui.autoconfigure.restclienttrace.RestClientTraceController;
+import io.github.jdubois.bootui.autoconfigure.sqltrace.SqlTraceController;
+import io.github.jdubois.bootui.autoconfigure.web.BootUiHttpExchangeRepository;
+import io.github.jdubois.bootui.autoconfigure.web.ExchangeSlowThreshold;
+import io.github.jdubois.bootui.autoconfigure.web.HealthController;
+import io.github.jdubois.bootui.autoconfigure.web.HttpExchangesController;
+import io.github.jdubois.bootui.autoconfigure.web.SecurityLogsController;
+import io.github.jdubois.bootui.core.ValueExposure;
+import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
+import io.github.jdubois.bootui.core.dto.EmailMessageDto;
+import io.github.jdubois.bootui.core.dto.EmailsReport;
+import io.github.jdubois.bootui.core.dto.ExceptionGroupDto;
+import io.github.jdubois.bootui.core.dto.ExceptionsReport;
+import io.github.jdubois.bootui.core.dto.HttpExchangeDto;
+import io.github.jdubois.bootui.core.dto.HttpExchangesReport;
+import io.github.jdubois.bootui.core.dto.LiveActivityReport;
+import io.github.jdubois.bootui.core.dto.PageMetadata;
+import io.github.jdubois.bootui.core.dto.RestClientTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.RestClientTraceReport;
+import io.github.jdubois.bootui.core.dto.RestClientTraceStatsDto;
+import io.github.jdubois.bootui.core.dto.SecurityLogEventDto;
+import io.github.jdubois.bootui.core.dto.SecurityLogsReport;
+import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.SqlTraceReport;
+import io.github.jdubois.bootui.core.dto.SqlTraceStatsDto;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
+import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
+import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder;
+import io.github.jdubois.bootui.engine.web.LiveActivityAssembler;
+import io.github.jdubois.bootui.engine.web.ReservedActivityEntries;
+import java.net.URI;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import org.assertj.core.api.SoftAssertions;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.actuate.web.exchanges.HttpExchange;
+import org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository;
+import org.springframework.mock.env.MockEnvironment;
+
+class LiveActivityServiceTests {
+
+    private static final Instant BASE = Instant.parse("2026-06-14T10:00:00Z");
+
+    @Test
+    void mergesKafkaCapturedMessagesAsMessagingEntries() {
+        io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder(true, true, 10, 16);
+        recorder.recordProduce("orders", 0, "order-1", 0L, true, null);
+        recorder.recordConsume("orders", 0, 5L, "order-1", 12L, true, null, "group-a", "myListener");
+        recorder.recordConsume("orders", 0, 6L, "order-2", 3L, false, "boom", "group-a", "myListener");
+
+        LiveActivityService service = serviceWithKafka(recorder, new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.typeCounts()).containsEntry("MESSAGING", 3);
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("MESSAGING"))
+                .extracting("summary", "severity")
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("→ orders [0]", "OK"),
+                        org.assertj.core.groups.Tuple.tuple("← orders [0]", "OK"),
+                        org.assertj.core.groups.Tuple.tuple("← orders [0]", "ERROR"));
+    }
+
+    @Test
+    void doesNotIncludeKafkaMessagesWhenKafkaPanelDisabled() {
+        io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder(true, true, 10, 16);
+        recorder.recordProduce("orders", 0, "order-1", 0L, true, null);
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.KAFKA).setEnabled(false);
+        LiveActivityService service = serviceWithKafka(recorder, properties);
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.sources()).doesNotContain("Kafka");
+        assertThat(report.entries()).noneMatch(e -> e.type().equals("MESSAGING"));
+    }
+
+    @Test
+    void includesJmsMessagesWhenKafkaPanelDisabled() {
+        io.github.jdubois.bootui.engine.jms.JmsActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.jms.JmsActivityRecorder(true, true, 10, 50);
+        recorder.recordProduce("orders", "ID:1", 3L, true, null);
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.KAFKA).setEnabled(false);
+        LiveActivityReport report = serviceWithJms(recorder, properties).report(null, null, 0, 0);
+
+        assertThat(report.sources()).contains("JMS").doesNotContain("Kafka");
+        assertThat(report.entries()).singleElement().satisfies(entry -> {
+            assertThat(entry.id()).startsWith("jms-");
+            assertThat(entry.type()).isEqualTo("MESSAGING");
+        });
+    }
+
+    @Test
+    void doesNotIncludeJmsMessagesWhenJmsPanelDisabled() {
+        io.github.jdubois.bootui.engine.jms.JmsActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.jms.JmsActivityRecorder(true, true, 10, 50);
+        recorder.recordProduce("orders", "ID:1", 3L, true, null);
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.JMS).setEnabled(false);
+        LiveActivityReport report = serviceWithJms(recorder, properties).report(null, null, 0, 0);
+
+        assertThat(report.sources()).doesNotContain("JMS");
+        assertThat(report.entries()).noneMatch(entry -> entry.id().startsWith("jms-"));
+    }
+
+    @Test
+    void mergesRabbitMessagesAndHonorsRabbitPanelGate() {
+        io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder rabbit =
+                new io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder(true, false, 10, 16);
+        rabbit.recordConsume("orders", "created", "workers", 4L, false, "payload=secret", null);
+
+        LiveActivityReport enabled =
+                serviceWithMessaging(null, null, rabbit, new BootUiProperties()).report(null, null, 0, 0);
+
+        assertThat(enabled.sources()).contains("RabbitMQ");
+        assertThat(enabled.entries()).singleElement().satisfies(entry -> {
+            assertThat(entry.id()).startsWith("rabbit-");
+            assertThat(entry.type()).isEqualTo("MESSAGING");
+            assertThat(entry.detail()).contains("Message processing failed").doesNotContain("payload=secret");
+        });
+
+        BootUiProperties disabledProperties = new BootUiProperties();
+        disabledProperties.panel(BootUiPanels.RABBITMQ).setEnabled(false);
+        LiveActivityReport disabled =
+                serviceWithMessaging(null, null, rabbit, disabledProperties).report(null, null, 0, 0);
+
+        assertThat(disabled.sources()).doesNotContain("RabbitMQ");
+        assertThat(disabled.entries()).isEmpty();
+    }
+
+    @Test
+    void reportsEnabledMessagingSourcesBeforeTheirFirstMessage() {
+        var kafka = new io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder(true, true, 10, 16);
+        var jms = new io.github.jdubois.bootui.engine.jms.JmsActivityRecorder(true, true, 10, 16);
+        var rabbit = new io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder(true, false, 10, 16);
+
+        LiveActivityReport report =
+                serviceWithMessaging(kafka, jms, rabbit, new BootUiProperties()).report(null, null, 0, 0);
+
+        assertThat(report.sources()).contains("Kafka", "JMS", "RabbitMQ");
+        assertThat(report.entries()).isEmpty();
+    }
+
+    @Test
+    void keepsKafkaAndJmsRetentionIndependent() {
+        io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder kafka =
+                new io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder(true, true, 1, 16);
+        io.github.jdubois.bootui.engine.jms.JmsActivityRecorder jms =
+                new io.github.jdubois.bootui.engine.jms.JmsActivityRecorder(true, true, 1, 16);
+        kafka.recordProduce("kafka-orders", 0, "order-1", 1L, true, null);
+        jms.recordProduce("old-jms-orders", "ID:1", 1L, true, null);
+        jms.recordProduce("new-jms-orders", "ID:2", 1L, true, null);
+
+        LiveActivityReport report = service(
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        kafka,
+                        jms,
+                        new BootUiProperties())
+                .report(null, null, 0, 0);
+
+        assertThat(report.entries())
+                .extracting("id", "summary")
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("kafka-1", "→ kafka-orders [0]"),
+                        org.assertj.core.groups.Tuple.tuple("jms-2", "→ new-jms-orders"));
+        assertThat(report.sources()).contains("Kafka", "JMS");
+    }
+
+    @Test
+    void mergesAndSortsSourcesNewestFirst() {
+        LiveActivityService service = service(
+                requests(
+                        exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L),
+                        exchange("r2", BASE.plusMillis(3000), "GET", "/b", 500, 12L)),
+                sql(sqlEntry(1, BASE.plusMillis(2000).toEpochMilli(), "SELECT 1", "SELECT", 5, true, false)),
+                exceptions(group(
+                        "e1",
+                        "java.lang.IllegalStateException",
+                        BASE.plusMillis(2500).toEpochMilli())),
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.available()).isTrue();
+        assertThat(report.entries())
+                .extracting(e -> e.type() + ":" + e.timestamp())
+                .containsExactly(
+                        "REQUEST:" + BASE.plusMillis(3000).toEpochMilli(),
+                        "EXCEPTION:" + BASE.plusMillis(2500).toEpochMilli(),
+                        "SQL:" + BASE.plusMillis(2000).toEpochMilli(),
+                        "REQUEST:" + BASE.plusMillis(1000).toEpochMilli());
+        assertThat(report.typeCounts())
+                .containsEntry("REQUEST", 2)
+                .containsEntry("SQL", 1)
+                .containsEntry("EXCEPTION", 1);
+    }
+
+    @Test
+    void classifiesSeverityFromStatusAndSlowness() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setRequestSlowThresholdMs(100);
+        LiveActivityService service = service(
+                requests(
+                        exchange("ok", BASE.plusMillis(10), "GET", "/ok", 200, 5L),
+                        exchange("slow", BASE.plusMillis(20), "GET", "/slow", 200, 500L),
+                        exchange("warn", BASE.plusMillis(30), "GET", "/warn", 404, 5L),
+                        exchange("err", BASE.plusMillis(40), "GET", "/err", 500, 5L)),
+                null,
+                null,
+                null,
+                null,
+                properties);
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("REQUEST"))
+                .extracting(e -> e.id() + "=" + e.severity())
+                .containsExactlyInAnyOrder("ok=OK", "slow=SLOW", "warn=WARN", "err=ERROR");
+    }
+
+    @Test
+    void zeroRequestSlowThresholdDisablesSlowSeverity() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setRequestSlowThresholdMs(0);
+        LiveActivityService service = service(
+                requests(
+                        exchange("fast", BASE.plusMillis(10), "GET", "/fast", 200, 0L),
+                        exchange("slow", BASE.plusMillis(20), "GET", "/slow", 200, 60_000L),
+                        exchange("err", BASE.plusMillis(30), "GET", "/err", 500, 5L)),
+                null,
+                null,
+                null,
+                null,
+                properties);
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("REQUEST"))
+                .extracting(e -> e.id() + "=" + e.severity())
+                .containsExactlyInAnyOrder("fast=OK", "slow=OK", "err=ERROR");
+    }
+
+    @Test
+    void appliesTypeSeveritySinceAndLimitFilters() {
+        LiveActivityService service = service(
+                requests(
+                        exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 5L),
+                        exchange("r2", BASE.plusMillis(2000), "GET", "/b", 500, 5L)),
+                sql(sqlEntry(1, BASE.plusMillis(1500).toEpochMilli(), "SELECT 1", "SELECT", 5, true, false)),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        assertThat(service.report("REQUEST", null, 0, 0).entries())
+                .allMatch(e -> e.type().equals("REQUEST"));
+        assertThat(service.report(null, "ERROR", 0, 0).entries())
+                .allMatch(e -> e.severity().equals("ERROR"));
+        assertThat(service.report(null, null, BASE.plusMillis(1600).toEpochMilli(), 0)
+                        .entries())
+                .extracting(e -> e.id())
+                .containsExactly("r2");
+        assertThat(service.report(null, null, 0, 1).entries()).hasSize(1);
+    }
+
+    @Test
+    void reportsUnavailableWhenNoSourcesPresent() {
+        LiveActivityService service = service(null, null, null, null, null, new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.available()).isFalse();
+        assertThat(report.entries()).isEmpty();
+        assertThat(report.sources()).isEmpty();
+    }
+
+    @Test
+    void computesKpisFromRequestsAndSql() {
+        LiveActivityService service = service(
+                requests(
+                        exchange("r1", BASE.plusMillis(0), "GET", "/fast", 200, 10L),
+                        exchange("r2", BASE.plusMillis(60_000), "GET", "/slow", 500, 200L)),
+                sql(sqlEntry(1, BASE.toEpochMilli(), "SELECT 1", "SELECT", 40, true, false)),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        var kpis = service.report(null, null, 0, 0).kpis();
+
+        assertThat(kpis.errorRatePercent()).isEqualTo(50.0);
+        assertThat(kpis.slowestEndpoint()).isEqualTo("/slow");
+        assertThat(kpis.slowestEndpointMs()).isEqualTo(200L);
+        assertThat(kpis.slowestQueryMs()).isEqualTo(40L);
+    }
+
+    /**
+     * Spring MVC computes its KPIs here, while Spring WebFlux and Quarkus use the engine assembler; both
+     * delegate to the shared engine helper, so the same retained exchanges must yield the same latency KPIs
+     * and the same labelled slowest request on every stack.
+     */
+    @Test
+    void latencyKpisAndSlowestRouteMatchTheSharedEngineAssembler() {
+        HttpExchangeDto[] exchanges = {
+            routedExchange("r1", BASE.plusMillis(0), "/api/orders/1", 40L, "/api/orders/{id}", "FRAMEWORK_TEMPLATE"),
+            routedExchange("r2", BASE.plusMillis(10), "/api/orders/2", 900L, "/api/orders/{id}", "FRAMEWORK_TEMPLATE"),
+            routedExchange("r3", BASE.plusMillis(20), "/api/health", 900L, "/api/health", "DECLARED_MAPPING"),
+            routedExchange("r4", BASE.plusMillis(30), "/files/abc123", 3L, "/files/{value}", "MASKED_PATH"),
+            routedExchange("r5", BASE.plusMillis(40), "/stream", null, "/stream", "MASKED_PATH")
+        };
+        var mvc = service(requests(exchanges), null, null, null, null, new BootUiProperties())
+                .report(null, null, 0, 0)
+                .kpis();
+        var shared = new LiveActivityAssembler()
+                .report(
+                        new HttpExchangesReport(
+                                exchanges.length,
+                                exchanges.length,
+                                0,
+                                List.of(exchanges),
+                                new PageMetadata(exchanges.length, exchanges.length, 0, exchanges.length, 5, false),
+                                null),
+                        List.of(),
+                        false,
+                        null,
+                        List.of(),
+                        List.of(),
+                        false,
+                        List.of(),
+                        false,
+                        List.of(),
+                        null,
+                        0,
+                        List.of(),
+                        false,
+                        List.of(),
+                        false,
+                        List.of(),
+                        false,
+                        List.of(),
+                        false)
+                .kpis();
+
+        // The two 900 ms requests tie; the newer one wins on every stack.
+        assertThat(mvc.slowestEndpoint()).isEqualTo("/api/health");
+        assertThat(mvc.slowestEndpointRoute()).isEqualTo("/api/health");
+        assertThat(mvc.slowestEndpointRouteId()).isEqualTo("GET /api/health");
+        assertThat(mvc.slowestEndpointRouteSource()).isEqualTo("DECLARED_MAPPING");
+        assertThat(mvc.latencySampleCount()).isEqualTo(4);
+        assertThat(mvc.p50LatencyMs()).isEqualTo(40L);
+        assertThat(mvc.p95LatencyMs()).isEqualTo(900L);
+        assertThat(List.of(
+                        mvc.p50LatencyMs(),
+                        mvc.p95LatencyMs(),
+                        mvc.slowestEndpoint(),
+                        mvc.slowestEndpointMs(),
+                        mvc.slowestEndpointRoute(),
+                        mvc.slowestEndpointRouteId(),
+                        mvc.slowestEndpointRouteSource(),
+                        mvc.latencySampleCount()))
+                .isEqualTo(List.of(
+                        shared.p50LatencyMs(),
+                        shared.p95LatencyMs(),
+                        shared.slowestEndpoint(),
+                        shared.slowestEndpointMs(),
+                        shared.slowestEndpointRoute(),
+                        shared.slowestEndpointRouteId(),
+                        shared.slowestEndpointRouteSource(),
+                        shared.latencySampleCount()));
+    }
+
+    @Test
+    void computesRestKpisFromCapturedCalls() {
+        LiveActivityService service = service(
+                null,
+                null,
+                rest(
+                        restEntry(1, BASE.plusMillis(10).toEpochMilli(), "GET", "api", "/ok", 200, 10L, true, null),
+                        restEntry(2, BASE.plusMillis(20).toEpochMilli(), "GET", "api", "/warn", 404, 20L, true, null),
+                        restEntry(3, BASE.plusMillis(30).toEpochMilli(), "GET", "api", "/error", 500, 30L, true, null),
+                        restEntry(
+                                4,
+                                BASE.plusMillis(40).toEpochMilli(),
+                                "GET",
+                                "api",
+                                "/down",
+                                null,
+                                40L,
+                                false,
+                                "Connection refused")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        var kpis = service.report(null, null, 0, 0).kpis();
+
+        assertThat(kpis.restCallErrorRatePercent()).isEqualTo(75.0);
+        assertThat(kpis.restCallP95LatencyMs()).isEqualTo(40L);
+    }
+
+    @Test
+    void leavesRestKpisNullWhenRestTraceUnavailableOrEmpty() {
+        var emptyKpis = service(null, null, rest(), null, null, null, new BootUiProperties())
+                .report(null, null, 0, 0)
+                .kpis();
+        assertThat(emptyKpis.restCallErrorRatePercent()).isNull();
+        assertThat(emptyKpis.restCallP95LatencyMs()).isNull();
+
+        var unavailableKpis = service(null, null, unavailableRest(), null, null, null, new BootUiProperties())
+                .report(null, null, 0, 0)
+                .kpis();
+        assertThat(unavailableKpis.restCallErrorRatePercent()).isNull();
+        assertThat(unavailableKpis.restCallP95LatencyMs()).isNull();
+    }
+
+    @Test
+    void nestsSqlUnderRequestByTraceId() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                sql(sqlEntryOn(1, BASE.plusMillis(1010).toEpochMilli(), "http-thread", "trace-r1")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "sql-1")).isEqualTo("r1");
+    }
+
+    @Test
+    void nestsEveryChildUnderTheRequestWhoseRequestIdItCarriesWhenIdenticalRequestsOverlap() {
+        String first = "0123456789abcdef";
+        String second = "fedcba9876543210";
+        long during = BASE.plusMillis(1010).toEpochMilli();
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder cache =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        cache.setCorrelationContextProvider(() -> io.github.jdubois.bootui.spi.CorrelationContext.forRequest(second));
+        cache.recordHit("cacheManager", "orders", "key");
+        long cacheSeq = cache.recentEvents().get(0).seq();
+        SqlTraceEntryDto statement = sqlEntryOn(1, during, "worker-1", null);
+        RestClientTraceEntryDto call = restEntryOn(2, during, "worker-1", null);
+        EmailMessageDto mail = email("email-3", during, null, "worker-1");
+        SecurityLogEventDto login = securityEvent("AUTHENTICATION_SUCCESS", "alice", during);
+
+        LiveActivityService service = service(
+                requests(stampedExchange(first), stampedExchange(second)),
+                sql(withRequestId(statement, second)),
+                rest(new RestClientTraceEntryDto(
+                        call.id(),
+                        call.timestamp(),
+                        call.method(),
+                        call.uri(),
+                        call.host(),
+                        call.path(),
+                        call.status(),
+                        call.durationMillis(),
+                        call.success(),
+                        call.errorMessage(),
+                        call.slow(),
+                        call.clientType(),
+                        call.requestHeaders(),
+                        null,
+                        call.thread(),
+                        null,
+                        first)),
+                null,
+                security(new SecurityLogEventDto(
+                        login.timestamp(), login.principal(), login.type(), List.of(), null, first)),
+                null,
+                email(new EmailMessageDto(
+                        mail.id(),
+                        mail.timestamp(),
+                        mail.from(),
+                        mail.to(),
+                        mail.cc(),
+                        mail.bcc(),
+                        mail.subject(),
+                        mail.textBody(),
+                        mail.htmlBody(),
+                        mail.attachments(),
+                        mail.sent(),
+                        null,
+                        mail.thread(),
+                        second)),
+                null,
+                null,
+                cache,
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(parentOf(report, "sql-1")).isEqualTo(second);
+        assertThat(parentOf(report, "rest-2")).isEqualTo(first);
+        assertThat(parentOf(report, "email-3")).isEqualTo(second);
+        assertThat(parentOf(report, "cache-" + cacheSeq)).isEqualTo(second);
+        assertThat(parentOfSecurityEntry(report)).isEqualTo(first);
+        assertThat(securedPrincipalOf(report, first)).isEqualTo("alice");
+        assertThat(securedPrincipalOf(report, second)).isNull();
+    }
+
+    @Test
+    void nestsSqlUnderRequestByServingThread() {
+        RequestCorrelationRegistry requestCorrelations = new RequestCorrelationRegistry(10);
+        requestCorrelations.record(new RequestCorrelationRegistry.RequestCorrelation(
+                BASE.plusMillis(1000).toEpochMilli(), BASE.plusMillis(1030).toEpochMilli(), "worker-9", "GET", "/a"));
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                sql(sqlEntryOn(1, BASE.plusMillis(1015).toEpochMilli(), "worker-9", null)),
+                null,
+                null,
+                null,
+                requestCorrelations,
+                null,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "sql-1")).isEqualTo("r1");
+    }
+
+    @Test
+    void nestsExceptionUnderRequestByMethodAndPath() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 500, 30L)),
+                null,
+                exceptions(group(
+                        "e1",
+                        "java.lang.IllegalStateException",
+                        BASE.plusMillis(1020).toEpochMilli())),
+                null,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "exc-e1")).isEqualTo("r1");
+        assertThat(service.report(null, null, 0, 0).entries())
+                .filteredOn(entry -> entry.id().equals("exc-e1"))
+                .singleElement()
+                .satisfies(entry -> assertThat(entry.exceptionGroupId()).isEqualTo("e1"));
+    }
+
+    @Test
+    void nestsMailUnderRequestByTraceId() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                null,
+                null,
+                null,
+                email(email("email-1", BASE.plusMillis(1010).toEpochMilli(), "trace-r1", "mail-thread")),
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "email-1")).isEqualTo("r1");
+    }
+
+    @Test
+    void leavesMailTopLevelWhenTraceIdAndThreadDoNotCorrelate() {
+        RequestCorrelationRegistry requestCorrelations = new RequestCorrelationRegistry(10);
+        requestCorrelations.record(new RequestCorrelationRegistry.RequestCorrelation(
+                BASE.plusMillis(1000).toEpochMilli(), BASE.plusMillis(1030).toEpochMilli(), "worker-9", "GET", "/a"));
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                null,
+                null,
+                null,
+                email(email("email-1", BASE.plusMillis(2000).toEpochMilli(), "trace-orphan", "mail-thread")),
+                requestCorrelations,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "email-1")).isNull();
+    }
+
+    @Test
+    void nestsSecurityUnderRequestByServingThread() {
+        long ts = BASE.plusMillis(1015).toEpochMilli();
+        SecurityEventCorrelationRegistry securityCorrelations = new SecurityEventCorrelationRegistry(10);
+        securityCorrelations.record(new SecurityEventCorrelationRegistry.SecurityEventCorrelation(
+                ts, "worker-7", "AUTHENTICATION_SUCCESS", "alice"));
+        RequestCorrelationRegistry requestCorrelations = new RequestCorrelationRegistry(10);
+        requestCorrelations.record(new RequestCorrelationRegistry.RequestCorrelation(
+                BASE.plusMillis(1000).toEpochMilli(), BASE.plusMillis(1030).toEpochMilli(), "worker-7", "GET", "/a"));
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                null,
+                security(securityEvent("AUTHENTICATION_SUCCESS", "alice", ts)),
+                null,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOfSecurityEntry(service.report(null, null, 0, 0))).isEqualTo("r1");
+    }
+
+    @Test
+    void marksSecuredRequestWithCorrelatedPrincipal() {
+        long ts = BASE.plusMillis(1015).toEpochMilli();
+        SecurityEventCorrelationRegistry securityCorrelations = new SecurityEventCorrelationRegistry(10);
+        securityCorrelations.record(new SecurityEventCorrelationRegistry.SecurityEventCorrelation(
+                ts, "worker-7", "AUTHENTICATION_SUCCESS", "alice"));
+        RequestCorrelationRegistry requestCorrelations = new RequestCorrelationRegistry(10);
+        requestCorrelations.record(new RequestCorrelationRegistry.RequestCorrelation(
+                BASE.plusMillis(1000).toEpochMilli(), BASE.plusMillis(1030).toEpochMilli(), "worker-7", "GET", "/a"));
+        LiveActivityService service = service(
+                requests(
+                        exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L),
+                        exchange("r2", BASE.plusMillis(2000), "GET", "/b", 200, 5L)),
+                null,
+                null,
+                security(securityEvent("AUTHENTICATION_SUCCESS", "alice", ts)),
+                null,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+        assertThat(securedPrincipalOf(report, "r1")).isEqualTo("alice");
+        assertThat(securedPrincipalOf(report, "r2")).isNull();
+    }
+
+    @Test
+    void doesNotMarkRequestSecuredWhenCorrelatedPrincipalIsBlank() {
+        long ts = BASE.plusMillis(1015).toEpochMilli();
+        SecurityEventCorrelationRegistry securityCorrelations = new SecurityEventCorrelationRegistry(10);
+        securityCorrelations.record(new SecurityEventCorrelationRegistry.SecurityEventCorrelation(
+                ts, "worker-7", "AUTHORIZATION_FAILURE", ""));
+        RequestCorrelationRegistry requestCorrelations = new RequestCorrelationRegistry(10);
+        requestCorrelations.record(new RequestCorrelationRegistry.RequestCorrelation(
+                BASE.plusMillis(1000).toEpochMilli(), BASE.plusMillis(1030).toEpochMilli(), "worker-7", "GET", "/a"));
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 403, 30L)),
+                null,
+                null,
+                security(securityEvent("AUTHORIZATION_FAILURE", "", ts)),
+                null,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                new BootUiProperties());
+
+        // The event correlates to the request (so it still nests), but a blank principal must not flag
+        // the request as authenticated.
+        LiveActivityReport report = service.report(null, null, 0, 0);
+        assertThat(parentOfSecurityEntry(report)).isEqualTo("r1");
+        assertThat(securedPrincipalOf(report, "r1")).isNull();
+    }
+
+    @Test
+    void nestsExceptionUnderScheduledTaskByThreadAndWindow() {
+        LiveActivityService service = service(
+                null,
+                null,
+                exceptions(scheduledExceptionGroup(
+                        "e1",
+                        "java.lang.RuntimeException",
+                        BASE.plusMillis(1010).toEpochMilli(),
+                        "scheduler-1")),
+                null,
+                null,
+                null,
+                null,
+                scheduledStore(
+                        scheduledRun("MyJob#run", BASE.plusMillis(1000).toEpochMilli(), 30L, false, "scheduler-1")),
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "exc-e1")).isEqualTo("sched-1");
+    }
+
+    @Test
+    void nestsSqlUnderTheScheduledRunWhoseExecutionIdItCarriesOnAnyThread() {
+        io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.Run seed =
+                scheduledRun("MyJob#run", BASE.plusMillis(1000).toEpochMilli(), 30L, true, "scheduler-1");
+        SqlTraceEntryDto base = sqlEntryOn(1, BASE.plusMillis(9000).toEpochMilli(), "worker-7", null);
+        SqlTraceEntryDto statement = new SqlTraceEntryDto(
+                base.id(),
+                base.timestamp(),
+                base.sql(),
+                base.statementType(),
+                base.category(),
+                base.durationMicros(),
+                base.durationMillis(),
+                base.success(),
+                base.errorMessage(),
+                base.affectedRows(),
+                base.batchSize(),
+                base.connectionId(),
+                base.thread(),
+                base.slow(),
+                base.parameters(),
+                null,
+                null,
+                null,
+                "00112233aabbccdd");
+        LiveActivityService service = service(
+                null,
+                sql(statement),
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                scheduledStore(new io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.Run(
+                        0,
+                        seed.runnable(),
+                        seed.startTimestamp(),
+                        seed.durationMs(),
+                        true,
+                        null,
+                        null,
+                        seed.thread(),
+                        "00112233aabbccdd")),
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "sql-1")).isEqualTo("sched-1");
+    }
+
+    @Test
+    void leavesExceptionTopLevelWhenScheduledTaskThreadDoesNotMatch() {
+        LiveActivityService service = service(
+                null,
+                null,
+                exceptions(scheduledExceptionGroup(
+                        "e1",
+                        "java.lang.RuntimeException",
+                        BASE.plusMillis(1010).toEpochMilli(),
+                        "other-thread")),
+                null,
+                null,
+                null,
+                null,
+                scheduledStore(
+                        scheduledRun("MyJob#run", BASE.plusMillis(1000).toEpochMilli(), 30L, false, "scheduler-1")),
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "exc-e1")).isNull();
+    }
+
+    @Test
+    void leavesUncorrelatedSignalsTopLevel() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                sql(sqlEntryOn(1, BASE.plusMillis(5000).toEpochMilli(), "other-thread", "trace-zzz")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+        assertThat(parentOf(report, "sql-1")).isNull();
+        assertThat(parentOf(report, "r1")).isNull();
+    }
+
+    @Test
+    void flagsRequestAsSqlNPlusOneSuspectedWhenItsCorrelatedSqlHitsTheThreshold() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setNPlusOneThreshold(5);
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                sql(
+                        sqlEntryOn(1, BASE.plusMillis(1001).toEpochMilli(), "http-thread", "trace-r1"),
+                        sqlEntryOn(2, BASE.plusMillis(1002).toEpochMilli(), "http-thread", "trace-r1"),
+                        sqlEntryOn(3, BASE.plusMillis(1003).toEpochMilli(), "http-thread", "trace-r1"),
+                        sqlEntryOn(4, BASE.plusMillis(1004).toEpochMilli(), "http-thread", "trace-r1"),
+                        sqlEntryOn(5, BASE.plusMillis(1005).toEpochMilli(), "http-thread", "trace-r1")),
+                null,
+                null,
+                null,
+                properties);
+
+        assertThat(sqlNPlusOneSuspectedOf(service.report(null, null, 0, 0), "r1"))
+                .isTrue();
+    }
+
+    @Test
+    void doesNotFlagSqlNPlusOneSuspectedBelowTheThreshold() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setNPlusOneThreshold(5);
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                sql(
+                        sqlEntryOn(1, BASE.plusMillis(1001).toEpochMilli(), "http-thread", "trace-r1"),
+                        sqlEntryOn(2, BASE.plusMillis(1002).toEpochMilli(), "http-thread", "trace-r1")),
+                null,
+                null,
+                null,
+                properties);
+
+        assertThat(sqlNPlusOneSuspectedOf(service.report(null, null, 0, 0), "r1"))
+                .isFalse();
+    }
+
+    @Test
+    void mergesRestClientCallsIntoStream() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                rest(restEntry(
+                        1,
+                        BASE.plusMillis(1500).toEpochMilli(),
+                        "GET",
+                        "api.example.com",
+                        "/users",
+                        200,
+                        8L,
+                        true,
+                        null)),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.entries())
+                .extracting(e -> e.type() + ":" + e.timestamp())
+                .containsExactly(
+                        "REST_CLIENT:" + BASE.plusMillis(1500).toEpochMilli(),
+                        "REQUEST:" + BASE.plusMillis(1000).toEpochMilli());
+        assertThat(report.typeCounts()).containsEntry("REST_CLIENT", 1);
+        assertThat(report.sources()).contains("REST Client");
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("REST_CLIENT"))
+                .extracting(e -> e.id() + "=" + e.summary() + "=" + e.detail())
+                .containsExactly("rest-1=GET api.example.com/users → 200=RestClient");
+    }
+
+    @Test
+    void classifiesRestSeverityFromStatusSuccessAndSlowness() {
+        LiveActivityService service = service(
+                null,
+                null,
+                rest(
+                        restEntry(1, BASE.plusMillis(10).toEpochMilli(), "GET", "api", "/ok", 200, 5L, true, null),
+                        restEntry(
+                                2,
+                                BASE.plusMillis(20).toEpochMilli(),
+                                "GET",
+                                "api",
+                                "/slow",
+                                200,
+                                5000L,
+                                true,
+                                null,
+                                true),
+                        restEntry(3, BASE.plusMillis(30).toEpochMilli(), "GET", "api", "/warn", 404, 5L, true, null),
+                        restEntry(4, BASE.plusMillis(40).toEpochMilli(), "GET", "api", "/err", 500, 5L, true, null),
+                        restEntry(
+                                5,
+                                BASE.plusMillis(50).toEpochMilli(),
+                                "GET",
+                                "api",
+                                "/down",
+                                null,
+                                5L,
+                                false,
+                                "Connection refused")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("REST_CLIENT"))
+                .extracting(e -> e.id() + "=" + e.severity())
+                .containsExactlyInAnyOrder("rest-1=OK", "rest-2=SLOW", "rest-3=WARN", "rest-4=ERROR", "rest-5=ERROR");
+    }
+
+    @Test
+    void marksFailedRestCallDetailWithErrorMessage() {
+        LiveActivityService service = service(
+                null,
+                null,
+                rest(restEntry(
+                        1,
+                        BASE.plusMillis(10).toEpochMilli(),
+                        "GET",
+                        "api",
+                        "/down",
+                        null,
+                        5L,
+                        false,
+                        "Connection refused")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("REST_CLIENT"))
+                .extracting(e -> e.detail())
+                .containsExactly("Connection refused");
+    }
+
+    @Test
+    void nestsRestUnderRequestByTraceId() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                rest(restEntryOn(1, BASE.plusMillis(1010).toEpochMilli(), "http-thread", "trace-r1")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "rest-1")).isEqualTo("r1");
+    }
+
+    @Test
+    void nestsRestUnderRequestByServingThread() {
+        RequestCorrelationRegistry requestCorrelations = new RequestCorrelationRegistry(10);
+        requestCorrelations.record(new RequestCorrelationRegistry.RequestCorrelation(
+                BASE.plusMillis(1000).toEpochMilli(), BASE.plusMillis(1030).toEpochMilli(), "worker-9", "GET", "/a"));
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                rest(restEntryOn(1, BASE.plusMillis(1015).toEpochMilli(), "worker-9", null)),
+                null,
+                null,
+                null,
+                requestCorrelations,
+                null,
+                new BootUiProperties());
+
+        assertThat(parentOf(service.report(null, null, 0, 0), "rest-1")).isEqualTo("r1");
+    }
+
+    @Test
+    void leavesUncorrelatedRestCallTopLevel() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                rest(restEntryOn(1, BASE.plusMillis(5000).toEpochMilli(), "other-thread", "trace-zzz")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+        assertThat(parentOf(report, "rest-1")).isNull();
+    }
+
+    @Test
+    void doesNotIncludeRestClientTraceInSourcesWhenPanelDisabled() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.REST_CLIENT_TRACE).setEnabled(false);
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                rest(restEntry(1, BASE.plusMillis(1500).toEpochMilli(), "GET", "api", "/users", 200, 8L, true, null)),
+                null,
+                null,
+                null,
+                properties);
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.sources()).doesNotContain("REST Client");
+        assertThat(report.entries()).noneMatch(e -> e.type().equals("REST_CLIENT"));
+    }
+
+    @Test
+    void mergesCacheEventsIntoTheStream() {
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        recorder.recordHit("cacheManager", "orders", "42");
+        recorder.recordMiss("cacheManager", "orders", "43");
+        LiveActivityService service = serviceWithCache(null, null, null, null, null, recorder, new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.available()).isTrue();
+        assertThat(report.sources()).contains("Cache");
+        assertThat(report.typeCounts()).containsEntry("CACHE", 2);
+        assertThat(report.entries())
+                .filteredOn(e -> e.type().equals("CACHE"))
+                .extracting(e -> e.severity() + ":" + e.summary())
+                .containsExactlyInAnyOrder("OK:HIT orders", "WARN:MISS orders");
+    }
+
+    @Test
+    void cacheEntryDetailCarriesOnlyTheHashedKeyNeverTheRawKey() {
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        recorder.recordHit("cacheManager", "orders", "super-secret-key");
+        LiveActivityService service = serviceWithCache(null, null, null, null, null, recorder, new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        String detail = report.entries().stream()
+                .filter(e -> e.type().equals("CACHE"))
+                .findFirst()
+                .orElseThrow()
+                .detail();
+        assertThat(detail).doesNotContain("super-secret-key").startsWith("key ");
+    }
+
+    @Test
+    void clearCacheEventHasNoKeyDetail() {
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        recorder.recordClear("cacheManager", "orders");
+        LiveActivityService service = serviceWithCache(null, null, null, null, null, recorder, new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+
+        assertThat(report.entries().get(0).detail()).isNull();
+    }
+
+    @Test
+    void nestsCacheEventUnderRequestByTraceId() {
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-r1", null));
+        recorder.recordHit("cacheManager", "orders", "42");
+        LiveActivityService service = serviceWithCache(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                null,
+                null,
+                null,
+                recorder,
+                new BootUiProperties());
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+        String cacheEntryId = report.entries().stream()
+                .filter(e -> e.type().equals("CACHE"))
+                .findFirst()
+                .orElseThrow()
+                .id();
+        assertThat(parentOf(report, cacheEntryId)).isEqualTo("r1");
+    }
+
+    @Test
+    void computesCacheHitRatioKpiFromCapturedEvents() {
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        recorder.recordHit("cacheManager", "orders", "1");
+        recorder.recordHit("cacheManager", "orders", "2");
+        recorder.recordHit("cacheManager", "orders", "3");
+        recorder.recordMiss("cacheManager", "orders", "4");
+        LiveActivityService service = serviceWithCache(null, null, null, null, null, recorder, new BootUiProperties());
+
+        assertThat(service.report(null, null, 0, 0).kpis().cacheHitRatioPercent())
+                .isEqualTo(75.0);
+    }
+
+    @Test
+    void cacheHitRatioKpiIsNullWhenNoCacheEventsCaptured() {
+        LiveActivityService service = service(
+                requests(exchange("r1", BASE.plusMillis(1000), "GET", "/a", 200, 30L)),
+                null,
+                null,
+                null,
+                null,
+                new BootUiProperties());
+
+        assertThat(service.report(null, null, 0, 0).kpis().cacheHitRatioPercent())
+                .isNull();
+    }
+
+    @Test
+    void cacheEventsAreOmittedWhenCachePanelIsDisabled() {
+        io.github.jdubois.bootui.engine.cache.CacheActivityRecorder recorder =
+                new io.github.jdubois.bootui.engine.cache.CacheActivityRecorder(true, 10);
+        recorder.recordHit("cacheManager", "orders", "1");
+        BootUiProperties properties = new BootUiProperties();
+        properties
+                .panel(io.github.jdubois.bootui.engine.panel.BootUiPanels.CACHE)
+                .setEnabled(false);
+        LiveActivityService service = serviceWithCache(null, null, null, null, null, recorder, properties);
+
+        LiveActivityReport report = service.report(null, null, 0, 0);
+        assertThat(report.entries()).noneMatch(e -> e.type().equals("CACHE"));
+        assertThat(report.sources()).doesNotContain("Cache");
+    }
+
+    // --- helpers ---
+
+    private static String parentOf(LiveActivityReport report, String entryId) {
+        return report.entries().stream()
+                .filter(e -> e.id().equals(entryId))
+                .findFirst()
+                .orElseThrow()
+                .parentId();
+    }
+
+    /**
+     * Security entry ids are a content hash (see {@code SecurityActivityIds}), not a predictable literal,
+     * so tests locate the single security entry by type instead of hardcoding an id.
+     */
+    private static String parentOfSecurityEntry(LiveActivityReport report) {
+        return report.entries().stream()
+                .filter(e -> "SECURITY".equals(e.type()))
+                .findFirst()
+                .orElseThrow()
+                .parentId();
+    }
+
+    private static String securedPrincipalOf(LiveActivityReport report, String entryId) {
+        return report.entries().stream()
+                .filter(e -> e.id().equals(entryId))
+                .findFirst()
+                .orElseThrow()
+                .securedPrincipal();
+    }
+
+    private static boolean sqlNPlusOneSuspectedOf(LiveActivityReport report, String entryId) {
+        return report.entries().stream()
+                .filter(e -> e.id().equals(entryId))
+                .findFirst()
+                .orElseThrow()
+                .sqlNPlusOneSuspected();
+    }
+
+    /**
+     * This service renders SQL and REST client entries with its own severity mapping; Live Activity persistence reads
+     * a record's reservation back from that severity, so it must agree with each recorder for every combination.
+     */
+    @Test
+    void sqlAndRestClientEntriesAreReservedExactlyWhenTheirRecorderReservesTheRecord() {
+        BootUiProperties properties = new BootUiProperties();
+        ReservedActivityEntries rule =
+                new ReservedActivityEntries(properties.getActivity().getRequestSlowThresholdMs());
+        SoftAssertions softly = new SoftAssertions();
+        for (long threshold : new long[] {0L, 100L}) {
+            for (boolean success : new boolean[] {true, false}) {
+                for (long durationMicros : new long[] {0L, 99_999L, 100_000L, 250_000L}) {
+                    SqlTraceRecorder recorder =
+                            new SqlTraceRecorder(true, true, false, false, 10, threshold, 2_000, 200, 5, 90);
+                    recorder.record(
+                            SqlTraceRecorder.StatementType.PREPARED,
+                            SqlTraceRecorder.Category.SELECT,
+                            "select * from orders where id = ?",
+                            List.of("42"),
+                            durationMicros,
+                            success,
+                            success ? null : "deadlock detected",
+                            null,
+                            0,
+                            "conn-1",
+                            "main");
+                    SqlTraceController sql = mock(SqlTraceController.class);
+                    when(sql.trace()).thenReturn(recorder.report(false));
+
+                    ActivityEntryDto entry = only(
+                            service(null, sql, null, null, null, properties).report(null, null, 0, 0), "SQL");
+
+                    softly.assertThat(rule.test(entry))
+                            .as(
+                                    "SQL success=%s, %s µs, threshold %s ms, severity %s",
+                                    success, durationMicros, threshold, entry.severity())
+                            .isEqualTo(recorder.retention().reserved() == 1);
+                }
+            }
+        }
+        for (long threshold : new long[] {0L, 1_000L}) {
+            for (boolean success : new boolean[] {true, false}) {
+                for (Integer status : new Integer[] {null, 200, 302, 404, 499, 500, 503}) {
+                    for (long durationMillis : new long[] {5L, 1_000L, 1_500L}) {
+                        RestClientTraceRecorder recorder =
+                                new RestClientTraceRecorder(true, true, false, false, 10, threshold, 2_000, 200, 5, 90);
+                        recorder.record(
+                                "GET",
+                                "http://api.example.com/items",
+                                "api.example.com",
+                                "/items",
+                                status,
+                                durationMillis,
+                                success,
+                                success ? null : "Connection refused",
+                                "RestClient",
+                                Map.of(),
+                                "main");
+                        RestClientTraceController rest = mock(RestClientTraceController.class);
+                        when(rest.trace()).thenReturn(recorder.report(true, ValueExposure.MASKED));
+
+                        ActivityEntryDto entry = only(
+                                service(null, null, rest, null, null, null, properties)
+                                        .report(null, null, 0, 0),
+                                "REST_CLIENT");
+
+                        softly.assertThat(rule.test(entry))
+                                .as(
+                                        "REST success=%s, status %s, %s ms, threshold %s ms, severity %s",
+                                        success, status, durationMillis, threshold, entry.severity())
+                                .isEqualTo(recorder.retention().reserved() == 1);
+                    }
+                }
+            }
+        }
+        softly.assertAll();
+    }
+
+    /**
+     * Both Spring stacks build the capture's reserved-entry rule from {@code bootui.activity.request-slow-threshold-ms},
+     * while BootUI's exchange repository applies {@link ExchangeSlowThreshold}, which is {@code 0} when Actuator does
+     * not record {@code time-taken}. They must still agree on every request, read through the real controller.
+     */
+    @Test
+    void requestEntriesAreReservedExactlyWhenBootUisExchangeRepositoryReservesTheExchange() {
+        SoftAssertions softly = new SoftAssertions();
+        for (String include : new String[] {null, "request-headers,time-taken", "request-headers,response-headers"}) {
+            for (long threshold : new long[] {0L, 1_000L}) {
+                BootUiProperties properties = new BootUiProperties();
+                properties.getActivity().setRequestSlowThresholdMs(threshold);
+                MockEnvironment environment = new MockEnvironment();
+                if (include != null) {
+                    environment.setProperty("management.httpexchanges.recording.include", include);
+                }
+                boolean timeTaken = include == null || include.contains("time-taken");
+                ReservedActivityEntries rule =
+                        new ReservedActivityEntries(properties.getActivity().getRequestSlowThresholdMs());
+                for (int status : new int[] {200, 302, 404, 499, 500, 503}) {
+                    for (long durationMs : new long[] {5L, 999L, 1_000L, 1_500L}) {
+                        BootUiHttpExchangeRepository repository = new BootUiHttpExchangeRepository(
+                                10, 90, ExchangeSlowThreshold.resolve(properties, environment), false);
+                        repository.add(new HttpExchange(
+                                Instant.parse("2026-06-03T09:15:00Z"),
+                                new HttpExchange.Request(
+                                        URI.create("http://localhost:8080/api/orders"), "127.0.0.1", "GET", Map.of()),
+                                new HttpExchange.Response(status, Map.of()),
+                                null,
+                                null,
+                                timeTaken ? Duration.ofMillis(durationMs) : null));
+                        HttpExchangesController requests = new HttpExchangesController(
+                                LiveActivityServiceTests.<HttpExchangeRepository>provider(repository), properties);
+
+                        ActivityEntryDto entry = only(
+                                service(requests, null, null, null, null, properties)
+                                        .report(null, null, 0, 0),
+                                "REQUEST");
+
+                        softly.assertThat(rule.test(entry))
+                                .as(
+                                        "include %s, threshold %s ms, status %s, %s ms, severity %s",
+                                        include, threshold, status, durationMs, entry.severity())
+                                .isEqualTo(repository.snapshot().reserved() == 1);
+                    }
+                }
+            }
+        }
+        softly.assertAll();
+    }
+
+    private static ActivityEntryDto only(LiveActivityReport report, String type) {
+        List<ActivityEntryDto> entries = report.entries().stream()
+                .filter(entry -> type.equals(entry.type()))
+                .toList();
+        assertThat(entries).hasSize(1);
+        return entries.get(0);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            BootUiProperties properties) {
+        return service(
+                requests, sql, null, exceptions, security, health, null, null, null, null, null, null, properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            RestClientTraceController rest,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            BootUiProperties properties) {
+        return service(
+                requests, sql, rest, exceptions, security, health, null, null, null, null, null, null, properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            EmailController email,
+            BootUiProperties properties) {
+        return service(
+                requests, sql, null, exceptions, security, health, email, null, null, null, null, null, properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            BootUiProperties properties) {
+        return service(
+                requests,
+                sql,
+                null,
+                exceptions,
+                security,
+                health,
+                null,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                null,
+                null,
+                properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            RestClientTraceController rest,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            BootUiProperties properties) {
+        return service(
+                requests,
+                sql,
+                rest,
+                exceptions,
+                security,
+                health,
+                null,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                null,
+                null,
+                properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore scheduledTaskRuns,
+            BootUiProperties properties) {
+        return service(
+                requests,
+                sql,
+                null,
+                exceptions,
+                security,
+                health,
+                null,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                scheduledTaskRuns,
+                null,
+                properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            EmailController email,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            BootUiProperties properties) {
+        return service(
+                requests,
+                sql,
+                null,
+                exceptions,
+                security,
+                health,
+                email,
+                requestCorrelations,
+                securityCorrelations,
+                null,
+                null,
+                null,
+                properties);
+    }
+
+    /**
+     * The fullest helper: every other {@code service(...)} overload above forwards here so a caller's
+     * parameters are always passed straight through to the production constructor with explicit
+     * {@code null}s for whatever it doesn't set, rather than routing through another partial overload
+     * (which previously let a merge silently drop a parameter without a compile error).
+     */
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            RestClientTraceController rest,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            EmailController email,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            io.github.jdubois.bootui.engine.cache.CacheActivityRecorder cacheActivity,
+            io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore scheduledTaskRuns,
+            io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder kafka,
+            BootUiProperties properties) {
+        return service(
+                requests,
+                sql,
+                rest,
+                exceptions,
+                security,
+                health,
+                email,
+                requestCorrelations,
+                securityCorrelations,
+                cacheActivity,
+                scheduledTaskRuns,
+                kafka,
+                null,
+                properties);
+    }
+
+    private LiveActivityService service(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            RestClientTraceController rest,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            EmailController email,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            io.github.jdubois.bootui.engine.cache.CacheActivityRecorder cacheActivity,
+            io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore scheduledTaskRuns,
+            io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder kafka,
+            io.github.jdubois.bootui.engine.jms.JmsActivityRecorder jms,
+            BootUiProperties properties) {
+        return new LiveActivityService(
+                provider(requests),
+                provider(sql),
+                provider(rest),
+                provider(exceptions),
+                provider(security),
+                provider(health),
+                provider(email),
+                provider(requestCorrelations),
+                provider(securityCorrelations),
+                provider(cacheActivity),
+                provider(scheduledTaskRuns),
+                provider(kafka),
+                provider(jms),
+                provider(null),
+                provider(null),
+                properties);
+    }
+
+    private LiveActivityService serviceWithKafka(
+            io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder recorder, BootUiProperties properties) {
+        return service(null, null, null, null, null, null, null, null, null, null, null, recorder, properties);
+    }
+
+    private LiveActivityService serviceWithJms(
+            io.github.jdubois.bootui.engine.jms.JmsActivityRecorder recorder, BootUiProperties properties) {
+        return service(null, null, null, null, null, null, null, null, null, null, null, null, recorder, properties);
+    }
+
+    private LiveActivityService serviceWithMessaging(
+            io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder kafka,
+            io.github.jdubois.bootui.engine.jms.JmsActivityRecorder jms,
+            io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder rabbit,
+            BootUiProperties properties) {
+        return new LiveActivityService(
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(kafka),
+                provider(jms),
+                provider(rabbit),
+                provider(null),
+                properties);
+    }
+
+    private LiveActivityService serviceWithCache(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            SecurityLogsController security,
+            HealthController health,
+            io.github.jdubois.bootui.engine.cache.CacheActivityRecorder cacheActivity,
+            BootUiProperties properties) {
+        return service(
+                requests,
+                sql,
+                null,
+                exceptions,
+                security,
+                health,
+                null,
+                null,
+                null,
+                cacheActivity,
+                null,
+                null,
+                properties);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> provider(T value) {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(value);
+        return provider;
+    }
+
+    private static HttpExchangesController requests(HttpExchangeDto... exchanges) {
+        HttpExchangesController controller = mock(HttpExchangesController.class);
+        HttpExchangesReport report = new HttpExchangesReport(
+                exchanges.length,
+                exchanges.length,
+                0,
+                List.of(exchanges),
+                new PageMetadata(0, exchanges.length, exchanges.length, 1, 0, false),
+                null);
+        when(controller.exchanges(null, null, null, null, null)).thenReturn(report);
+        return controller;
+    }
+
+    private static SqlTraceController sql(SqlTraceEntryDto... entries) {
+        SqlTraceController controller = mock(SqlTraceController.class);
+        SqlTraceReport report = new SqlTraceReport(
+                true,
+                null,
+                true,
+                false,
+                100,
+                entries.length,
+                1000,
+                List.of("ds"),
+                SqlTraceStatsDto.empty(),
+                List.of(entries),
+                List.of(),
+                List.of());
+        when(controller.trace()).thenReturn(report);
+        return controller;
+    }
+
+    private static RestClientTraceController rest(RestClientTraceEntryDto... entries) {
+        RestClientTraceController controller = mock(RestClientTraceController.class);
+        RestClientTraceReport report = new RestClientTraceReport(
+                true,
+                null,
+                true,
+                false,
+                100,
+                entries.length,
+                1000,
+                List.of("RestClient"),
+                RestClientTraceStatsDto.empty(),
+                List.of(entries),
+                List.of(),
+                List.of());
+        when(controller.trace()).thenReturn(report);
+        return controller;
+    }
+
+    private static RestClientTraceController unavailableRest() {
+        RestClientTraceController controller = mock(RestClientTraceController.class);
+        when(controller.trace()).thenReturn(RestClientTraceReport.unavailable("REST client tracing is not configured"));
+        return controller;
+    }
+
+    private static ExceptionsController exceptions(ExceptionGroupDto... groups) {
+        ExceptionsController controller = mock(ExceptionsController.class);
+        ExceptionsReport report = new ExceptionsReport(true, null, 50, groups.length, List.of(groups));
+        when(controller.list()).thenReturn(report);
+        return controller;
+    }
+
+    private static HttpExchangeDto routedExchange(
+            String id, Instant timestamp, String path, Long durationMs, String route, String routeSource) {
+        return new HttpExchangeDto(
+                id,
+                timestamp,
+                "GET",
+                path,
+                null,
+                path,
+                200,
+                "2xx",
+                durationMs,
+                null,
+                null,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                route,
+                routeSource);
+    }
+
+    private static HttpExchangeDto exchange(
+            String id, Instant timestamp, String method, String path, int status, Long durationMs) {
+        return new HttpExchangeDto(
+                id,
+                timestamp,
+                method,
+                path,
+                null,
+                path,
+                status,
+                status >= 500 ? "SERVER_ERROR" : "SUCCESS",
+                durationMs,
+                null,
+                null,
+                null,
+                null,
+                "trace-" + id,
+                List.of(),
+                List.of());
+    }
+
+    private static SqlTraceEntryDto sqlEntry(
+            long id, long timestamp, String sql, String category, long durationMillis, boolean success, boolean slow) {
+        return new SqlTraceEntryDto(
+                id,
+                timestamp,
+                sql,
+                category,
+                category,
+                durationMillis * 1_000L,
+                durationMillis,
+                success,
+                null,
+                null,
+                0,
+                "conn-1",
+                "http-thread",
+                slow,
+                List.of(),
+                null,
+                null);
+    }
+
+    /** An exchange stamped with BootUI's request id, which is then its id, and carrying no trace id. */
+    private static HttpExchangeDto stampedExchange(String requestId) {
+        HttpExchangeDto base = exchange(requestId, BASE.plusMillis(1000), "GET", "/orders", 200, 30L);
+        return new HttpExchangeDto(
+                base.id(),
+                base.timestamp(),
+                base.method(),
+                base.path(),
+                base.query(),
+                base.uri(),
+                base.status(),
+                base.statusFamily(),
+                base.durationMs(),
+                base.responseSizeBytes(),
+                base.remoteAddress(),
+                base.principal(),
+                base.sessionId(),
+                null,
+                base.requestHeaders(),
+                base.responseHeaders(),
+                null,
+                null,
+                requestId);
+    }
+
+    private static SqlTraceEntryDto withRequestId(SqlTraceEntryDto entry, String requestId) {
+        return new SqlTraceEntryDto(
+                entry.id(),
+                entry.timestamp(),
+                entry.sql(),
+                entry.statementType(),
+                entry.category(),
+                entry.durationMicros(),
+                entry.durationMillis(),
+                entry.success(),
+                entry.errorMessage(),
+                entry.affectedRows(),
+                entry.batchSize(),
+                entry.connectionId(),
+                entry.thread(),
+                entry.slow(),
+                entry.parameters(),
+                entry.traceId(),
+                entry.callSite(),
+                requestId);
+    }
+
+    private static SqlTraceEntryDto sqlEntryOn(long id, long timestamp, String thread, String traceId) {
+        return new SqlTraceEntryDto(
+                id,
+                timestamp,
+                "SELECT 1",
+                "SELECT",
+                "SELECT",
+                5_000,
+                5,
+                true,
+                null,
+                null,
+                0,
+                "conn-1",
+                thread,
+                false,
+                List.of(),
+                traceId,
+                null);
+    }
+
+    private static RestClientTraceEntryDto restEntry(
+            long id,
+            long timestamp,
+            String method,
+            String host,
+            String path,
+            Integer status,
+            long durationMillis,
+            boolean success,
+            String errorMessage) {
+        return restEntry(id, timestamp, method, host, path, status, durationMillis, success, errorMessage, false);
+    }
+
+    private static RestClientTraceEntryDto restEntry(
+            long id,
+            long timestamp,
+            String method,
+            String host,
+            String path,
+            Integer status,
+            long durationMillis,
+            boolean success,
+            String errorMessage,
+            boolean slow) {
+        return new RestClientTraceEntryDto(
+                id,
+                timestamp,
+                method,
+                "https://" + host + path,
+                host,
+                path,
+                status,
+                durationMillis,
+                success,
+                errorMessage,
+                slow,
+                "RestClient",
+                Map.of(),
+                null,
+                "http-thread",
+                null);
+    }
+
+    private static RestClientTraceEntryDto restEntryOn(long id, long timestamp, String thread, String traceId) {
+        return new RestClientTraceEntryDto(
+                id,
+                timestamp,
+                "GET",
+                "https://api.example.com/users",
+                "api.example.com",
+                "/users",
+                200,
+                5,
+                true,
+                null,
+                false,
+                "RestClient",
+                Map.of(),
+                traceId,
+                thread,
+                null);
+    }
+
+    private static SecurityLogsController security(SecurityLogEventDto... events) {
+        SecurityLogsController controller = mock(SecurityLogsController.class);
+        SecurityLogsReport report = new SecurityLogsReport(
+                true,
+                null,
+                100,
+                List.of(),
+                List.of(events),
+                new PageMetadata(0, events.length, events.length, 1, 0, false));
+        when(controller.logs(null, null, null, 0, 200)).thenReturn(report);
+        return controller;
+    }
+
+    private static EmailController email(EmailMessageDto... messages) {
+        EmailController controller = mock(EmailController.class);
+        EmailsReport report = new EmailsReport(true, null, false, 100, messages.length, List.of(messages));
+        when(controller.list()).thenReturn(report);
+        return controller;
+    }
+
+    private static SecurityLogEventDto securityEvent(String type, String principal, long timestampMillis) {
+        return new SecurityLogEventDto(
+                Instant.ofEpochMilli(timestampMillis).toString(), principal, type, List.of(), null);
+    }
+
+    private static EmailMessageDto email(String id, long timestamp, String traceId, String thread) {
+        return new EmailMessageDto(
+                id,
+                timestamp,
+                "noreply@example.com",
+                List.of("user@example.com"),
+                List.of(),
+                List.of(),
+                "Welcome",
+                "Hello",
+                null,
+                List.of(),
+                true,
+                traceId,
+                thread);
+    }
+
+    private static ExceptionGroupDto group(String id, String className, long lastSeen) {
+        return new ExceptionGroupDto(
+                id,
+                className,
+                "boom",
+                1,
+                lastSeen,
+                lastSeen,
+                "Foo.java:1",
+                true,
+                "http-thread",
+                "GET",
+                "/a",
+                "h",
+                "s",
+                null,
+                "OPEN",
+                0,
+                null);
+    }
+
+    /**
+     * An exception group with no correlated HTTP request (no method/path, matching the shape a
+     * background {@code @Scheduled} failure's captured exception actually has), so {@code
+     * matchExceptionParent} always yields {@code null} and {@code matchScheduledTaskParent} is the only
+     * tier that can attach it to a parent.
+     */
+    private static ExceptionGroupDto scheduledExceptionGroup(
+            String id, String className, long lastSeen, String thread) {
+        return new ExceptionGroupDto(
+                id,
+                className,
+                "boom",
+                1,
+                lastSeen,
+                lastSeen,
+                "Foo.java:1",
+                true,
+                thread,
+                null,
+                null,
+                "h",
+                "s",
+                null,
+                "OPEN",
+                0,
+                null);
+    }
+
+    private static io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore scheduledStore(
+            io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.Run... runs) {
+        io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore store =
+                new io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore(100);
+        for (io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.Run run : runs) {
+            store.record(
+                    run.runnable(),
+                    run.startTimestamp(),
+                    run.durationMs(),
+                    run.success(),
+                    run.exceptionClassName(),
+                    run.message(),
+                    run.thread(),
+                    run.executionId());
+        }
+        return store;
+    }
+
+    private static io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.Run scheduledRun(
+            String runnable, long startTimestamp, long durationMs, boolean success, String thread) {
+        return new io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.Run(
+                0,
+                runnable,
+                startTimestamp,
+                durationMs,
+                success,
+                success ? null : "java.lang.RuntimeException",
+                success ? null : "boom",
+                thread);
+    }
+}

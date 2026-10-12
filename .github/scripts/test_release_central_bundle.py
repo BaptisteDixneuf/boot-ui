@@ -1,197 +1,199 @@
-import hashlib
-import json
-import os
-import subprocess
-import sys
+import importlib.util
 import tempfile
-import threading
 import unittest
-import zipfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPTS))
+SCRIPT = Path(__file__).resolve().parent / "check-central-bundle.py"
+SPEC = importlib.util.spec_from_file_location("check_central_bundle", SCRIPT)
+bundle = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(bundle)
 
-from assemble_central_bundle import ARTIFACT_IDS, BundleError, assemble  # noqa: E402
-
-VERSION = "1.2.3"
-POM_ONLY = {"bootui-parent", "bootui-quarkus-parent"}
-
-
-def install(repository, artifact_id, extra=()):
-    directory = repository / "com/julien-dubois/bootui" / artifact_id / VERSION
-    directory.mkdir(parents=True)
-    prefix = f"{artifact_id}-{VERSION}"
-    names = [f"{prefix}.pom"]
-    if artifact_id not in POM_ONLY:
-        names += [f"{prefix}.jar", f"{prefix}-sources.jar", f"{prefix}-javadoc.jar"]
-    for name in [*names, *extra]:
-        (directory / name).write_text(name)
-        (directory / f"{name}.asc").write_text("signature")
-    (directory / "_remote.repositories").write_text("bookkeeping")
-    (directory.parent / "maven-metadata-local.xml").write_text("<metadata/>")
-    return directory
+VERSION = "2.0.0"
+GROUP_PATH = Path("com/julien-dubois/bootui")
 
 
-class AssembleCentralBundleTests(unittest.TestCase):
+def pom(artifact, dependencies="", extra=""):
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.julien-dubois.bootui</groupId>
+  <artifactId>{artifact}</artifactId>
+  <version>{VERSION}</version>
+  <name>BootUI :: {artifact}</name>
+  <description>The {artifact} module.</description>
+  <url>https://github.com/jdubois/boot-ui</url>
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <id>jdubois</id>
+      <name>Julien Dubois</name>
+    </developer>
+  </developers>
+  <scm>
+    <connection>scm:git:https://github.com/jdubois/boot-ui.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/jdubois/boot-ui.git</developerConnection>
+    <url>https://github.com/jdubois/boot-ui</url>
+  </scm>
+  {extra}
+  <dependencies>{dependencies}</dependencies>
+</project>
+"""
+
+
+def dependency(group, artifact, version="1.0", scope=None, optional=False):
+    scope_xml = f"<scope>{scope}</scope>" if scope else ""
+    optional_xml = "<optional>true</optional>" if optional else ""
+    return (
+        f"<dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId>"
+        f"<version>{version}</version>{scope_xml}{optional_xml}</dependency>"
+    )
+
+
+class CentralBundleTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.repository = Path(self.directory.name) / "repository"
-        self.output = Path(self.directory.name) / "bundle.zip"
-        for artifact_id in ARTIFACT_IDS:
-            install(self.repository, artifact_id, ("bootui-cli-1.2.3-all.jar",) if artifact_id == "bootui-cli" else ())
+        self.root = Path(self.directory.name)
+        for artifact in bundle.PUBLISHED:
+            self.write(artifact, pom(artifact))
 
-    def test_bundle_holds_only_signed_artifacts_and_their_checksums(self):
-        assemble(self.repository, VERSION, self.output)
-        with zipfile.ZipFile(self.output) as bundle:
-            names = bundle.namelist()
-            pom = "com/julien-dubois/bootui/bootui-core/1.2.3/bootui-core-1.2.3.pom"
-            self.assertEqual(bundle.read(pom + ".sha1").decode(), hashlib.sha1(pom.rsplit("/", 1)[1].encode()).hexdigest())
-            self.assertEqual(bundle.read(pom + ".md5").decode(), hashlib.md5(pom.rsplit("/", 1)[1].encode()).hexdigest())
-        directories = {name.rsplit("/", 1)[0] for name in names}
-        self.assertEqual(directories, {f"com/julien-dubois/bootui/{a}/{VERSION}" for a in ARTIFACT_IDS})
-        for directory in directories:
-            artifact_id = directory.split("/")[-2]
-            self.assertIn(f"{directory}/{artifact_id}-{VERSION}.pom", names)
-        self.assertFalse([n for n in names if "_remote" in n or "maven-metadata" in n])
-        self.assertFalse([n for n in names if n.endswith((".asc.md5", ".asc.sha1"))])
-        self.assertIn("com/julien-dubois/bootui/bootui-cli/1.2.3/bootui-cli-1.2.3-all.jar.asc", names)
+    def tearDown(self):
+        self.directory.cleanup()
 
-    def test_stale_checksums_are_regenerated(self):
-        directory = self.repository / "com/julien-dubois/bootui/bootui-core" / VERSION
-        (directory / "bootui-core-1.2.3.pom.sha1").write_text("stale")
-        assemble(self.repository, VERSION, self.output)
-        with zipfile.ZipFile(self.output) as bundle:
-            self.assertNotEqual(bundle.read("com/julien-dubois/bootui/bootui-core/1.2.3/bootui-core-1.2.3.pom.sha1"), b"stale")
+    def write(self, artifact, content, files=None):
+        artifact_dir = self.root / GROUP_PATH / artifact / VERSION
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        prefix = f"{artifact}-{VERSION}"
+        names = files
+        if names is None:
+            names = [f"{prefix}.jar", f"{prefix}-sources.jar", f"{prefix}-javadoc.jar"]
+            names += [f"{prefix}-{c}.jar" for c in bundle.EXTRA_FILES.get(artifact, ())]
+        for name in names + [f"{prefix}.pom"]:
+            for suffix in ("", ".md5", ".sha1"):
+                (artifact_dir / (name + suffix)).write_text("x", encoding="utf-8")
+        (artifact_dir / f"{prefix}.pom").write_text(content, encoding="utf-8")
 
-    def test_missing_module_is_refused(self):
-        directory = self.repository / "com/julien-dubois/bootui/bootui-cli" / VERSION
-        for path in directory.iterdir():
-            path.unlink()
-        directory.rmdir()
-        with self.assertRaisesRegex(BundleError, "bootui-cli 1.2.3 is not installed"):
-            assemble(self.repository, VERSION, self.output)
+    def errors(self):
+        return bundle.check_bundle(self.root, VERSION)
 
-    def test_missing_pom_is_refused(self):
-        (self.repository / "com/julien-dubois/bootui/bootui-engine/1.2.3/bootui-engine-1.2.3.pom").unlink()
-        with self.assertRaisesRegex(BundleError, "bootui-engine 1.2.3 has no POM"):
-            assemble(self.repository, VERSION, self.output)
+    def assert_error(self, fragment):
+        errors = self.errors()
+        self.assertTrue(any(fragment in e for e in errors), errors)
 
-    def test_missing_javadoc_is_refused(self):
-        (self.repository / "com/julien-dubois/bootui/bootui-ui/1.2.3/bootui-ui-1.2.3-javadoc.jar").unlink()
-        with self.assertRaisesRegex(BundleError, "bootui-ui 1.2.3 has no javadoc jar"):
-            assemble(self.repository, VERSION, self.output)
+    def test_a_well_formed_bundle_passes(self):
+        self.assertEqual(self.errors(), [])
 
-    def test_unsigned_file_is_refused(self):
-        (self.repository / "com/julien-dubois/bootui/bootui-core/1.2.3/bootui-core-1.2.3.jar.asc").unlink()
-        with self.assertRaisesRegex(BundleError, "unsigned file: bootui-core-1.2.3.jar"):
-            assemble(self.repository, VERSION, self.output)
+    def test_a_parent_pom_or_an_old_coordinate_is_rejected(self):
+        for extra in ("bootui-parent", "bootui-spring-boot-starter-reactive", "bootui-client"):
+            with self.subTest(extra=extra):
+                self.write(extra, pom(extra))
+                self.assert_error("the bundle must hold exactly")
+                for child in (self.root / GROUP_PATH / extra).rglob("*"):
+                    if child.is_file():
+                        child.unlink()
+                for child in sorted((self.root / GROUP_PATH / extra).rglob("*"), reverse=True):
+                    child.rmdir()
+                (self.root / GROUP_PATH / extra).rmdir()
 
-    def test_foreign_file_is_refused(self):
-        (self.repository / "com/julien-dubois/bootui/bootui-core/1.2.3/notes.txt").write_text("?")
-        with self.assertRaisesRegex(BundleError, "unexpected file"):
-            assemble(self.repository, VERSION, self.output)
+    def test_a_missing_published_artifact_or_file_is_rejected(self):
+        artifact_dir = self.root / GROUP_PATH / "bootui-cli" / VERSION
+        (artifact_dir / f"bootui-cli-{VERSION}-all.jar").unlink()
+        self.assert_error("missing bootui-cli-2.0.0-all.jar")
+        (artifact_dir / f"bootui-cli-{VERSION}-sources.jar.sha1").unlink()
+        self.assert_error("missing bootui-cli-2.0.0-sources.jar.sha1")
 
+    def test_signatures_are_accepted_beside_their_files(self):
+        artifact_dir = self.root / GROUP_PATH / "bootui-agent" / VERSION
+        for name in (f"bootui-agent-{VERSION}.jar.asc", f"bootui-agent-{VERSION}.pom.asc"):
+            (artifact_dir / name).write_text("signature", encoding="utf-8")
+        self.assertEqual(self.errors(), [])
 
-class FakePortal(BaseHTTPRequestHandler):
-    states = []
-    requests = []
+    def test_resolver_bookkeeping_and_foreign_files_are_rejected(self):
+        artifact_dir = self.root / GROUP_PATH / "bootui-engine"
+        for path in (
+            artifact_dir / "maven-metadata-local.xml",
+            artifact_dir / VERSION / "_remote.repositories",
+            artifact_dir / VERSION / f"bootui-engine-{VERSION}-tests.jar",
+            artifact_dir / VERSION / f"bootui-engine-{VERSION}.jar.asc.md5",
+        ):
+            with self.subTest(path=path.name):
+                path.write_text("x", encoding="utf-8")
+                self.assert_error(f"unexpected file in the bundle: {path.relative_to(self.root).as_posix()}")
+                path.unlink()
+        self.assertEqual(self.errors(), [])
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        FakePortal.requests.append((self.path, self.headers.get("Authorization"), self.headers.get("Content-Type"), body))
-        if self.path.startswith("/api/v1/publisher/upload"):
-            self._answer(201, b"deployment-1")
-        elif self.path.startswith("/api/v1/publisher/status"):
-            state = FakePortal.states.pop(0) if len(FakePortal.states) > 1 else FakePortal.states[0]
-            if state == 503:
-                self._answer(503, b"busy")
-                return
-            payload = {"deploymentId": "deployment-1", "deploymentState": state}
-            if state == "FAILED":
-                payload["errors"] = {"pkg:maven/x": ["Missing signature"]}
-            self._answer(200, json.dumps(payload).encode())
-        else:
-            self._answer(404, b"")
-
-    def _answer(self, code, body):
-        self.send_response(code)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
-
-class PublishCentralBundleTests(unittest.TestCase):
-    def setUp(self):
-        self.server = HTTPServer(("127.0.0.1", 0), FakePortal)
-        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-        FakePortal.requests = []
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.bundle = Path(directory.name) / "central-bundle.zip"
-        self.bundle.write_bytes(b"zip-content")
-
-    def publish(self, states, auto_publish="true", username="user", timeout="5"):
-        FakePortal.states = list(states)
-        env = {
-            **os.environ,
-            "MAVEN_CENTRAL_USERNAME": username,
-            "MAVEN_CENTRAL_PASSWORD": "s3cret",
-            "BOOTUI_CENTRAL_PORTAL_URL": f"http://127.0.0.1:{self.server.server_port}",
-            "BOOTUI_CENTRAL_POLL_SECONDS": "0.01",
-            "BOOTUI_CENTRAL_TIMEOUT_SECONDS": timeout,
-        }
-        return subprocess.run(
-            [sys.executable, str(SCRIPTS / "publish_central_bundle.py"), str(self.bundle), "bootui-1.2.3", auto_publish],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
+    def test_a_pom_with_a_parent_is_rejected(self):
+        parent = (
+            "<parent><groupId>com.julien-dubois.bootui</groupId><artifactId>bootui-parent</artifactId>"
+            f"<version>{VERSION}</version></parent>"
         )
+        self.write("bootui-engine", pom("bootui-engine", extra=parent))
+        self.assert_error("must not declare <parent>")
 
-    def test_automatic_publication_waits_until_publishing(self):
-        result = self.publish(["PENDING", 503, "VALIDATING", "PUBLISHING"])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("deployment-1 is PUBLISHING", result.stdout)
-        path, authorization, content_type, body = FakePortal.requests[0]
-        self.assertEqual(path, "/api/v1/publisher/upload?name=bootui-1.2.3&publishingType=AUTOMATIC")
-        self.assertEqual(authorization, "Bearer dXNlcjpzM2NyZXQ=")
-        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
-        self.assertIn(b'name="bundle"; filename="central-bundle.zip"', body)
-        self.assertIn(b"zip-content", body)
-        self.assertNotIn("s3cret", result.stdout + result.stderr)
+    def test_inherited_build_sections_are_rejected(self):
+        for element in ("dependencyManagement", "profiles", "build", "repositories"):
+            with self.subTest(element=element):
+                self.write("bootui-engine", pom("bootui-engine", extra=f"<{element}/>"))
+                self.assert_error(f"must not declare <{element}>")
 
-    def test_user_managed_publication_stops_at_validated(self):
-        result = self.publish(["VALIDATING", "VALIDATED"], auto_publish="false")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("publishingType=USER_MANAGED", FakePortal.requests[0][0])
-        self.assertIn("publish it in the Central Portal", result.stdout)
+    def test_unresolved_properties_and_missing_versions_are_rejected(self):
+        self.write("bootui-engine", pom("bootui-engine", dependency("org.example", "lib", "${lib.version}")))
+        self.assert_error("unresolved ${...} property")
+        self.write(
+            "bootui-engine",
+            pom("bootui-engine", "<dependency><groupId>org.example</groupId><artifactId>lib</artifactId></dependency>"),
+        )
+        self.assert_error("must declare groupId, artifactId and a literal version")
 
-    def test_failed_validation_reports_the_errors(self):
-        result = self.publish(["VALIDATING", "FAILED"])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("failed validation", result.stderr)
-        self.assertIn("Missing signature", result.stderr)
+    def test_central_metadata_must_match_the_root(self):
+        for old, new, fragment in (
+            ("<url>https://github.com/jdubois/boot-ui</url>\n  <licenses>",
+             "<url>https://github.com/jdubois/boot-ui/bootui-engine</url>\n  <licenses>", "<url> must be"),
+            ("<description>The bootui-engine module.</description>", "", "non-empty <description>"),
+            ("Apache License, Version 2.0", "MIT", "<licenses>"),
+            ("<name>Julien Dubois</name>", "", "named developer"),
+            ("scm:git:https://github.com/jdubois/boot-ui.git<", "scm:git:https://github.com/jdubois/boot-ui.git/core<",
+             "<scm><connection>"),
+        ):
+            with self.subTest(new=new):
+                self.write("bootui-engine", pom("bootui-engine").replace(old, new, 1))
+                self.assert_error(fragment)
 
-    def test_timeout_is_reported(self):
-        result = self.publish(["VALIDATING"], timeout="0.05")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("did not reach PUBLISHED or PUBLISHING in time", result.stderr)
+    def test_unpublished_bootui_dependencies_are_rejected_unless_optional(self):
+        bridge = dependency("com.julien-dubois.bootui", "bootui-agent-bridge", VERSION)
+        self.write("bootui-agent", pom("bootui-agent", bridge))
+        self.assert_error("bootui-agent-bridge is not published")
+        optional_bridge = dependency("com.julien-dubois.bootui", "bootui-agent-bridge", VERSION, optional=True)
+        self.write("bootui-agent", pom("bootui-agent", optional_bridge))
+        self.assertEqual(self.errors(), [])
+        stale = dependency("com.julien-dubois.bootui", "bootui-engine", "1.19.0")
+        self.write("bootui-spring-boot-starter", pom("bootui-spring-boot-starter", stale))
+        self.assert_error("must be version 2.0.0")
 
-    def test_missing_credentials_are_refused_before_upload(self):
-        result = self.publish(["PUBLISHED"], username="")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("MAVEN_CENTRAL_USERNAME and MAVEN_CENTRAL_PASSWORD must be set", result.stderr)
-        self.assertEqual(FakePortal.requests, [])
+    def test_test_scope_dependencies_are_rejected(self):
+        self.write("bootui-engine", pom("bootui-engine", dependency("org.junit.jupiter", "junit-jupiter", scope="test")))
+        self.assert_error("scope test")
+
+    def test_the_starter_brings_no_web_stack(self):
+        starter = "bootui-spring-boot-starter"
+        for group, artifact, optional in (
+            ("org.springframework.boot", "spring-boot-starter-web", False),
+            ("org.springframework.boot", "spring-boot-starter-webflux", True),
+            ("org.apache.tomcat.embed", "tomcat-embed-core", False),
+            ("jakarta.servlet", "jakarta.servlet-api", False),
+            ("io.projectreactor.netty", "reactor-netty-http", False),
+        ):
+            with self.subTest(artifact=artifact):
+                self.write(starter, pom(starter, dependency(group, artifact, optional=optional)))
+                self.assert_error("must bring no web stack")
+        provided = dependency("org.springframework.boot", "spring-boot-starter-web", scope="provided")
+        self.write(starter, pom(starter, provided))
+        self.assertEqual(self.errors(), [])
 
 
 if __name__ == "__main__":

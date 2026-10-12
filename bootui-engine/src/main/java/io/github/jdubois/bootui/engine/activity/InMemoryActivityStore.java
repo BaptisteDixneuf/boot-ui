@@ -79,6 +79,15 @@ public final class InMemoryActivityStore implements ActivityStore {
         return new ActivityPage(page, nextCursor, hasMore);
     }
 
+    /** Drops every retained entry and returns how many there were. */
+    public int clear() {
+        synchronized (lock) {
+            int retained = buffer.size();
+            buffer.clear();
+            return retained;
+        }
+    }
+
     private static boolean matchesFilters(
             ActivityEntryDto entry, String type, String severity, String text, Long since, Long until) {
         if (since != null && entry.timestamp() <= since) {
@@ -99,7 +108,7 @@ public final class InMemoryActivityStore implements ActivityStore {
         return true;
     }
 
-    private static boolean matchesText(ActivityEntryDto entry, String needle) {
+    static boolean matchesText(ActivityEntryDto entry, String needle) {
         String lowerNeedle = needle.toLowerCase(Locale.ROOT);
         return containsIgnoreCase(entry.summary(), lowerNeedle)
                 || containsIgnoreCase(entry.detail(), lowerNeedle)

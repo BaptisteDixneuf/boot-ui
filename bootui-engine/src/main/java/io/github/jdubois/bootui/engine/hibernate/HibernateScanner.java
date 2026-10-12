@@ -67,7 +67,7 @@ public final class HibernateScanner {
             sourceLocations = HibernateSourceLocations::resolve;
     private final SingleFlightAction singleFlight = new SingleFlightAction();
     private final AdvisorScanState<HibernateReport> violationState =
-            new AdvisorScanState<>(HibernateReport::withViolationDetails);
+            new AdvisorScanState<>(HibernateReport::withViolationDetails, this::ruleCatalog);
 
     /**
      * Compatibility factory for declaration-only discovery. The property callback is retained for
@@ -133,7 +133,8 @@ public final class HibernateScanner {
     public HibernateReport initialReport() {
         return report(
                 "NOT_SCANNED",
-                "Hibernate Advisor has not run yet. Click Run Hibernate checks to inspect mapped entities.",
+                "Hibernate Advisor has not run yet. Run Hibernate checks in the panel, or call hibernate_scan"
+                        + " (bootui hibernate scan), to inspect mapped entities.",
                 null,
                 List.of(),
                 0,
@@ -630,5 +631,10 @@ public final class HibernateScanner {
 
     private static boolean isViolation(HibernateRuleResultDto result) {
         return HibernateRuleSupport.VIOLATION.equals(result.status());
+    }
+
+    /** The ids of the rules this scanner runs, the catalogue its detail reads know. */
+    private List<String> ruleCatalog() {
+        return AdvisorScanState.ruleIds(rules, rule -> rule.definition().id());
     }
 }

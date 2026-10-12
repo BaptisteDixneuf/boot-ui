@@ -11,13 +11,19 @@ import io.github.jdubois.bootui.engine.architecture.ArchitecturePlatform;
 import io.github.jdubois.bootui.engine.architecture.ArchitectureScanner;
 import io.github.jdubois.bootui.engine.beans.BeansService;
 import io.github.jdubois.bootui.engine.cache.CacheService;
+import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
+import io.github.jdubois.bootui.engine.codepaths.JournalRequestOutcomes;
 import io.github.jdubois.bootui.engine.config.ConfigService;
+import io.github.jdubois.bootui.engine.correlation.RequestPhases;
+import io.github.jdubois.bootui.engine.correlation.ScopedCorrelationContextProvider;
+import io.github.jdubois.bootui.engine.correlation.TraceIdSource;
 import io.github.jdubois.bootui.engine.databaseadvisor.DatabaseAdvisorScanner;
 import io.github.jdubois.bootui.engine.datasource.ConnectionPoolService;
 import io.github.jdubois.bootui.engine.devservices.DevServicesReportService;
 import io.github.jdubois.bootui.engine.email.EmailCaptureService;
 import io.github.jdubois.bootui.engine.email.EmailStore;
 import io.github.jdubois.bootui.engine.errorcontract.ErrorContractService;
+import io.github.jdubois.bootui.engine.exceptions.CaughtExceptionsReader;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionsService;
 import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder;
@@ -33,15 +39,39 @@ import io.github.jdubois.bootui.engine.hibernate.EntityDiscovery;
 import io.github.jdubois.bootui.engine.hibernate.EntityDiscoverySource;
 import io.github.jdubois.bootui.engine.hibernate.HibernateScanner;
 import io.github.jdubois.bootui.engine.hibernate.HibernateStatisticsService;
+import io.github.jdubois.bootui.engine.insights.AiUsageByRoute;
+import io.github.jdubois.bootui.engine.inventory.CodeInventoryHistory;
+import io.github.jdubois.bootui.engine.inventory.CodeInventoryService;
+import io.github.jdubois.bootui.engine.inventory.CodeInventorySettings;
+import io.github.jdubois.bootui.engine.inventory.JournalRequestRoutes;
+import io.github.jdubois.bootui.engine.javaagent.AgentBridgeAccess;
+import io.github.jdubois.bootui.engine.javaagent.AgentCaughtExceptions;
+import io.github.jdubois.bootui.engine.javaagent.AgentClaim;
+import io.github.jdubois.bootui.engine.javaagent.AgentHandoffs;
+import io.github.jdubois.bootui.engine.javaagent.AgentSetupSnippets;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentSettings;
+import io.github.jdubois.bootui.engine.journal.ActivityFeedSource;
+import io.github.jdubois.bootui.engine.journal.AgentEvidence;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates;
+import io.github.jdubois.bootui.engine.journal.RunBaselineFile;
+import io.github.jdubois.bootui.engine.journal.RunHistory;
+import io.github.jdubois.bootui.engine.journal.RunSummary;
+import io.github.jdubois.bootui.engine.journal.RunningHandoffs;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournal;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournalSettings;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
 import io.github.jdubois.bootui.engine.liquibase.LiquibaseService;
 import io.github.jdubois.bootui.engine.loggers.LoggersService;
 import io.github.jdubois.bootui.engine.logtail.LogTailBuffer;
 import io.github.jdubois.bootui.engine.mappings.MappingsService;
+import io.github.jdubois.bootui.engine.memory.MemoryOffloadService;
 import io.github.jdubois.bootui.engine.memory.MemoryReportProvider;
 import io.github.jdubois.bootui.engine.memory.MemoryScanner;
 import io.github.jdubois.bootui.engine.metrics.MeterSelfFilter;
 import io.github.jdubois.bootui.engine.metrics.MetricsReportProvider;
+import io.github.jdubois.bootui.engine.model.StructureSnapshots;
 import io.github.jdubois.bootui.engine.mysql.MySqlInsightService;
 import io.github.jdubois.bootui.engine.mysql.MySqlRowLimits;
 import io.github.jdubois.bootui.engine.pentesting.PentestingScanner;
@@ -50,6 +80,7 @@ import io.github.jdubois.bootui.engine.postgres.PostgresRowLimits;
 import io.github.jdubois.bootui.engine.quarkusapp.QuarkusAppScanner;
 import io.github.jdubois.bootui.engine.quarkussecurity.QuarkusSecurityScanner;
 import io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder;
+import io.github.jdubois.bootui.engine.resources.ResourceSettings;
 import io.github.jdubois.bootui.engine.restapi.RestApiScanner;
 import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
 import io.github.jdubois.bootui.engine.retention.TieredCaptureBuffer;
@@ -57,7 +88,11 @@ import io.github.jdubois.bootui.engine.safety.ApiTokenAuthenticator;
 import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
 import io.github.jdubois.bootui.engine.scheduled.ScheduledTasksService;
 import io.github.jdubois.bootui.engine.security.SecurityEventBuffer;
+import io.github.jdubois.bootui.engine.sideeffects.JournalExecutions;
+import io.github.jdubois.bootui.engine.sideeffects.JournalNetworkCapture;
+import io.github.jdubois.bootui.engine.sideeffects.SideEffectsService;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder;
+import io.github.jdubois.bootui.engine.support.BootUiHttpClients;
 import io.github.jdubois.bootui.engine.support.InternalPackageMatcher;
 import io.github.jdubois.bootui.engine.telemetry.SelfTelemetryClassifier;
 import io.github.jdubois.bootui.engine.telemetry.SpanEnricher;
@@ -70,40 +105,48 @@ import io.github.jdubois.bootui.engine.websocket.WebSocketService;
 import io.github.jdubois.bootui.engine.websocket.WebSocketSettings;
 import io.github.jdubois.bootui.quarkus.beans.QuarkusBeanProvider;
 import io.github.jdubois.bootui.quarkus.config.QuarkusConfigProvider;
+import io.github.jdubois.bootui.quarkus.correlation.QuarkusRequestCorrelation;
+import io.github.jdubois.bootui.quarkus.correlation.QuarkusThreadKinds;
 import io.github.jdubois.bootui.quarkus.databaseadvisor.QuarkusDatabaseAdvisorDataSourceProvider;
 import io.github.jdubois.bootui.quarkus.errorcontract.QuarkusErrorContractProvider;
 import io.github.jdubois.bootui.quarkus.faulttolerance.QuarkusFaultTolerancePolicyProvider;
 import io.github.jdubois.bootui.quarkus.health.QuarkusHealthGuidance;
 import io.github.jdubois.bootui.quarkus.hibernate.QuarkusHibernatePropertyLookup;
+import io.github.jdubois.bootui.quarkus.javaagent.QuarkusAgentClaim;
+import io.github.jdubois.bootui.quarkus.logging.QuarkusLogCoverage;
 import io.github.jdubois.bootui.quarkus.logging.QuarkusLoggerProvider;
 import io.github.jdubois.bootui.quarkus.mappings.QuarkusMappingProvider;
 import io.github.jdubois.bootui.quarkus.pentesting.QuarkusPentestingObservationCollector;
 import io.github.jdubois.bootui.quarkus.quarkusapp.QuarkusAppSnapshotProviderImpl;
 import io.github.jdubois.bootui.quarkus.scheduled.QuarkusScheduledTaskProvider;
 import io.github.jdubois.bootui.quarkus.security.QuarkusSecuritySnapshotProviderImpl;
+import io.github.jdubois.bootui.quarkus.web.DeclaredRouteTemplates;
 import io.github.jdubois.bootui.quarkus.web.GitHubApiClient;
 import io.github.jdubois.bootui.quarkus.web.QuarkusGitHubSettings;
 import io.github.jdubois.bootui.quarkus.websocket.QuarkusWebSocketMetadataProvider;
 import io.github.jdubois.bootui.spi.CacheProvider;
 import io.github.jdubois.bootui.spi.ConnectionPoolProvider;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
 import io.github.jdubois.bootui.spi.FlywayProvider;
 import io.github.jdubois.bootui.spi.HealthProvider;
 import io.github.jdubois.bootui.spi.HibernateStatisticsProvider;
 import io.github.jdubois.bootui.spi.LiquibaseProvider;
 import io.github.jdubois.bootui.spi.LoggerProvider;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.spi.MappingProvider;
 import io.github.jdubois.bootui.spi.WebSocketSessionProvider;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.quarkus.runtime.LaunchMode;
+import io.quarkus.runtime.StartupEvent;
 import io.smallrye.config.SmallRyeConfig;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.inject.AmbiguousResolutionException;
 import jakarta.enterprise.inject.Any;
+import jakarta.enterprise.inject.Disposes;
 import jakarta.enterprise.inject.Instance;
 import jakarta.enterprise.inject.Produces;
 import jakarta.enterprise.inject.spi.BeanManager;
 import jakarta.inject.Singleton;
-import java.net.http.HttpClient;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Clock;
@@ -147,6 +190,42 @@ public class BootUiEngineProducer {
         mySqlRowLimits(config);
     }
 
+    /**
+     * Rejects a non-positive {@code bootui.runtime-insights.ai-token-threshold} at startup, as Spring's property binder
+     * does, rather than at the first Runtime Insights request: {@code RuntimeInsightsResource} is a REST resource that
+     * Quarkus constructs lazily, so without this observer a mistyped threshold would surface as a failed request
+     * instead of a failed start.
+     */
+    void validateRuntimeInsightsThreshold(
+            @jakarta.enterprise.event.Observes io.quarkus.runtime.StartupEvent event, Config config) {
+        runtimeInsightsTokenThreshold(config);
+    }
+
+    /**
+     * Rejects {@code bootui.activity.feed-source=buffers}, which 2.0.0 removed, and any unknown value at startup, as
+     * Spring's property binder does: {@code LiveActivityResource} is a REST resource that Quarkus constructs lazily.
+     */
+    void validateActivityFeedSource(
+            @jakarta.enterprise.event.Observes io.quarkus.runtime.StartupEvent event, Config config) {
+        activityFeedSource(config);
+    }
+
+    /** The validated {@code bootui.activity.feed-source}. */
+    public static ActivityFeedSource activityFeedSource(Config config) {
+        return ActivityFeedSource.parseConfigured(config.getOptionalValue(ActivityFeedSource.PROPERTY, String.class)
+                .orElse(null));
+    }
+
+    /** The validated {@code bootui.runtime-insights.ai-token-threshold}. */
+    public static long runtimeInsightsTokenThreshold(Config config) {
+        String property = "bootui.runtime-insights.ai-token-threshold";
+        // An explicitly empty value must fail conversion, not silently select the default, which is what
+        // getOptionalValue would do with it.
+        return config.getConfigValue(property).getRawValue() == null
+                ? AiUsageByRoute.DEFAULT_TOKEN_THRESHOLD
+                : AiUsageByRoute.validateTokenThreshold(config.getValue(property, Long.class));
+    }
+
     @Produces
     @Singleton
     ApiTokenAuthenticator apiTokenAuthenticator(Config config) {
@@ -174,6 +253,252 @@ public class BootUiEngineProducer {
         }
     }
 
+    /**
+     * The Java Agent panel's service ({@code docs/PLAN-v2.md} §5.13), reading the claim {@code BootUiAgentRecorder}
+     * made at static init. Production never wires it, so its disabled state is only ever reported defensively.
+     */
+    @Produces
+    @Singleton
+    public JavaAgentService javaAgentService(Instance<QuarkusAgentClaim> claim) {
+        return javaAgentService(
+                AgentBridgeAccess.locate(),
+                claim.isResolvable() ? claim.get() : QuarkusAgentClaim.none(),
+                LaunchMode.current());
+    }
+
+    /**
+     * The service for {@code claim}, with the build-time {@code bootui.agent.enabled} the static-init claim was decided
+     * with: a runtime value of that build-time property changes nothing, so the panel never reports it.
+     */
+    static JavaAgentService javaAgentService(AgentBridgeAccess access, QuarkusAgentClaim claim, LaunchMode launchMode) {
+        return new JavaAgentService(
+                access,
+                claim::claim,
+                JavaAgentSettings.of(
+                        AgentSetupSnippets.QUARKUS,
+                        claim.enabled(),
+                        launchMode == LaunchMode.NORMAL ? "Quarkus production mode" : null));
+    }
+
+    /**
+     * Code Inventory ({@code docs/PLAN-v2.md} §5.15): this run's executed and changed application methods and its
+     * dependency use, from the BootUI agent's inventory sensor. {@code QuarkusAgentClaimLifecycle} starts it at startup
+     * once this start's claim is armed; it stops its drain and scan threads when the application stops, which a live
+     * reload does. It scans the class files the application class loader of this start sees.
+     */
+    @Produces
+    @Singleton
+    public CodeInventoryService codeInventoryService(
+            Instance<QuarkusAgentClaim> claim,
+            JavaAgentService javaAgent,
+            QuarkusDependencyProvider dependencies,
+            Instance<JournalAggregates> aggregates,
+            Instance<RuntimeJournal> journal,
+            AgentEvidence evidence,
+            Config config) {
+        QuarkusAgentClaim current = claim.isResolvable() ? claim.get() : QuarkusAgentClaim.none();
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        CodeInventoryService service = new CodeInventoryService(
+                AgentBridgeAccess.locate(),
+                current::claim,
+                javaAgent::inventoryUnavailableReason,
+                () -> loader,
+                dependencies::inventory,
+                () -> aggregates.isResolvable() ? aggregates.get().runReadyAtEpochMillis() : null,
+                new CodeInventorySettings(
+                        config.getOptionalValue("bootui.code-inventory.max-classes", Integer.class)
+                                .orElse(CodeInventorySettings.DEFAULT_MAX_CLASSES),
+                        config.getOptionalValue("bootui.code-inventory.scan-timeout", Duration.class)
+                                .orElse(CodeInventorySettings.DEFAULT_SCAN_TIMEOUT)),
+                CodeInventoryHistory.shared(),
+                // Its panel and HTTP Exchanges, which owns request routes, gate its reads (docs/PLAN-v2.md §8).
+                evidence);
+        JournalAggregates journalAggregates = aggregates.isResolvable() ? aggregates.get() : null;
+        service.setRequestRoutes(JournalRequestRoutes.of(
+                journal.isResolvable() ? journal.get() : null,
+                journalAggregates == null ? null : journalAggregates.declaredRoutes()));
+        return service;
+    }
+
+    /**
+     * The agent evidence contract ({@code docs/PLAN-v2.md} §5.17, M5-11), from the same
+     * {@code bootui.runtime-journal.agent-evidence-max-bytes} key and default as the Spring adapter: Code Paths and Code
+     * Inventory read their evidence through it under the panels' live state, and, as a listener of the journal, every
+     * clear of the journal clears it too. A panel is visible when it is available and enabled; the services give the
+     * agent's own reason first, so a missing agent never reads as a disabled panel.
+     */
+    @Produces
+    @Singleton
+    public AgentEvidence agentEvidence(
+            Config config, RuntimeJournal journal, Instance<QuarkusPanelAvailability> panels) {
+        AgentEvidence evidence = new AgentEvidence(
+                panel -> panelVisible(panels, panel),
+                RuntimeJournalSettings.parseBytes(
+                        config.getOptionalValue("bootui.runtime-journal.agent-evidence-max-bytes", String.class)
+                                .orElse(null),
+                        "bootui.runtime-journal.agent-evidence-max-bytes"));
+        evidence.listenTo(journal);
+        return evidence;
+    }
+
+    /** Stops clearing the agent evidence with the journal when the application stops. */
+    public void closeAgentEvidence(@Disposes AgentEvidence evidence, RuntimeJournal journal) {
+        journal.removeListener(evidence);
+    }
+
+    private static boolean panelVisible(Instance<QuarkusPanelAvailability> panels, String panel) {
+        if (!panels.isResolvable()) {
+            return false;
+        }
+        QuarkusPanelAvailability availability = panels.get();
+        return availability.isPanelAvailable(panel) && availability.isPanelEnabled(panel);
+    }
+
+    /** Stops Code Inventory's drain and scan threads with the application. */
+    public void closeCodeInventoryService(@Disposes CodeInventoryService service) {
+        service.close();
+    }
+
+    /**
+     * Code Paths ({@code docs/PLAN-v2.md} §5.14, M5-4a): routes the agent's {@code code-paths} fragments of this start's
+     * claim into request trees and decides the sensor's adaptive exclusion. {@code QuarkusAgentClaimLifecycle} starts it
+     * at startup; a live reload's next start claims again and produces a new one.
+     */
+    @Produces
+    @Singleton
+    public CodePathsService codePathsService(
+            Instance<QuarkusAgentClaim> claim,
+            JavaAgentService javaAgent,
+            Instance<JournalAggregates> aggregates,
+            Instance<RuntimeJournal> journal,
+            AgentEvidence evidence,
+            Instance<QuarkusBeanProvider> beans,
+            QuarkusExposurePolicy exposure) {
+        QuarkusAgentClaim current = claim.isResolvable() ? claim.get() : QuarkusAgentClaim.none();
+        // Its panel and HTTP Exchanges, which owns route trees and request outcomes, gate its reads (docs/PLAN-v2.md
+        // §8).
+        CodePathsService service = new CodePathsService(
+                AgentBridgeAccess.locate(), current::claim, javaAgent::codePathsUnavailableReason, evidence);
+        JournalAggregates journalAggregates = aggregates.isResolvable() ? aggregates.get() : null;
+        service.setRequestOutcomes(JournalRequestOutcomes.of(
+                journal.isResolvable() ? journal.get() : null,
+                journalAggregates == null ? null : journalAggregates.declaredRoutes()));
+        // Beans at runtime reads the Beans panel's beans and their declared dependencies (M5-4c).
+        service.setStructure(() -> StructureSnapshots.read(null, beans.isResolvable() ? beans.get() : null, null));
+        // Method probes' argument and return shapes follow the live bootui.expose-values (M5-8, D44).
+        service.setExposure(exposure);
+        return service;
+    }
+
+    /** Stops routing Code Paths' fragments with the application. */
+    public void closeCodePathsService(@Disposes CodePathsService service) {
+        service.close();
+    }
+
+    /**
+     * Side Effects ({@code docs/PLAN-v2.md} §5.16, M5-5a): routes the agent's side-effect records of this start's claim
+     * into bounded rows per sensor, attributed to their request's route through HTTP Exchanges.
+     * {@code QuarkusAgentClaimLifecycle} starts it at startup; a live reload's next start claims again and produces a new
+     * one.
+     */
+    @Produces
+    @Singleton
+    public SideEffectsService sideEffectsService(
+            Instance<QuarkusAgentClaim> claim,
+            JavaAgentService javaAgent,
+            Instance<JournalAggregates> aggregates,
+            Instance<RuntimeJournal> journal,
+            AgentEvidence evidence,
+            Config config,
+            RequestPhases requestPhases) {
+        QuarkusAgentClaim current = claim.isResolvable() ? claim.get() : QuarkusAgentClaim.none();
+        SideEffectsService service = new SideEffectsService(
+                AgentBridgeAccess.locate(),
+                current::claim,
+                javaAgent::sideEffectsUnavailableReason,
+                javaAgent::sideEffectsCoverage,
+                evidence);
+        JournalAggregates journalAggregates = aggregates.isResolvable() ? aggregates.get() : null;
+        service.setRequestRoutes(JournalRequestRoutes.of(
+                journal.isResolvable() ? journal.get() : null,
+                journalAggregates == null ? null : journalAggregates.declaredRoutes()));
+        service.setExecutionLabels(JournalExecutions.of(journal.isResolvable() ? journal.get() : null));
+        // Whether a panel shows a network connection's work (M5-5b).
+        service.setNetworkCapture(JournalNetworkCapture.of(journal.isResolvable() ? journal.get() : null));
+        // Connections to a telemetry exporter the application configures are infrastructure (M5-5b).
+        service.setExporterEndpoints(
+                key -> config.getOptionalValue(key, String.class).orElse(null));
+        // Each request's end, as the capture filter marks it, so the thread-activity sensor checks what it left
+        // running.
+        service.listenToRequestEnds(requestPhases);
+        if (journalAggregates != null) {
+            // The run's side-effect keys go into its summary, for the next start's comparison (M5-7b).
+            journalAggregates.setRunSideEffects(service::runSideEffects);
+        }
+        // A sensor switched at run time (M5-14): the run is not compared for it (M5-7b), and a side-effect sensor
+        // switched on records from now on, even before the panel is read.
+        javaAgent.onSensorSwitched(id -> {
+            service.sensorSwitched(id);
+            service.start();
+        });
+        return service;
+    }
+
+    /** Stops routing Side Effects' records with the application. */
+    public void closeSideEffectsService(@Disposes SideEffectsService service) {
+        service.close();
+    }
+
+    /**
+     * The engine side of the BootUI agent's opt-in {@code caught-exceptions} sensor ({@code docs/PLAN-v2.md} M5-6a):
+     * routes its records into the runtime journal, which is installed on it at startup as on every recorder.
+     * {@code QuarkusAgentClaimLifecycle} starts it; a live reload's next start claims again and produces a new one.
+     */
+    @Produces
+    @Singleton
+    public AgentCaughtExceptions agentCaughtExceptions(Instance<QuarkusAgentClaim> claim) {
+        QuarkusAgentClaim current = claim.isResolvable() ? claim.get() : QuarkusAgentClaim.none();
+        return new AgentCaughtExceptions(AgentBridgeAccess.locate(), current::claim);
+    }
+
+    /** Stops routing caught exceptions with the application. */
+    public void closeAgentCaughtExceptions(@Disposes AgentCaughtExceptions caught) {
+        caught.close();
+    }
+
+    /**
+     * The Exceptions panel's <b>Caught in application code</b> section ({@code docs/PLAN-v2.md} M5-6): what became of
+     * the exceptions application code caught, from the agent's {@code caught-exceptions} sensor, with the JBoss
+     * LogManager's coverage. Without the sensor it reports why; a read drains the agent and starts nothing else.
+     */
+    @Produces
+    @Singleton
+    public CaughtExceptionsReader caughtExceptionsReader(
+            RuntimeJournal journal, Instance<AgentCaughtExceptions> caught) {
+        return new CaughtExceptionsReader(
+                journal,
+                () -> caught.isResolvable() ? caught.get() : null,
+                new QuarkusLogCoverage(),
+                RunningHandoffs.shared());
+    }
+
+    /**
+     * The engine side of the BootUI agent's executor propagation ({@code docs/PLAN-v2.md} M5-2), which
+     * {@code QuarkusAgentClaimLifecycle} attaches to this start's claim at startup. It reads the request's context from
+     * the thread scope, else the request's Vert.x duplicated context. Without the agent, nothing calls it.
+     */
+    @Produces
+    @Singleton
+    public AgentHandoffs agentHandoffs(RequestPhases phases, Instance<QuarkusAgentClaim> claim) {
+        AgentClaim current = claim.isResolvable() ? claim.get().claim() : null;
+        return new AgentHandoffs(
+                QuarkusRequestCorrelation::current,
+                phases,
+                current == null
+                        ? AgentHandoffs.DEFAULT_MAX_HANDOFF
+                        : current.sensors().maxHandoff());
+    }
+
     @Produces
     @Singleton
     public ThreadDumpService threadDumpService(QuarkusExposurePolicy exposure) {
@@ -185,6 +510,16 @@ public class BootUiEngineProducer {
     public MemoryReportProvider memoryReportProvider(
             QuarkusMemoryRuntimeConfig runtimeConfig, QuarkusExposurePolicy exposure) {
         return new MemoryReportProvider(runtimeConfig, exposure);
+    }
+
+    /**
+     * <b>Free BootUI memory</b> for the Live Memory, JVM Tuning, Heap Dump, and Memory panels, over the BootUI stores
+     * ArC has already created ({@link QuarkusMemoryOffloadCandidates}), re-read on every call.
+     */
+    @Produces
+    @Singleton
+    public MemoryOffloadService memoryOffloadService() {
+        return new MemoryOffloadService(QuarkusMemoryOffloadCandidates::created);
     }
 
     /**
@@ -226,6 +561,105 @@ public class BootUiEngineProducer {
      * also carries that threshold to the Live Activity assembler, so both agree on which requests are slow. The
      * buffer caps and orders, the engine service masks. A singleton so writes and reads share one bounded buffer.
      */
+    /**
+     * The incremental aggregates of the runtime journal ({@code docs/PLAN-v2.md} §5.2), which name a request's route
+     * from the declared JAX-RS mappings, since Quarkus records no route template. When the application stops, as
+     * before a live reload, they keep the run's summary in the JVM's run history, and in the baseline file when one is
+     * set ({@code docs/PLAN-v2.md} §5.8).
+     */
+    @Produces
+    @Singleton
+    public JournalAggregates journalAggregates(
+            Instance<MappingProvider> mappings, QuarkusApplicationInfo application, Config config) {
+        JournalAggregates aggregates = new JournalAggregates();
+        aggregates.setDeclaredRoutes(DeclaredRouteTemplates.caching(mappings));
+        aggregates.recordRunIn(
+                RunHistory.shared(),
+                application.run(),
+                RunBaselineFile.of(
+                        config.getOptionalValue("bootui.runtime-journal.baseline-file", String.class)
+                                .orElse(null),
+                        config.getOptionalValue("quarkus.application.name", String.class)
+                                .orElse("application")),
+                runApplicationKey(config, LaunchMode.current()));
+        return aggregates;
+    }
+
+    /**
+     * The key of this application's runs ({@code RunSummary.applicationKey}), so run comparison never compares a run
+     * with one of another application sharing the JVM: its mode, as the BootUI agent's claim slot names it
+     * ({@code bootui.agent.mode}, else {@code test} in test launch mode and {@code dev} otherwise), then
+     * {@code quarkus.application.name}.
+     */
+    static String runApplicationKey(Config config, LaunchMode launchMode) {
+        String configured = config.getOptionalValue("bootui.agent.mode", String.class)
+                .orElse("auto")
+                .strip()
+                .toLowerCase(java.util.Locale.ROOT);
+        String mode = AgentClaim.DEV.equals(configured) || AgentClaim.TEST.equals(configured)
+                ? configured
+                : launchMode == LaunchMode.TEST ? AgentClaim.TEST : AgentClaim.DEV;
+        return RunSummary.applicationKey(
+                mode,
+                config.getOptionalValue("quarkus.application.name", String.class)
+                        .orElse("application"));
+    }
+
+    /**
+     * The runtime journal of this application start ({@code docs/PLAN-v2.md} §5.2), from the same
+     * {@code bootui.runtime-journal.*} keys and defaults as the Spring adapter. The SQL recorder and the HTTP capture
+     * filter publish to it, so it exists from the first request. Its aggregates listen from its creation.
+     */
+    @Produces
+    @Singleton
+    public RuntimeJournal runtimeJournal(
+            Config config, QuarkusApplicationInfo application, JournalAggregates aggregates) {
+        RuntimeJournalSettings settings = RuntimeJournalSettings.of(
+                config.getOptionalValue("bootui.runtime-journal.enabled", Boolean.class)
+                        .orElse(true),
+                config.getOptionalValue("bootui.runtime-journal.max-events", Integer.class)
+                        .orElse(RuntimeJournalSettings.DEFAULT_MAX_EVENTS),
+                RuntimeJournalSettings.parseBytes(
+                        config.getOptionalValue("bootui.runtime-journal.max-bytes", String.class)
+                                .orElse(null)),
+                config.getOptionalValue("bootui.runtime-journal.queue-capacity", Integer.class)
+                        .orElse(RuntimeJournalSettings.DEFAULT_QUEUE_CAPACITY),
+                config.getOptionalValue("bootui.runtime-journal.sources", String.class)
+                        .orElse(null));
+        RuntimeJournal journal = new RuntimeJournal(settings, application.run());
+        journal.setCorrelationContextProvider(QuarkusRequestCorrelation::current);
+        journal.setThreadKindClassifier(new QuarkusThreadKinds());
+        journal.addListener(aggregates);
+        journal.startGcSource();
+        journal.startResourceSampler(
+                new ResourceSettings(
+                        config.getOptionalValue("bootui.resources.sample-interval", Duration.class)
+                                .orElse(ResourceSettings.DEFAULT_SAMPLE_INTERVAL),
+                        config.getOptionalValue("bootui.resources.max-threads", Integer.class)
+                                .orElse(ResourceSettings.DEFAULT_MAX_THREADS),
+                        config.getOptionalValue("bootui.resources.jfr.max-duration", Duration.class)
+                                .orElse(ResourceSettings.DEFAULT_JFR_MAX_DURATION)),
+                aggregates.resourceTrack());
+        return journal;
+    }
+
+    /**
+     * Installs the runtime journal on every recorder when the application starts ({@code docs/PLAN-v2.md} §5.2):
+     * each recorder's producer declares it as a {@link RuntimeEventPublisher}, so CDI lists them all here, and they
+     * publish from the first request.
+     */
+    void installRuntimeJournal(
+            @Observes StartupEvent event, RuntimeJournal journal, @Any Instance<RuntimeEventPublisher> publishers) {
+        for (RuntimeEventPublisher publisher : publishers) {
+            publisher.setRuntimeEventSink(journal);
+        }
+    }
+
+    /** Stops the journal's dispatcher when the application stops, including before a live reload. */
+    void closeRuntimeJournal(@Disposes RuntimeJournal journal) {
+        journal.close();
+    }
+
     @Produces
     @Singleton
     public HttpExchangeBuffer httpExchangeBuffer(Config config) {
@@ -299,7 +733,7 @@ public class BootUiEngineProducer {
     @Produces
     @Singleton
     public EmailCaptureService emailCaptureService(
-            QuarkusExposurePolicy exposure, Config config, Instance<TraceIdProvider> traceIdProvider) {
+            QuarkusExposurePolicy exposure, Config config, Instance<TraceIdSource> traceIdProvider) {
         int maxEntries = config.getOptionalValue("bootui.email.max-entries", Integer.class)
                 .orElse(100);
         int maxBodyLength = config.getOptionalValue("bootui.email.max-body-length", Integer.class)
@@ -310,10 +744,48 @@ public class BootUiEngineProducer {
                 .orElse(false);
         EmailCaptureService service =
                 new EmailCaptureService(new EmailStore(maxEntries, maxBodyLength), exposure, mock, maskContent);
-        if (traceIdProvider.isResolvable()) {
-            service.setTraceIdProvider(traceIdProvider.get());
-        }
+        service.setCorrelationContextProvider(new ScopedCorrelationContextProvider(
+                QuarkusRequestCorrelation::current, traceIdProvider.isResolvable() ? traceIdProvider.get() : null));
         return service;
+    }
+
+    /** The phase markers of recent requests ({@code docs/PLAN-v2.md} §5.1), shared by the filters and recorders. */
+    @Produces
+    @Singleton
+    public RequestPhases requestPhases() {
+        return new RequestPhases();
+    }
+
+    /**
+     * The correlation context of the work being recorded ({@code docs/PLAN-v2.md} §5.1): the open thread scope, else
+     * the context {@code QuarkusHttpExchangeCaptureFilter} attached to the request's Vert.x duplicated context, with
+     * the trace id filled in from OpenTelemetry when it is present.
+     */
+    /**
+     * The journal and correlation of the {@code orm} source ({@code docs/PLAN-v2.md} §5.18, M4-9), for the session listener
+     * Hibernate creates itself: installed by the startup observer that installs every publisher, uninstalled at
+     * shutdown so a live reload's next run installs its own.
+     */
+    @Produces
+    @Singleton
+    public io.github.jdubois.bootui.engine.journal.OrmSessionEvents.Publisher ormSessionEventsPublisher() {
+        io.github.jdubois.bootui.engine.journal.OrmSessionEvents.Publisher publisher =
+                new io.github.jdubois.bootui.engine.journal.OrmSessionEvents.Publisher();
+        publisher.setCorrelationContextProvider(QuarkusRequestCorrelation::current);
+        return publisher;
+    }
+
+    void closeOrmSessionEventsPublisher(
+            @jakarta.enterprise.inject.Disposes
+                    io.github.jdubois.bootui.engine.journal.OrmSessionEvents.Publisher publisher) {
+        publisher.close();
+    }
+
+    @Produces
+    @Singleton
+    public CorrelationContextProvider correlationContextProvider(Instance<TraceIdSource> traceIdProvider) {
+        return new ScopedCorrelationContextProvider(
+                QuarkusRequestCorrelation::current, traceIdProvider.isResolvable() ? traceIdProvider.get() : null);
     }
 
     /**
@@ -362,9 +834,7 @@ public class BootUiEngineProducer {
                         .orElse(500),
                 config.getOptionalValue("bootui.activity.persistence.retention", Duration.class)
                         .orElse(Duration.ofDays(7)),
-                instanceId,
-                config.getOptionalValue("bootui.activity.persistence.capture-interval", Duration.class)
-                        .orElse(Duration.ofSeconds(2)));
+                instanceId);
     }
 
     /**
@@ -526,6 +996,7 @@ public class BootUiEngineProducer {
         if (spanEnricher.isResolvable()) {
             store.setSpanEnricher(spanEnricher.get());
         }
+        store.setCorrelationContextProvider(QuarkusRequestCorrelation::current);
         return store;
     }
 
@@ -746,7 +1217,7 @@ public class BootUiEngineProducer {
                 allowedApiHosts);
         GitHubApiClient client = new GitHubApiClient(
                 settings,
-                HttpClient.newBuilder().connectTimeout(requestTimeout).build(),
+                BootUiHttpClients.newBuilder().connectTimeout(requestTimeout).build(),
                 new ObjectMapper(),
                 DefaultGitHubTokenProvider.create());
         return GitHubDashboardService.using(
@@ -1153,7 +1624,7 @@ public class BootUiEngineProducer {
     @Produces
     @Singleton
     public FaultToleranceEventRecorder faultToleranceEventRecorder(
-            Config config, Instance<TraceIdProvider> traceIdProvider) {
+            Config config, Instance<TraceIdSource> traceIdProvider) {
         boolean enabled = config.getOptionalValue("bootui.fault-tolerance.enabled", Boolean.class)
                         .orElse(true)
                 && config.getOptionalValue("bootui.panels.fault-tolerance.enabled", Boolean.class)
@@ -1161,9 +1632,8 @@ public class BootUiEngineProducer {
         int maxEvents = config.getOptionalValue("bootui.fault-tolerance.max-events", Integer.class)
                 .orElse(200);
         FaultToleranceEventRecorder recorder = new FaultToleranceEventRecorder(enabled, maxEvents);
-        if (traceIdProvider.isResolvable()) {
-            recorder.setTraceIdProvider(traceIdProvider.get());
-        }
+        recorder.setCorrelationContextProvider(new ScopedCorrelationContextProvider(
+                QuarkusRequestCorrelation::current, traceIdProvider.isResolvable() ? traceIdProvider.get() : null));
         return recorder;
     }
 
@@ -1268,7 +1738,7 @@ public class BootUiEngineProducer {
      */
     @Produces
     @Singleton
-    public RestClientTraceRecorder restClientTraceRecorder(Config config, Instance<TraceIdProvider> traceIdProvider) {
+    public RestClientTraceRecorder restClientTraceRecorder(Config config, Instance<TraceIdSource> traceIdProvider) {
         boolean enabled = config.getOptionalValue("bootui.rest-client-trace.enabled", Boolean.class)
                 .orElse(true);
         boolean recording = config.getOptionalValue("bootui.rest-client-trace.recording", Boolean.class)
@@ -1304,9 +1774,9 @@ public class BootUiEngineProducer {
                 maxHeaderValueLength,
                 chattyCallThreshold,
                 reservedSharePercent);
-        if (traceIdProvider.isResolvable()) {
-            recorder.setTraceIdProvider(traceIdProvider.get());
-        }
+        recorder.setThreadKindClassifier(new QuarkusThreadKinds());
+        recorder.setCorrelationContextProvider(new ScopedCorrelationContextProvider(
+                QuarkusRequestCorrelation::current, traceIdProvider.isResolvable() ? traceIdProvider.get() : null));
         return recorder;
     }
 }

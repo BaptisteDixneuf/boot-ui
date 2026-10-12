@@ -1,6 +1,16 @@
 package io.github.jdubois.bootui.engine.cache;
 
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.javaagent.AgentCodePaths;
+import io.github.jdubois.bootui.engine.journal.ApplicationFrames;
+import io.github.jdubois.bootui.engine.journal.CachePayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -26,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * restart or via {@link #clear()}. Thread-safe: {@link #record} may be called concurrently from many
  * application threads while {@link #recentEvents()} is read from an HTTP request thread.</p>
  */
-public final class CacheActivityRecorder {
+public final class CacheActivityRecorder implements RuntimeEventPublisher, MemoryOffloadable {
 
     private final boolean enabled;
     private final int maxEntries;
@@ -34,8 +44,8 @@ public final class CacheActivityRecorder {
     private final Object lock = new Object();
     private final AtomicLong sequence = new AtomicLong();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
-
-    private volatile TraceIdProvider traceIdProvider = CacheActivityRecorder::mdcTraceId;
+    private final CorrelationSource correlation = new CorrelationSource();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
     private volatile boolean instrumentedManager;
 
     public CacheActivityRecorder(boolean enabled, int maxEntries) {
@@ -59,12 +69,21 @@ public final class CacheActivityRecorder {
     }
 
     /**
-     * Installs the {@link TraceIdProvider} used to stamp the active distributed-trace id on each captured
-     * event. Defaults to the SLF4J MDC {@code traceId} key (the same default {@code SqlTraceRecorder}
-     * uses); each adapter may install its own (e.g. an OpenTelemetry-backed one).
+     * Replaces the source of the request id stamped on each capture ({@code docs/PLAN-v2.md} §5.1). Defaults to the
+     * thread's correlation scope; the Quarkus adapter installs one that reads the request's Vert.x context. Passing
+     * {@code null} restores the default.
      */
-    public void setTraceIdProvider(TraceIdProvider traceIdProvider) {
-        this.traceIdProvider = traceIdProvider == null ? CacheActivityRecorder::mdcTraceId : traceIdProvider;
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded access right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
     }
 
     /** Records a cache read that found a value. */
@@ -97,6 +116,7 @@ public final class CacheActivityRecorder {
             return;
         }
         try {
+            CorrelationContext context = correlation.current();
             CacheActivityEvent event = new CacheActivityEvent(
                     sequence.incrementAndGet(),
                     System.currentTimeMillis(),
@@ -105,13 +125,31 @@ public final class CacheActivityRecorder {
                     operation,
                     key == null ? null : hashKey(key),
                     resolveTraceId(),
-                    Thread.currentThread().getName());
+                    Thread.currentThread().getName(),
+                    context.requestId(),
+                    context.executionId());
             synchronized (lock) {
                 events.addLast(event);
                 while (events.size() > maxEntries) {
                     events.removeFirst();
                 }
             }
+            RuntimeEventSink sink = journal;
+            // Walk the stack only when the journal records cache accesses, since the cache panel needs no frames.
+            boolean toJournal = sink.records(JournalSource.CACHE);
+            ApplicationFrames frames = toJournal ? ApplicationFrames.capture() : null;
+            // The accessing thread's innermost instrumented method, when the BootUI agent records code paths (§5.14).
+            long codePathStamp = toJournal ? AgentCodePaths.stamp() : 0L;
+            sink.offer(RuntimeEvent.of(
+                    JournalSource.CACHE,
+                    event.timestampMillis(),
+                    -1,
+                    context,
+                    event.traceId(),
+                    event.thread(),
+                    null,
+                    false,
+                    new CachePayload(cacheName, operation.name(), frames, codePathStamp)));
             notifyListeners();
         } catch (RuntimeException ex) {
             // Recording must never disrupt the cache access it observes.
@@ -123,6 +161,24 @@ public final class CacheActivityRecorder {
         synchronized (lock) {
             return new ArrayList<>(events);
         }
+    }
+
+    @Override
+    public String offloadId() {
+        return "cache-activity";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "Cache operations";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recentEvents().size();
+        clear();
+        return retained;
     }
 
     /** Clears all retained events. */
@@ -153,22 +209,9 @@ public final class CacheActivityRecorder {
 
     private String resolveTraceId() {
         try {
-            String traceId = traceIdProvider.currentTraceId();
+            String traceId = correlation.traceId();
             return traceId == null || traceId.isBlank() ? null : traceId;
         } catch (RuntimeException ex) {
-            return null;
-        }
-    }
-
-    /**
-     * Default trace-id source: the SLF4J MDC where Micrometer Tracing publishes it (mirrors
-     * {@code SqlTraceRecorder}'s default so cache accesses correlate the same way SQL statements do).
-     */
-    private static String mdcTraceId() {
-        try {
-            String traceId = org.slf4j.MDC.get("traceId");
-            return traceId == null || traceId.isBlank() ? null : traceId;
-        } catch (RuntimeException | NoClassDefFoundError ex) {
             return null;
         }
     }

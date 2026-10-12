@@ -55,6 +55,20 @@ class ToolManifestGeneratorTests {
     }
 
     @Test
+    void agentStatusTakesAQueryButNoLimitBecauseItListsEveryMatchingSensor() {
+        ToolManifest.Tool agentStatus = ToolManifest.parse(ToolManifestGenerator.generate()).tools().stream()
+                .filter(tool -> tool.name().equals("get_agent_status"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(agentStatus.schema()).isEqualTo("QUERY");
+        assertThat(agentStatus.takesQuery()).isTrue();
+        assertThat(agentStatus.takesLimit()).isFalse();
+        assertThat(agentStatus.description()).contains("overflow", "another request's context");
+        assertThat(ToolManifest.bundled().byName("get_agent_status").description())
+                .isEqualTo(agentStatus.description());
+    }
+
+    @Test
     void noTwoToolsShareACommandPath() {
         Set<String> paths = new HashSet<>(CliCommandPaths.BY_TOOL.values());
 

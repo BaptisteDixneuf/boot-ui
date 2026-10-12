@@ -3,8 +3,18 @@ package io.github.jdubois.bootui.engine.transactions;
 import io.github.jdubois.bootui.core.dto.TransactionEntryDto;
 import io.github.jdubois.bootui.core.dto.TransactionReport;
 import io.github.jdubois.bootui.core.dto.TransactionStatsDto;
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.engine.journal.TransactionPayload;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder;
+import io.github.jdubois.bootui.engine.support.BootUiThreadLocal;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
 import io.github.jdubois.bootui.spi.IdleReclaimable;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -38,7 +48,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * heuristic {@code SqlTraceRecorder} itself falls back to when no trace id is available, applied here
  * rather than duplicated.</p>
  */
-public final class TransactionRecorder implements IdleReclaimable {
+public final class TransactionRecorder implements IdleReclaimable, RuntimeEventPublisher, MemoryOffloadable {
 
     /** Outcome of a completed transaction boundary. */
     public enum Status {
@@ -67,10 +77,13 @@ public final class TransactionRecorder implements IdleReclaimable {
     private final AtomicLong evicted = new AtomicLong();
     private final AtomicBoolean recording;
     private volatile boolean idleSuspended = false;
+    private volatile boolean reactiveSeen;
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
 
     private final Map<Long, ActiveTransaction> active = new ConcurrentHashMap<>();
-    private final ThreadLocal<Deque<Long>> threadStack = ThreadLocal.withInitial(ArrayDeque::new);
+    private final ThreadLocal<Deque<Long>> threadStack = BootUiThreadLocal.withInitial(ArrayDeque::new);
+    private final CorrelationSource correlation = new CorrelationSource();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
 
     public TransactionRecorder(
             boolean enabled,
@@ -102,6 +115,14 @@ public final class TransactionRecorder implements IdleReclaimable {
         }
     }
 
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded transaction right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
     public int getMaxEntries() {
         return maxEntries;
     }
@@ -122,22 +143,60 @@ public final class TransactionRecorder implements IdleReclaimable {
         return connectionHoldThresholdMillis > 0 && durationMillis >= connectionHoldThresholdMillis;
     }
 
-    private boolean isActive() {
+    /** Whether the Transactions panel captures now: capture is enabled, recording is on, and it is not idle. */
+    private boolean capturesForPanel() {
         return enabled && !idleSuspended && recording.get();
     }
 
     /**
      * Records the start of a transaction boundary, resolving its parent from the thread's stack of
      * already-active transactions. Returns {@code -1} (a sentinel completion no-ops on) when capture is
-     * disabled, paused, or idle-suspended, so callers never need a null check.
+     * disabled, or when the panel is paused or idle-suspended and the runtime journal does not record transactions,
+     * so callers never need a null check.
      */
     public long beginTransaction(String methodName, boolean readOnly, String isolation, String thread, String traceId) {
-        if (!isActive()) {
+        return beginTransaction(methodName, readOnly, isolation, thread, traceId, false);
+    }
+
+    /**
+     * Records the start of a transaction boundary, as {@link #beginTransaction(String, boolean, String, String, String)}
+     * does, saying whether it is a savepoint inside the enclosing transaction rather than a physical transaction of its
+     * own ({@code docs/PLAN-v2.md} §5.5).
+     */
+    public long beginTransaction(
+            String methodName, boolean readOnly, String isolation, String thread, String traceId, boolean savepoint) {
+        return beginTransaction(methodName, readOnly, isolation, thread, traceId, savepoint, true);
+    }
+
+    /**
+     * Records the start of a transaction boundary, as {@link #beginTransaction(String, boolean, String, String, String,
+     * boolean)} does; with {@code threadBound} {@code false}, as a reactive transaction that begins and completes on
+     * whichever threads its pipeline runs, it takes no parent from this thread's stack and is not pushed on it, so it
+     * never becomes the parent of a later transaction of this thread.
+     */
+    public long beginTransaction(
+            String methodName,
+            boolean readOnly,
+            String isolation,
+            String thread,
+            String traceId,
+            boolean savepoint,
+            boolean threadBound) {
+        if (!enabled) {
             return -1;
         }
+        // A paused or idle-suspended panel skips its own buffer, but the runtime journal keeps recording
+        // transactions (docs/PLAN-v2.md §5.2).
+        boolean panel = capturesForPanel();
+        if (!panel && !journal.records(JournalSource.TRANSACTION)) {
+            return -1;
+        }
+        if (!threadBound) {
+            reactiveSeen = true;
+        }
         long id = sequence.incrementAndGet();
-        Deque<Long> stack = threadStack.get();
-        Long parentId = stack.peekLast();
+        Deque<Long> stack = threadBound ? threadStack.get() : null;
+        Long parentId = stack == null ? null : stack.peekLast();
         ActiveTransaction transaction = new ActiveTransaction(
                 id,
                 methodName == null ? "unknown" : methodName,
@@ -147,9 +206,15 @@ public final class TransactionRecorder implements IdleReclaimable {
                 parentId,
                 thread,
                 traceId,
-                System.currentTimeMillis());
+                System.currentTimeMillis(),
+                System.nanoTime(),
+                savepoint,
+                correlation.current(),
+                panel);
         active.put(id, transaction);
-        stack.addLast(id);
+        if (stack != null) {
+            stack.addLast(id);
+        }
         return id;
     }
 
@@ -160,6 +225,16 @@ public final class TransactionRecorder implements IdleReclaimable {
      * this recorder never saw begin (e.g. capture was toggled on mid-transaction).
      */
     public void completeTransaction(long id, Status status, String errorMessage) {
+        completeTransaction(id, status, errorMessage, false, null);
+    }
+
+    /**
+     * Records the completion of a transaction boundary, as {@link #completeTransaction(long, Status, String)} does, with
+     * whether it was marked rollback-only and the exception class that failed its commit or rollback, if any
+     * ({@code docs/PLAN-v2.md} §5.18).
+     */
+    public void completeTransaction(
+            long id, Status status, String errorMessage, boolean rollbackOnly, String failureClass) {
         if (id < 0) {
             return;
         }
@@ -168,7 +243,7 @@ public final class TransactionRecorder implements IdleReclaimable {
         if (transaction == null) {
             return;
         }
-        record(transaction, status == null ? Status.UNKNOWN : status, errorMessage);
+        record(transaction, status == null ? Status.UNKNOWN : status, errorMessage, rollbackOnly, failureClass);
     }
 
     private void popStack(long id) {
@@ -179,37 +254,77 @@ public final class TransactionRecorder implements IdleReclaimable {
         }
     }
 
-    private void record(ActiveTransaction transaction, Status status, String errorMessage) {
+    private void record(
+            ActiveTransaction transaction,
+            Status status,
+            String errorMessage,
+            boolean rollbackOnly,
+            String failureClass) {
         long end = System.currentTimeMillis();
         long duration = Math.max(0, end - transaction.startTimestamp);
-        Correlation correlation = correlate(transaction, end);
-        TransactionEntryDto entry = new TransactionEntryDto(
-                transaction.id,
-                transaction.methodName,
-                transaction.propagation,
-                transaction.isolation,
-                status.name(),
-                transaction.startTimestamp,
-                end,
-                duration,
-                transaction.parentId,
-                transaction.thread,
-                transaction.traceId,
-                correlation.statementCount(),
-                correlation.connectionCount(),
-                transaction.readOnly,
-                isSlow(duration),
-                isConnectionHeld(duration),
-                errorMessage);
-        synchronized (lock) {
-            buffer.addLast(entry);
-            while (buffer.size() > maxEntries) {
-                buffer.removeFirst();
-                evicted.incrementAndGet();
+        if (transaction.panel()) {
+            Correlation correlation = correlate(transaction, end);
+            TransactionEntryDto entry = new TransactionEntryDto(
+                    transaction.id,
+                    transaction.methodName,
+                    transaction.propagation,
+                    transaction.isolation,
+                    status.name(),
+                    transaction.startTimestamp,
+                    end,
+                    duration,
+                    transaction.parentId,
+                    transaction.thread,
+                    transaction.traceId,
+                    correlation.statementCount(),
+                    correlation.connectionCount(),
+                    transaction.readOnly,
+                    isSlow(duration),
+                    isConnectionHeld(duration),
+                    errorMessage);
+            synchronized (lock) {
+                buffer.addLast(entry);
+                while (buffer.size() > maxEntries) {
+                    buffer.removeFirst();
+                    evicted.incrementAndGet();
+                }
             }
+            totalCaptured.incrementAndGet();
         }
-        totalCaptured.incrementAndGet();
-        notifyListeners();
+        try {
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.TRANSACTION,
+                    transaction.startTimestamp(),
+                    System.nanoTime() - transaction.startNanos(),
+                    transaction.context(),
+                    transaction.traceId(),
+                    transaction.thread(),
+                    null,
+                    status != Status.COMMITTED || isSlow(duration),
+                    new TransactionPayload(
+                            transaction.methodName(),
+                            status == Status.ROLLED_BACK,
+                            transaction.parentId() != null,
+                            transaction.savepoint(),
+                            transaction.startNanos(),
+                            transaction.readOnly(),
+                            ISOLATION_UNKNOWN.equals(transaction.isolation()) ? null : transaction.isolation(),
+                            rollbackOnly,
+                            failureClass)));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the transaction it observes.
+        }
+        if (transaction.panel()) {
+            notifyListeners();
+        }
+    }
+
+    /**
+     * Installs where this recorder reads the request or execution a transaction belongs to, when it begins
+     * ({@code docs/PLAN-v2.md} §5.1). The default is the thread's correlation scope.
+     */
+    public void setCorrelationContextProvider(CorrelationContextProvider provider) {
+        correlation.set(provider);
     }
 
     /**
@@ -225,7 +340,7 @@ public final class TransactionRecorder implements IdleReclaimable {
         int statements = 0;
         Set<String> connections = new HashSet<>();
         for (SqlTraceRecorder.CapturedStatement statement : sqlTraceRecorder.recent()) {
-            if (!transaction.thread.equals(statement.thread())) {
+            if (!statement.executed() || !transaction.thread.equals(statement.thread())) {
                 continue;
             }
             long timestamp = statement.timestamp();
@@ -259,6 +374,24 @@ public final class TransactionRecorder implements IdleReclaimable {
 
     public long evicted() {
         return evicted.get();
+    }
+
+    @Override
+    public String offloadId() {
+        return "transactions";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "Transactions";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recent().size();
+        clear();
+        return retained;
     }
 
     public void clear() {
@@ -369,6 +502,11 @@ public final class TransactionRecorder implements IdleReclaimable {
 
     private List<String> warnings() {
         List<String> warnings = new ArrayList<>();
+        if (reactiveSeen) {
+            warnings.add("Reactive capture records physical begin/commit/rollback callbacks, not a complete parent"
+                    + " or savepoint hierarchy. SQL and connection counts cover JDBC work on the begin thread only;"
+                    + " R2DBC statements and work moved to another thread are not counted.");
+        }
         if (!isRecording()) {
             warnings.add("Recording is paused. Resume it to capture new transactions.");
         }
@@ -390,5 +528,9 @@ public final class TransactionRecorder implements IdleReclaimable {
             Long parentId,
             String thread,
             String traceId,
-            long startTimestamp) {}
+            long startTimestamp,
+            long startNanos,
+            boolean savepoint,
+            CorrelationContext context,
+            boolean panel) {}
 }

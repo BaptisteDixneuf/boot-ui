@@ -52,7 +52,12 @@ const Ai = () => import('./views/Ai.vue')
 const Copilot = () => import('./views/Copilot.vue')
 const McpServer = () => import('./views/McpServer.vue')
 const Cli = () => import('./views/Cli.vue')
+const JavaAgent = () => import('./views/JavaAgent.vue')
+const CodeInventory = () => import('./views/CodeInventory.vue')
+const CodePaths = () => import('./views/CodePaths.vue')
+const SideEffects = () => import('./views/SideEffects.vue')
 const LiveActivity = () => import('./views/LiveActivity.vue')
+const RuntimeInsights = () => import('./views/RuntimeInsights.vue')
 const Email = () => import('./views/Email.vue')
 const Kafka = () => import('./views/Kafka.vue')
 const RabbitMQ = () => import('./views/RabbitMQ.vue')
@@ -60,7 +65,7 @@ const Jms = () => import('./views/Jms.vue')
 const NotFound = () => import('./views/NotFound.vue')
 
 export const groups = {
-  overview: 'overview',
+  home: 'home',
   advisors: 'advisors',
   runtime: 'runtime',
   configuration: 'configuration',
@@ -68,22 +73,23 @@ export const groups = {
   security: 'security',
   services: 'services',
   diagnostics: 'diagnostics',
+  agent: 'agent',
   developerTools: 'developer-tools'
 }
 
 /** @type {import('vue-router').RouteRecordRaw[]} */
 export const routes = [
-  {path: '/', redirect: '/overview'},
+  {path: '/', redirect: '/scorecard'},
   {
-    path: '/overview',
+    path: '/scorecard',
     name: 'overview',
     component: Overview,
     meta: {
-      group: groups.overview,
+      group: groups.home,
       icon: 'bi-speedometer2',
-      title: 'Overview',
-      shortcut: 'ov',
-      keywords: ['home', 'dashboard', 'summary', 'score', 'advisors', 'start']
+      title: 'Scorecard',
+      shortcut: 'sco',
+      keywords: ['overview', 'home', 'dashboard', 'summary', 'score', 'findings', 'advisors', 'start']
     }
   },
   {
@@ -91,23 +97,39 @@ export const routes = [
     name: 'activity',
     component: LiveActivity,
     meta: {
-      group: groups.overview,
+      group: groups.home,
       icon: 'bi-broadcast',
       title: 'Live Activity',
       shortcut: 'la',
-      keywords: ['realtime', 'live', 'stream', 'feed', 'events', 'recent']
+      keywords: ['realtime', 'live', 'stream', 'feed', 'events', 'recent', 'async', 'executor', 'handoff']
     }
   },
   {
-    path: '/github',
-    name: 'github',
-    component: GitHub,
+    path: '/runtime-insights',
+    name: 'runtime-insights',
+    component: RuntimeInsights,
     meta: {
-      group: groups.overview,
-      icon: 'bi-github',
-      title: 'GitHub',
-      shortcut: 'gh',
-      keywords: ['repo', 'repository', 'git', 'source', 'remote']
+      group: groups.home,
+      icon: 'bi-lightbulb',
+      title: 'Runtime Insights',
+      shortcut: 'ri',
+      keywords: [
+        'insights',
+        'why slow',
+        'slow',
+        'new exceptions',
+        'what changed',
+        'impact',
+        'compare',
+        'blocking',
+        'tokens',
+        'open session',
+        'connections',
+        'n+1',
+        'observations',
+        'auto-flush',
+        'persistence context'
+      ]
     }
   },
   {
@@ -575,6 +597,18 @@ export const routes = [
     }
   },
   {
+    path: '/sql-trace',
+    name: 'sql-trace',
+    component: SqlTrace,
+    meta: {
+      group: groups.database,
+      icon: 'bi-stopwatch',
+      title: 'SQL Trace',
+      shortcut: 'sq',
+      keywords: ['sql', 'queries', 'slow queries', 'slow query', 'n+1', 'jdbc', 'statements', 'select', 'query log']
+    }
+  },
+  {
     path: '/transactions',
     name: 'transactions',
     component: Transactions,
@@ -594,18 +628,6 @@ export const routes = [
         'transaction boundaries',
         'nested transactions'
       ]
-    }
-  },
-  {
-    path: '/sql-trace',
-    name: 'sql-trace',
-    component: SqlTrace,
-    meta: {
-      group: groups.database,
-      icon: 'bi-stopwatch',
-      title: 'SQL Trace',
-      shortcut: 'sq',
-      keywords: ['sql', 'queries', 'slow queries', 'slow query', 'n+1', 'jdbc', 'statements', 'select', 'query log']
     }
   },
   {
@@ -957,6 +979,100 @@ export const routes = [
     }
   },
   {
+    path: '/java-agent',
+    name: 'java-agent',
+    component: JavaAgent,
+    meta: {
+      group: groups.agent,
+      icon: 'bi-plug-fill',
+      title: 'Java Agent',
+      shortcut: 'ja',
+      keywords: [
+        'agent',
+        'javaagent',
+        'instrumentation',
+        '-javaagent',
+        'byte buddy',
+        'bootui-agent',
+        'executors',
+        'propagation',
+        'thread pool'
+      ]
+    }
+  },
+  {
+    path: '/code-paths',
+    name: 'code-paths',
+    component: CodePaths,
+    meta: {
+      group: groups.agent,
+      requiresAgent: true,
+      icon: 'bi-hourglass-split',
+      title: 'Code Paths',
+      shortcut: 'co',
+      keywords: [
+        'call tree',
+        'slow route',
+        'handler time',
+        'self time',
+        'which method is slow',
+        'bean calls',
+        'callers',
+        'hot path',
+        'agent'
+      ]
+    }
+  },
+  {
+    path: '/code-inventory',
+    name: 'code-inventory',
+    component: CodeInventory,
+    meta: {
+      group: groups.agent,
+      requiresAgent: true,
+      icon: 'bi-list-check',
+      title: 'Code Inventory',
+      shortcut: 'ci',
+      keywords: [
+        'executed',
+        'never executed',
+        'dead code',
+        'coverage',
+        'changed methods',
+        'did my change run',
+        'dependencies',
+        'unused jars',
+        'not loaded',
+        'agent'
+      ]
+    }
+  },
+  {
+    path: '/side-effects',
+    name: 'side-effects',
+    component: SideEffects,
+    meta: {
+      group: groups.agent,
+      requiresAgent: true,
+      icon: 'bi-box-arrow-up-right',
+      title: 'Side Effects',
+      shortcut: 'se',
+      keywords: [
+        'side effects',
+        'processes',
+        'process builder',
+        'runtime exec',
+        'files',
+        'network',
+        'environment',
+        'thread locals',
+        'blocking',
+        'security sinks',
+        'agent'
+      ]
+    }
+  },
+  {
     path: '/mcp-server',
     name: 'mcp-server',
     component: McpServer,
@@ -1036,6 +1152,19 @@ export const routes = [
       keywords: ['claude', 'anthropic', 'ai sessions', 'agent activity', 'claude code']
     }
   },
+  {
+    path: '/github',
+    name: 'github',
+    component: GitHub,
+    meta: {
+      group: groups.developerTools,
+      icon: 'bi-github',
+      title: 'GitHub',
+      shortcut: 'gh',
+      keywords: ['repo', 'repository', 'git', 'source', 'remote']
+    }
+  },
+  {path: '/overview', redirect: '/scorecard'},
   {path: '/tuning-advisor', redirect: '/jvm-tuning'},
   {path: '/pentest', redirect: '/pentesting'},
   {path: '/dependencies', redirect: '/vulnerabilities'},

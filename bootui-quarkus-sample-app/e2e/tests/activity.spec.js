@@ -1,14 +1,15 @@
 // @ts-check
-import {expect, test} from './fixtures.js'
+import {acceptConfirm, expect, test} from './fixtures.js'
+import {registerResourceLedgerTests} from '../../../bootui-spring-sample-app/e2e/scenarios/resource-ledger.js'
 
 /**
  * Live Activity (Quarkus).
  *
  * Quarkus now has a per-request profile drawer too (`GET /bootui/api/activity/request/{id}` — see the shared
- * `ExecutionProfileAssembler`), but it is a deliberately *reduced*, trace-id-only profile: unlike Spring's
- * tiered profiler (trace id, then method+path+time-window+thread heuristics), Quarkus's reactive
- * event-loop/worker model has no per-request serving-thread identity to fall back on, so a request only
- * ever profiles when it carries a distributed trace id, SQL/security correlation is always exact (never
+ * `ExecutionProfileAssembler`), but it is a deliberately *reduced* profile: unlike Spring's tiered profiler
+ * (request id and trace id, then method+path+time-window+thread heuristics), Quarkus's reactive
+ * event-loop/worker model has no per-request serving-thread identity to fall back on, so a request profiles
+ * by BootUI's request id or its distributed trace id only, SQL/security correlation is always exact (never
  * "approximate", and never thread-matched), and the drawer surfaces explicit reduced-profile notes instead
  * of Spring's exact/approximate badges. The dedicated profile-drawer tests below assert exactly that
  * reduced (not absent, not full-parity) behavior.
@@ -43,6 +44,62 @@ test.describe('Live Activity view (Quarkus)', () => {
     await expect(table.locator('tbody tr.table-danger').first()).toBeVisible()
   })
 
+  test('keeps a journal request visible when the HTTP-exchange profile is unavailable', async ({page}) => {
+    const search = await page.request.get('/api/sample/product-search')
+    expect(search.ok()).toBeTruthy()
+    const activity = await page.request.get('/bootui/api/activity?source=journal')
+    expect(activity.ok()).toBeTruthy()
+    const exemplar = (await activity.json()).entries.find(
+      (entry) => entry.type === 'REQUEST' && entry.path === '/api/sample/product-search'
+    )
+    expect(exemplar?.id).toBeTruthy()
+
+    await page.route('**/api/activity/request/*', async (route) => {
+      if (route.request().url().endsWith('/journal')) return route.continue()
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          available: false,
+          unavailableReason: `Request ${exemplar.id} is no longer in the buffer.`
+        })
+      })
+    })
+    await page.goto(`/bootui/#/activity?request=${encodeURIComponent(exemplar.id)}`)
+
+    const drawer = page.locator('.activity-drawer')
+    await expect(drawer.locator('.request-journal')).toContainText('GET /api/sample/product-search')
+    await expect(drawer).toContainText('HTTP-exchange details unavailable')
+  })
+
+  test('opens the runtime journal status on demand and clears the recording after confirmation', async ({
+    openView,
+    page
+  }) => {
+    const traffic = await page.request.get('/api/sample/product-search')
+    expect(traffic.ok()).toBeTruthy()
+
+    await openView('activity', 'Live Activity')
+
+    const toggle = page.getByRole('button', {name: 'Recording', exact: true})
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(page.locator('#activity-runtime-journal')).toHaveCount(0)
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+
+    const journal = page.locator('#activity-runtime-journal')
+    await expect(page.getByRole('heading', {name: 'Runtime journal'})).toHaveCount(1)
+    await expect(journal).toContainText('Recorded this run')
+    await expect(journal.locator('code', {hasText: /^http$/})).toBeVisible()
+    await expect(journal).toContainText('None: every event was recorded.')
+    await expect(journal).toContainText('Previous runs')
+
+    await journal.getByRole('button', {name: 'Clear recording'}).click()
+    await acceptConfirm(page)
+    await expect(
+      page.locator('.alert', {hasText: /Cleared \d+ recorded events? and the aggregates of this run/})
+    ).toBeVisible()
+  })
   test('captures the failing request with its real method and path, not null placeholders', async ({
     openView,
     page
@@ -119,8 +176,8 @@ test.describe('Live Activity view (Quarkus)', () => {
     await expect(secureRow.locator('.activity-principal-tag')).toContainText('admin')
   })
 
-  test('opens a per-request profile drawer with a reduced, trace-id-only profile', async ({openView, page}) => {
-    // product-search always runs SQL, so the request reliably has SQL to correlate in the drawer.
+  test('opens a per-request profile drawer with a reduced profile', async ({openView, page}) => {
+    // ORM inspection records preparation, not a confirmed JDBC execution.
     const search = await page.request.get('/api/sample/product-search')
     expect(search.ok()).toBeTruthy()
 
@@ -136,16 +193,17 @@ test.describe('Live Activity view (Quarkus)', () => {
     await expect(drawer).toContainText('Request profile')
     await expect(drawer).toContainText('/api/sample/product-search')
 
-    // Quarkus's reduced profile has no time-window/thread heuristic to fall back on, so a
-    // trace-id-correlated SQL execution is always "exact", never the "approximate" fallback Spring's
-    // fuller profiler can show.
-    await expect(drawer.getByText('exact', {exact: true})).toBeVisible()
+    const sql = drawer.locator('section', {has: page.getByRole('heading', {name: /^SQL/})}).first()
+    await expect(sql).toContainText('SQL preparation is not execution evidence')
+    await expect(sql.getByText('exact', {exact: true})).toHaveCount(0)
     await expect(drawer.getByText('approximate', {exact: true})).toHaveCount(0)
+    await expect(drawer).toContainText('SQL execution timing unavailable')
+    await expect(drawer).not.toContainText('0 SQL statement(s)')
 
     // The reduced-profile explanation is real, load-bearing UI copy (ExecutionProfileAssembler's notes),
     // not an internal implementation detail — a developer reads this to know why Quarkus's profile is
     // narrower than Spring's.
-    await expect(drawer).toContainText('reduced, trace-id-only profile')
+    await expect(drawer).toContainText('This is a reduced profile')
 
     // The REST client section is present, and the cache section honestly reports that Quarkus has no
     // cache-access capture seam; the serving-thread and time-window tiers are reported unavailable.
@@ -154,14 +212,30 @@ test.describe('Live Activity view (Quarkus)', () => {
     await expect(cache).toContainText('not available on Quarkus')
     await expect(drawer).toContainText('Serving thread and time window correlation are unavailable on this adapter')
 
-    await drawer.getByRole('button', {name: 'Close'}).click()
-    await expect(drawer).toHaveCount(0)
+    // The runtime journal's record of the same request (docs/PLAN-v2.md §5.3): its route and the SQL on its timeline.
+    const journal = drawer.locator('.request-journal')
+    await expect(journal.getByRole('heading', {name: 'Recorded by the runtime journal'})).toHaveCount(1)
+    await expect(journal).toContainText('GET /api/sample/product-search')
+    await expect(journal.locator('.request-journal__source', {hasText: /^sql$/}).first()).toBeVisible()
+    await expect(journal).toContainText('SQL preparation; execution not observed')
+
+    const deepDives = drawer.locator('.request-code-path')
+    await expect(deepDives.getByRole('link', {name: 'Open the JFR profile in Runtime Insights'})).toBeVisible()
+    await expect(deepDives).toContainText(/Code Paths unavailable|Open GET \/api\/sample\/product-search in Code Paths/)
+    await deepDives.getByRole('link', {name: 'Open the JFR profile in Runtime Insights'}).click()
+    await expect(page).toHaveURL(/#\/runtime-insights\?tab=profile/)
+    await expect(page.getByRole('tab', {name: 'JFR profile'})).toHaveAttribute('aria-selected', 'true')
+    await expect(page.locator('.insight-profile').getByRole('button', {name: /Profile resources/})).toBeVisible()
+    await expect(page.locator('.insight-profile-running')).toHaveCount(0)
   })
 
-  test('never attributes a REST client call to either request sharing its trace id', async ({openView, page}) => {
+  test('attributes a REST client call to its caller by request id when two requests share a trace id', async ({
+    openView,
+    page
+  }) => {
     // The sample REST client calls this same app, so the inbound POST and the downstream GET it triggers
-    // are two captured requests carrying one propagated trace id. The cross-anchor uniqueness guard then
-    // attributes the outbound call to neither and counts it in the notes.
+    // are two captured requests carrying one propagated trace id. The trace id cannot decide between them,
+    // but the outbound call carries the calling request's BootUI request id, so it is attributed exactly.
     await page.request.post('/bootui/api/rest-client-trace/recording', {data: {enabled: true}})
     const capture = await page.request.post('/api/sample/rest-client-capture')
     expect(capture.ok()).toBeTruthy()
@@ -174,18 +248,15 @@ test.describe('Live Activity view (Quarkus)', () => {
     const drawer = page.locator('.activity-drawer')
     await expect(drawer).toBeVisible()
     const rest = drawer.locator('section', {has: page.getByRole('heading', {name: /^REST client calls/})})
-    await expect(rest).toContainText('No REST client calls correlated to this request.')
+    await expect(rest).toContainText('/api/sample/products')
+    await expect(rest.locator('.activity-tier')).toHaveText('request id')
     await expect(drawer).toContainText('shared by more than one captured request')
-    await expect(drawer).toContainText('could equally belong to another captured request')
 
     await drawer.getByRole('button', {name: 'Close'}).click()
     await expect(drawer).toHaveCount(0)
   })
 
-  test('correlates a security event to the profiled request by trace id, never claiming a thread-exact match', async ({
-    openView,
-    page
-  }) => {
+  test('correlates a security event to the profiled request exactly by its request id', async ({openView, page}) => {
     // /api/secure/products deliberately also runs a live SQL SELECT (see SecureResource), so this
     // request's drawer exercises SQL correlation and security correlation together.
     const secure = await page.request.get('/api/secure/products', {
@@ -207,13 +278,10 @@ test.describe('Live Activity view (Quarkus)', () => {
     await expect(security).toBeVisible({timeout: 15_000})
     await expect(security).toContainText('AuthenticationSuccessEvent')
 
-    // Reduced correlation: Quarkus's reactive event-loop/worker model has no per-request serving-thread
-    // identity, so ExecutionProfileAssembler can only ever claim a "principal" match here (the event's
-    // principal equals the request's), never the stronger "exact" (thread-matched) badge Spring can show
-    // for the same scenario. Scoped to the security section specifically, since the SQL section on this
-    // same request legitimately does show "exact" (see the previous test).
-    await expect(security.getByText('principal', {exact: true})).toBeVisible()
-    await expect(security.getByText('exact', {exact: true})).toHaveCount(0)
+    // Quarkus has no per-request serving thread, but the security event carries the request's BootUI request
+    // id, stamped on the request's Vert.x context, so the event is attributed exactly, not just by principal.
+    await expect(security.getByText('exact', {exact: true})).toBeVisible()
+    await expect(security.locator('.activity-tier')).toHaveText('request id')
 
     await drawer.getByRole('button', {name: 'Close'}).click()
   })
@@ -235,7 +303,7 @@ test.describe('Live Activity view (Quarkus)', () => {
     await expect(drawer).toHaveCount(0)
   })
 
-  test('Copy for AI previews the profile Markdown with its SQL and copies it exactly', async ({
+  test('Copy for AI qualifies ORM preparation and copies the profile exactly', async ({
     browserName,
     context,
     openView,
@@ -265,13 +333,36 @@ test.describe('Live Activity view (Quarkus)', () => {
 
     const preview = drawer.getByRole('textbox', {name: 'Markdown export preview'})
     await expect(preview).toHaveValue(/# BootUI request profile: `GET \/api\/sample\/product-search`/)
-    await expect(preview).toHaveValue(/## SQL \(exact, trace id\)/)
-    await expect(preview).toHaveValue(/```sql\n/)
+    await expect(preview).toHaveValue(/## SQL \(unavailable\)/)
+    await expect(preview).toHaveValue(/SQL preparation is not execution evidence/)
+    await expect(preview).toHaveValue(/SQL execution timing unavailable/)
+    await expect(preview).not.toHaveValue(/```sql\n/)
+    await expect(preview).not.toHaveValue(/0 SQL statements/)
 
     await drawer.getByRole('button', {name: 'Copy Markdown'}).click()
     await expect(drawer.getByRole('button', {name: 'Copied'})).toBeVisible()
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await preview.inputValue())
     expect(writes).toEqual([])
+  })
+
+  test('manual JDBC retains exact execution evidence and SQL in the copied profile', async ({openView, page}) => {
+    const joined = await page.request.get('/api/insights/orders/joined')
+    expect(joined.ok()).toBeTruthy()
+    await openView('activity', 'Live Activity')
+    const row = page.locator('.activity-table tbody tr', {hasText: '/api/insights/orders/joined'}).first()
+    await expect(row).toBeVisible({timeout: 15_000})
+    await row.getByRole('button', {name: /Profile/}).click()
+    const drawer = page.locator('.activity-drawer')
+    const sql = drawer.locator('section', {has: page.getByRole('heading', {name: /^SQL/})}).first()
+    await expect(sql.getByText('exact', {exact: true})).toBeVisible()
+    await expect(sql).toContainText('request id')
+    await expect(sql).toContainText('insight_orders')
+    await expect(drawer).toContainText('Only confirmed JDBC executions are included')
+    await drawer.getByRole('button', {name: 'Copy for AI'}).click()
+    const preview = drawer.getByRole('textbox', {name: 'Markdown export preview'})
+    await expect(preview).toHaveValue(/## SQL \(exact, request id\)/)
+    await expect(preview).toHaveValue(/```sql\n/)
+    await expect(preview).toHaveValue(/insight_orders/)
   })
 
   test('pauses and resumes the live feed', async ({openView, page}) => {
@@ -365,4 +456,6 @@ test.describe('Live Activity view (Quarkus)', () => {
     const textual = map.locator('ul[aria-label="Service map relationships as text"]')
     await expect(textual).toHaveCount(1)
   })
+
+  registerResourceLedgerTests(test, expect)
 })

@@ -2,11 +2,17 @@ package io.github.jdubois.bootui.quarkus.kafka;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.journal.MessagingPayload;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.CapturedMessage;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.Direction;
+import io.github.jdubois.bootui.spi.CorrelationContext;
 import io.smallrye.reactive.messaging.kafka.api.IncomingKafkaRecordMetadata;
 import io.smallrye.reactive.messaging.kafka.api.OutgoingKafkaRecordMetadata;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -140,6 +146,64 @@ class QuarkusKafkaCaptureTests {
         assertThat(message.errorMessage()).isNull();
         assertThat(message.groupId()).isNull();
         assertThat(message.listenerId()).isEqualTo("orders-in");
+    }
+
+    @Test
+    void eachDeliveryIsRecordedAsItsOwnExecutionAndASendAsItsSendersChild() throws Exception {
+        KafkaActivityRecorder recorder = enabledRecorder();
+        QuarkusKafkaConsumerCapture consumer = new QuarkusKafkaConsumerCapture(recorder);
+        QuarkusKafkaProducerCapture producer = new QuarkusKafkaProducerCapture(recorder);
+
+        Message<?> first = consumer.afterMessageReceive(incomingKafkaMessage("orders", 0, 1L, "k", "orders-in"));
+        Message<?> second = consumer.afterMessageReceive(incomingKafkaMessage("orders", 0, 2L, "k", "orders-in"));
+        consumer.onMessageAck(first);
+        consumer.onMessageNack(second, new IllegalStateException("boom"));
+        Message<?> sent;
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forExecution("00112233aabbccdd"))) {
+            sent = producer.beforeMessageSend(outgoingKafkaMessage("shipments", 0, "k"));
+        }
+        Thread.sleep(20);
+        java.util.concurrent.CompletableFuture.runAsync(() -> producer.onMessageAck(sent))
+                .get(10, java.util.concurrent.TimeUnit.SECONDS);
+
+        List<CapturedMessage> consumed = recorder.recent().stream()
+                .filter(message -> message.direction() == Direction.CONSUME)
+                .toList();
+        assertThat(consumed)
+                .extracting(CapturedMessage::executionId)
+                .allSatisfy(id -> assertThat(id).matches("[0-9a-f]{16}"))
+                .doesNotHaveDuplicates();
+        assertThat(recorder.recent())
+                .filteredOn(message -> message.direction() == Direction.PRODUCE)
+                .singleElement()
+                .satisfies(message -> {
+                    assertThat(message.executionId()).isEqualTo("00112233aabbccdd");
+                    assertThat(message.durationMillis())
+                            .as("timed from entering the channel to its ack")
+                            .isGreaterThanOrEqualTo(20L);
+                });
+    }
+
+    @Test
+    void aDeliveryCarryingATraceparentLinksItsJournalEventToTheSendersTrace() {
+        KafkaActivityRecorder recorder = enabledRecorder();
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        QuarkusKafkaConsumerCapture capture = new QuarkusKafkaConsumerCapture(recorder);
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("orders", 0, 1L, "k", "payload");
+        record.headers()
+                .add(
+                        "traceparent",
+                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".getBytes(StandardCharsets.UTF_8));
+
+        capture.onMessageAck(capture.afterMessageReceive(
+                Message.of("payload", Metadata.of(new IncomingKafkaRecordMetadata<>(record, "orders-in")))));
+
+        assertThat(published)
+                .singleElement()
+                .satisfies(event -> assertThat(((MessagingPayload) event.payload()).linkedTraceId())
+                        .isEqualTo("4bf92f3577b34da6a3ce929d0e0e4736"));
     }
 
     @Test

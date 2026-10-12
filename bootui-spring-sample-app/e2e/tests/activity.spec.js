@@ -1,5 +1,6 @@
 // @ts-check
-import {expect, test} from './fixtures.js'
+import {acceptConfirm, expect, test} from './fixtures.js'
+import {registerResourceLedgerTests} from '../scenarios/resource-ledger.js'
 
 test.describe('Live Activity view', () => {
   test('merges requests, SQL and exceptions into one live stream', async ({openView, page}) => {
@@ -18,6 +19,34 @@ test.describe('Live Activity view', () => {
     await expect(table.locator('tbody tr.table-danger').first()).toBeVisible()
   })
 
+  test('opens the runtime journal status on demand and clears the recording after confirmation', async ({
+    openView,
+    page
+  }) => {
+    const products = await page.request.get('/api/sample/products')
+    expect(products.ok()).toBeTruthy()
+
+    await openView('activity', 'Live Activity')
+
+    const toggle = page.getByRole('button', {name: 'Recording', exact: true})
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(page.locator('#activity-runtime-journal')).toHaveCount(0)
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+
+    const journal = page.locator('#activity-runtime-journal')
+    await expect(page.getByRole('heading', {name: 'Runtime journal'})).toHaveCount(1)
+    await expect(journal).toContainText('Recorded this run')
+    await expect(journal.locator('code', {hasText: /^http$/})).toBeVisible()
+    await expect(journal).toContainText('None: every event was recorded.')
+    await expect(journal).toContainText('Previous runs')
+
+    await journal.getByRole('button', {name: 'Clear recording'}).click()
+    await acceptConfirm(page)
+    await expect(
+      page.locator('.alert', {hasText: /Cleared \d+ recorded events? and the aggregates of this run/})
+    ).toBeVisible()
+  })
   test('opens a per-request profile drawer with correlated signals', async ({openView, page}) => {
     // product-search runs SQL on every call (unlike the cached products endpoint), so the request
     // reliably has SQL to correlate.
@@ -36,20 +65,60 @@ test.describe('Live Activity view', () => {
     await expect(drawer).toContainText('Request profile')
     await expect(drawer).toContainText('/api/sample/product-search')
 
-    // The SQL-backed request is correlated exactly by its serving thread (no distributed trace id
+    // The SQL-backed request is correlated exactly by BootUI's request id (no distributed trace id
     // required), so the drawer shows the "exact" badge rather than the "approximate" fallback.
     await expect(drawer.getByText('exact', {exact: true})).toBeVisible()
     await expect(drawer.getByText('approximate', {exact: true})).toHaveCount(0)
 
-    await drawer.getByRole('button', {name: 'Close'}).click()
-    await expect(drawer).toHaveCount(0)
+    // The runtime journal's record of the same request (docs/PLAN-v2.md §5.3): its route and the SQL on its timeline.
+    const journal = drawer.locator('.request-journal')
+    await expect(journal.getByRole('heading', {name: 'Recorded by the runtime journal'})).toHaveCount(1)
+    await expect(journal).toContainText('GET /api/sample/product-search')
+    await expect(journal.locator('.request-journal__source', {hasText: /^sql$/}).first()).toBeVisible()
+
+    const deepDives = drawer.locator('.request-code-path')
+    await expect(deepDives.getByRole('link', {name: 'Open the JFR profile in Runtime Insights'})).toBeVisible()
+    await expect(deepDives).toContainText(/Code Paths unavailable|Open GET \/api\/sample\/product-search in Code Paths/)
+    await deepDives.getByRole('link', {name: 'Open the JFR profile in Runtime Insights'}).click()
+    await expect(page).toHaveURL(/#\/runtime-insights\?tab=profile/)
+    await expect(page.getByRole('tab', {name: 'JFR profile'})).toHaveAttribute('aria-selected', 'true')
+    await expect(page.locator('.insight-profile').getByRole('button', {name: /Profile resources/})).toBeVisible()
+    await expect(page.locator('.insight-profile-running')).toHaveCount(0)
+  })
+
+  test('opens a journal exemplar after HTTP-exchange detail is unavailable', async ({page}) => {
+    const search = await page.request.get('/api/sample/product-search')
+    expect(search.ok()).toBeTruthy()
+    const activity = await page.request.get('/bootui/api/activity?source=journal')
+    expect(activity.ok()).toBeTruthy()
+    const exemplar = (await activity.json()).entries.find(
+      (entry) => entry.type === 'REQUEST' && entry.path === '/api/sample/product-search'
+    )
+    expect(exemplar?.id).toBeTruthy()
+
+    await page.route('**/api/activity/request/*', async (route) => {
+      if (route.request().url().endsWith('/journal')) return route.continue()
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          available: false,
+          unavailableReason: `Request ${exemplar.id} is no longer in the buffer.`
+        })
+      })
+    })
+    await page.goto(`/bootui/#/activity?request=${encodeURIComponent(exemplar.id)}`)
+
+    const drawer = page.locator('.activity-drawer')
+    await expect(drawer.locator('.request-journal')).toContainText('GET /api/sample/product-search')
+    await expect(drawer).toContainText('HTTP-exchange details unavailable')
   })
 
   test('profiles the cache accesses and REST client calls a request made', async ({openView, page}) => {
     // /products reads through the sample-products cache on the request thread, and
     // /quarkus-secure-products calls the companion Quarkus app, which is not running in this suite, so
     // the outbound RestClient call fails fast but is still captured on the request thread. Both correlate
-    // exactly: by the trace id the sample's tracer stamps, or else by the serving thread.
+    // exactly: by BootUI's request id, stamped on both when they are recorded.
     const products = await page.request.get('/api/sample/products')
     expect(products.ok()).toBeTruthy()
     const crossService = await page.request.get('/api/sample/quarkus-secure-products')
@@ -64,7 +133,7 @@ test.describe('Live Activity view', () => {
     await expect(drawer).toBeVisible()
     const cache = drawer.locator('section', {has: page.getByRole('heading', {name: /^Cache accesses/})})
     await expect(cache).toContainText('sample-products')
-    await expect(cache.locator('.activity-tier')).toHaveText(/^(trace id|serving thread)$/)
+    await expect(cache.locator('.activity-tier')).toHaveText('request id')
     await expect(drawer.getByRole('heading', {name: /^REST client calls/})).toBeVisible()
     await drawer.getByRole('button', {name: 'Close'}).click()
     await expect(drawer).toHaveCount(0)
@@ -77,16 +146,16 @@ test.describe('Live Activity view', () => {
     await expect(drawer).toBeVisible()
     const rest = drawer.locator('section', {has: page.getByRole('heading', {name: /^REST client calls/})})
     await expect(rest).toContainText('/api/secure/products → failed')
-    await expect(rest.locator('.activity-tier')).toHaveText(/^(trace id|serving thread)$/)
+    await expect(rest.locator('.activity-tier')).toHaveText('request id')
     await expect(drawer.getByRole('button', {name: /Copy profile/})).toBeVisible()
     await drawer.getByRole('button', {name: 'Close'}).click()
     await expect(drawer).toHaveCount(0)
   })
 
-  test('correlates a security event to the request exactly by serving thread', async ({openView, page}) => {
-    // An authenticated, SQL-backed admin request publishes an AUTHENTICATION_SUCCESS audit event on
-    // the request's serving thread, so the profiler can pin it to this exact request rather than to
-    // any other concurrent request that happens to share the principal.
+  test('correlates a security event to the request exactly by its request id', async ({openView, page}) => {
+    // An authenticated, SQL-backed admin request publishes an AUTHENTICATION_SUCCESS audit event while
+    // the request is served, stamped with its BootUI request id, so the profiler can pin it to this exact
+    // request rather than to any other concurrent request that happens to share the principal.
     const secure = await page.request.get('/api/secure/products', {
       headers: {Authorization: 'Basic ' + Buffer.from('admin:admin').toString('base64')}
     })
@@ -105,7 +174,7 @@ test.describe('Live Activity view', () => {
     const security = drawer.locator('section', {has: page.getByRole('heading', {name: 'Security events'})})
     await expect(security).toBeVisible({timeout: 15_000})
     await expect(security).toContainText('AUTHENTICATION_SUCCESS')
-    // Captured on the request's own serving thread, so the event is badged exact, not just principal.
+    // Stamped with the request's own id, so the event is badged exact, not just principal.
     await expect(security.getByText('exact', {exact: true})).toBeVisible()
 
     await drawer.getByRole('button', {name: 'Close'}).click()
@@ -340,4 +409,6 @@ test.describe('Live Activity view', () => {
     await expect(textual).toHaveCount(1)
     await expect(textual).toContainText('retained')
   })
+
+  registerResourceLedgerTests(test, expect)
 })

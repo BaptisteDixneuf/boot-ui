@@ -11,8 +11,9 @@ import {expect, test} from './fixtures.js'
  * skipped — they are covered by not-applicable.spec.js instead.
  */
 const PANEL_HEADINGS = {
-  overview: /^Overview/,
+  overview: /^Scorecard/,
   activity: /Live Activity/,
+  'runtime-insights': /Runtime Insights/,
   github: /^GitHub/,
   health: /^Health/,
   'http-sessions': /^HTTP Sessions/,
@@ -55,6 +56,10 @@ const PANEL_HEADINGS = {
   exceptions: /^Exceptions/,
   'http-exchanges': /HTTP Exchanges/,
   'http-probe': /HTTP Probe/,
+  'java-agent': /Java Agent/,
+  'code-paths': /^Code Paths/,
+  'code-inventory': /^Code Inventory/,
+  'side-effects': /^Side Effects/,
   'rest-client-trace': /^REST Client/,
   websockets: /^WebSockets/,
   email: /^Email/,
@@ -177,8 +182,44 @@ test.describe('BootUI app shell (Quarkus)', () => {
     }
   })
 
-  test('redirects the root path to /overview', async ({page}) => {
+  test('redirects the root path to /scorecard', async ({page}) => {
     await page.goto('/bootui/')
-    await expect(page).toHaveURL(/\/bootui\/#\/overview$/)
+    await expect(page).toHaveURL(/\/bootui\/#\/scorecard$/)
+  })
+
+  test('redirects the former /overview route to /scorecard', async ({page}) => {
+    await page.goto('/bootui/#/overview')
+    await expect(page).toHaveURL(/\/bootui\/#\/scorecard$/)
+    await expect(page.locator('main h2').filter({hasText: /^Scorecard/})).toBeVisible()
+  })
+
+  test('the Instrumentation group lists the agent panels whether or not the agent is attached', async ({page}) => {
+    await page.goto('/bootui/')
+
+    // Code Paths, Code Inventory, and Side Effects need the BootUI agent. Without it they are unavailable, but they
+    // stay in the Instrumentation group, dimmed with their reason, instead of moving into "Disabled / unavailable".
+    await page.getByRole('button', {name: /Instrumentation\s+4/}).click()
+    await expect(
+      page.getByRole('group', {name: 'Instrumentation panels'}).locator('.bootui-nav-link__label')
+    ).toHaveText(['Java Agent', 'Code Paths', 'Code Inventory', 'Side Effects'])
+    await expect(
+      page
+        .getByRole('group', {name: 'Disabled / unavailable panels'})
+        .locator('.nav-link', {hasText: /^(Code |Side Effects)/})
+    ).toHaveCount(0)
+  })
+
+  test('pins Home at the top of the sidebar and lists GitHub under Developer tools', async ({page}) => {
+    await page.goto('/bootui/')
+
+    await expect(page.getByRole('group', {name: 'Home panels'}).locator('.bootui-nav-link__label')).toHaveText([
+      'Scorecard',
+      'Live Activity',
+      'Runtime Insights'
+    ])
+    await page.getByRole('button', {name: /Developer tools\s+\d+/}).click()
+    await expect(
+      page.getByRole('group', {name: 'Developer tools panels'}).locator('.bootui-nav-link', {hasText: 'GitHub'})
+    ).toHaveCount(1)
   })
 })

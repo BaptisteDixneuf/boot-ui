@@ -14,14 +14,19 @@ import io.github.jdubois.bootui.core.dto.SecurityLogEventDto;
 import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
 import io.github.jdubois.bootui.engine.cache.CacheActivityEvent;
 import io.github.jdubois.bootui.engine.cache.CacheActivityOperation;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
 import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder;
 import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceVocabulary;
 import io.github.jdubois.bootui.engine.jms.JmsActivityRecorder;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityEntries;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.CapturedMessage;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.Direction;
 import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
+import io.github.jdubois.bootui.engine.sqltrace.SqlTraceGrouping;
+import io.github.jdubois.bootui.spi.CorrelationContext;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -77,7 +82,439 @@ class LiveActivityAssemblerTests {
         assertThat(sqlEntry.parentId()).isEqualTo("req-1");
         assertThat(sqlEntry.correlationId()).isEqualTo("trace-a");
         assertThat(exceptionEntry.parentId()).isEqualTo("req-1");
+        assertThat(exceptionEntry.exceptionGroupId())
+                .as("the group id get_exception_detail takes, unlike the entry's own id")
+                .isEqualTo("g-1");
+        assertThat(request.exceptionGroupId()).isNull();
         assertThat(exceptionEntry.correlationId()).isEqualTo("trace-a");
+    }
+
+    @Test
+    void nestsSqlUnderTheRequestWhoseRequestIdItCarriesWithoutTracing() {
+        HttpExchangesReport requests = requests(stamped("0123456789abcdef", null), stamped("fedcba9876543210", null));
+        List<SqlTraceEntryDto> sql =
+                List.of(stampedSql(10, "0123456789abcdef", null), stampedSql(11, "fedcba9876543210", null));
+
+        LiveActivityReport report = reportOf(requests, sql);
+
+        assertThat(entry(report, "sql-10").parentId()).isEqualTo("0123456789abcdef");
+        assertThat(entry(report, "sql-11").parentId()).isEqualTo("fedcba9876543210");
+    }
+
+    @Test
+    void aRequestIdNestsExactlyWhereASharedTraceIdCannot() {
+        HttpExchangesReport requests =
+                requests(stamped("0123456789abcdef", "trace-shared"), stamped("fedcba9876543210", "trace-shared"));
+        List<SqlTraceEntryDto> sql = List.of(
+                stampedSql(10, "fedcba9876543210", "trace-shared"), sql(11, "select 1", "trace-shared", 1_010L));
+
+        LiveActivityReport report = reportOf(requests, sql);
+
+        assertThat(entry(report, "sql-10").parentId()).isEqualTo("fedcba9876543210");
+        assertThat(entry(report, "sql-11").parentId())
+                .as("an ambiguous trace id still nests nothing")
+                .isNull();
+    }
+
+    @Test
+    void nestsEveryChildTypeUnderTheRequestWhoseRequestIdItCarriesWithoutTracing() {
+        String first = "0123456789abcdef";
+        String second = "fedcba9876543210";
+        HttpExchangesReport requests = requests(stamped(first, null), stamped(second, null));
+        List<SqlTraceEntryDto> sql = new ArrayList<>();
+        for (int i = 0; i < SqlTraceGrouping.DEFAULT_N_PLUS_ONE_THRESHOLD; i++) {
+            sql.add(stampedSql(20 + i, second, null));
+        }
+        SecurityLogEventDto login = new SecurityLogEventDto(
+                Instant.ofEpochMilli(1_005L).toString(), "alice", "AUTHENTICATION_SUCCESS", List.of(), null, first);
+        CacheActivityEvent cacheHit = new CacheActivityEvent(
+                7L, 1_006L, "cacheManager", "orders", CacheActivityOperation.HIT, "h", null, "worker-9", second);
+        EmailMessageDto mail = new EmailMessageDto(
+                "email-3",
+                1_007L,
+                "noreply@example.com",
+                List.of("user@example.com"),
+                List.of(),
+                List.of(),
+                "Welcome",
+                "Hello",
+                null,
+                List.of(),
+                true,
+                null,
+                "worker-9",
+                first);
+        RestClientTraceEntryDto call = new RestClientTraceEntryDto(
+                4L,
+                1_008L,
+                "GET",
+                "https://api.example.com/rates",
+                "api.example.com",
+                "/rates",
+                200,
+                3L,
+                true,
+                null,
+                false,
+                "RestClient",
+                Map.of(),
+                null,
+                "worker-9",
+                null,
+                second);
+        FaultToleranceEventRecorder.CapturedEvent retry = new FaultToleranceEventRecorder.CapturedEvent(
+                5L, 1_009L, "rates", "RETRY", "Resilience4j", "rates", "RETRY", 2, 3L, null, null, null, first);
+
+        LiveActivityReport report = assembler.report(
+                requests,
+                sql,
+                true,
+                null,
+                List.of(),
+                List.of(login),
+                true,
+                List.of(cacheHit),
+                true,
+                List.of(),
+                "UP",
+                0,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(mail),
+                true,
+                List.of(call),
+                true,
+                List.of(retry),
+                true);
+
+        assertThat(onlyEntryOfType(report, "SECURITY").parentId()).isEqualTo(first);
+        assertThat(entry(report, "cache-7").parentId()).isEqualTo(second);
+        assertThat(onlyEntryOfType(report, "MAIL").parentId()).isEqualTo(first);
+        assertThat(entry(report, "rest-4").parentId()).isEqualTo(second);
+        assertThat(entry(report, "fault-tolerance-5").parentId()).isEqualTo(first);
+        assertThat(entry(report, first).securedPrincipal())
+                .as("a security event's principal marks the request it carries the id of")
+                .isEqualTo("alice");
+        assertThat(entry(report, second).sqlNPlusOneSuspected())
+                .as("repeated SQL nested by request id flags its request")
+                .isTrue();
+        assertThat(entry(report, first).sqlNPlusOneSuspected()).isFalse();
+    }
+
+    @Test
+    void aRequestIsProfileableWithoutHeuristicsWhenItCarriesATraceIdOrARequestId() {
+        HttpExchangesReport requests = requests(
+                stamped("0123456789abcdef", null),
+                request("req-traced", "/orders", "trace-a", 1_000L),
+                request("req-bare", "/orders", null, 1_000L));
+        LiveActivityReport report = LiveActivityAssembler.withExactProfiles(
+                reportOf(requests, List.of(stampedSql(10, "0123456789abcdef", null))), requests.exchanges());
+
+        assertThat(entry(report, "0123456789abcdef").profileable()).isTrue();
+        assertThat(entry(report, "req-traced").profileable()).isTrue();
+        assertThat(entry(report, "req-bare").profileable())
+                .as("a request with neither id has nothing exact to profile by")
+                .isFalse();
+        assertThat(entry(report, "sql-10").profileable()).isFalse();
+    }
+
+    @Test
+    void nestsAnExceptionGroupUnderTheRequestItsLastOccurrenceCarriesTheIdOf() {
+        HttpExchangesReport requests = requests(stamped("0123456789abcdef", null), stamped("fedcba9876543210", null));
+        ExceptionGroupDto base = exception("g-1", null, 1_020L);
+        ExceptionGroupDto group = new ExceptionGroupDto(
+                base.id(),
+                base.exceptionClassName(),
+                base.message(),
+                base.count(),
+                base.firstSeen(),
+                base.lastSeen(),
+                base.location(),
+                base.applicationException(),
+                base.lastThread(),
+                base.lastRequestMethod(),
+                base.lastRequestPath(),
+                base.lastHandler(),
+                base.lastSource(),
+                null,
+                base.status(),
+                base.regressionCount(),
+                null,
+                "fedcba9876543210");
+
+        LiveActivityReport report = assembler.report(
+                requests,
+                List.of(),
+                true,
+                null,
+                List.of(group),
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                "UP",
+                0,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                false);
+
+        assertThat(onlyEntryOfType(report, "EXCEPTION").parentId()).isEqualTo("fedcba9876543210");
+    }
+
+    @Test
+    void nestsSqlRestCallsAndExceptionsUnderTheScheduledRunWhoseExecutionIdTheyCarry() {
+        String execution = "00112233aabbccdd";
+        ScheduledTaskRunStore store = new ScheduledTaskRunStore(10);
+        store.record("com.example.Jobs.sync", 1_000L, 50L, true, null, null, "scheduling-1", execution);
+        store.record("com.example.Jobs.sync", 2_000L, 50L, true, null, null, "scheduling-1", "ffeeddccbbaa9988");
+        SqlTraceEntryDto base = sql(10, "select 1", null, 1_010L);
+        SqlTraceEntryDto statement = new SqlTraceEntryDto(
+                base.id(),
+                base.timestamp(),
+                base.sql(),
+                base.statementType(),
+                base.category(),
+                base.durationMicros(),
+                base.durationMillis(),
+                base.success(),
+                base.errorMessage(),
+                base.affectedRows(),
+                base.batchSize(),
+                base.connectionId(),
+                "scheduling-1",
+                base.slow(),
+                base.parameters(),
+                null,
+                null,
+                null,
+                execution);
+        RestClientTraceEntryDto call = new RestClientTraceEntryDto(
+                4L,
+                1_020L,
+                "GET",
+                "https://api.example.com/rates",
+                "api.example.com",
+                "/rates",
+                200,
+                3L,
+                true,
+                null,
+                false,
+                "RestClient",
+                Map.of(),
+                null,
+                "scheduling-1",
+                null,
+                null,
+                execution);
+        ExceptionGroupDto seed = exception("g-1", null, 1_030L);
+        ExceptionGroupDto failure = new ExceptionGroupDto(
+                seed.id(),
+                seed.exceptionClassName(),
+                seed.message(),
+                seed.count(),
+                seed.firstSeen(),
+                seed.lastSeen(),
+                seed.location(),
+                seed.applicationException(),
+                "another-thread",
+                null,
+                null,
+                null,
+                "log",
+                null,
+                seed.status(),
+                seed.regressionCount(),
+                null,
+                null,
+                execution);
+        String runEntry = "sched-"
+                + store.runs().stream()
+                        .filter(run -> execution.equals(run.executionId()))
+                        .findFirst()
+                        .orElseThrow()
+                        .sequence();
+
+        LiveActivityReport report = assembler.report(
+                requests(),
+                List.of(statement),
+                true,
+                null,
+                List.of(failure),
+                List.of(),
+                false,
+                List.of(),
+                false,
+                store.runs(),
+                "UP",
+                0,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(call),
+                true);
+
+        assertThat(entry(report, "sql-10").parentId()).isEqualTo(runEntry);
+        assertThat(entry(report, "rest-4").parentId()).isEqualTo(runEntry);
+        assertThat(onlyEntryOfType(report, "EXCEPTION").parentId())
+                .as("an exception thrown on another thread still nests by execution id")
+                .isEqualTo(runEntry);
+    }
+
+    @Test
+    void aConsumedMessageAnchorsItsListenersSignalsAndAMessageNestsUnderItsSender() {
+        KafkaActivityRecorder kafka = new KafkaActivityRecorder(true, false, 10, 16);
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forRequest("0123456789abcdef"))) {
+            kafka.recordProduce("orders", 0, null, null, true, null);
+        }
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forExecution("00112233aabbccdd"))) {
+            kafka.recordConsume("orders", 0, 1L, null, 5L, true, null, "group", "factory");
+            kafka.recordProduce("shipments", 0, null, null, true, null);
+        }
+        List<KafkaActivityRecorder.CapturedMessage> messages = kafka.recent();
+        String produce = entryIdOf(messages, KafkaActivityRecorder.Direction.PRODUCE, "orders");
+        String consume = entryIdOf(messages, KafkaActivityRecorder.Direction.CONSUME, "orders");
+        String forward = entryIdOf(messages, KafkaActivityRecorder.Direction.PRODUCE, "shipments");
+        SqlTraceEntryDto base = sql(10, "insert into shipments", null, 1_010L);
+        SqlTraceEntryDto listenerSql = new SqlTraceEntryDto(
+                base.id(),
+                base.timestamp(),
+                base.sql(),
+                base.statementType(),
+                base.category(),
+                base.durationMicros(),
+                base.durationMillis(),
+                base.success(),
+                base.errorMessage(),
+                base.affectedRows(),
+                base.batchSize(),
+                base.connectionId(),
+                "consumer-1",
+                base.slow(),
+                base.parameters(),
+                null,
+                null,
+                null,
+                "00112233aabbccdd");
+
+        LiveActivityReport report = assembler.report(
+                requests(stamped("0123456789abcdef", null)),
+                List.of(listenerSql),
+                true,
+                null,
+                List.of(),
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                "UP",
+                0,
+                messages,
+                true,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                false,
+                List.of(),
+                false);
+
+        assertThat(entry(report, produce).parentId()).isEqualTo("0123456789abcdef");
+        assertThat(entry(report, consume).parentId())
+                .as("a consumed message is an anchor")
+                .isNull();
+        assertThat(entry(report, "sql-10").parentId()).isEqualTo(consume);
+        assertThat(entry(report, forward).parentId()).isEqualTo(consume);
+    }
+
+    private static String entryIdOf(
+            List<KafkaActivityRecorder.CapturedMessage> messages,
+            KafkaActivityRecorder.Direction direction,
+            String topic) {
+        return KafkaActivityEntries.entryId(messages.stream()
+                .filter(message -> message.direction() == direction && topic.equals(message.topic()))
+                .findFirst()
+                .orElseThrow());
+    }
+
+    @Test
+    void anUnknownRequestIdFallsBackToTheTraceId() {
+        HttpExchangesReport requests = requests(request("req-1", "/orders", "trace-a", 1_000L));
+        List<SqlTraceEntryDto> sql = List.of(stampedSql(10, "0000000000000000", "trace-a"));
+
+        LiveActivityReport report = reportOf(requests, sql);
+
+        assertThat(entry(report, "sql-10").parentId()).isEqualTo("req-1");
+    }
+
+    private LiveActivityReport reportOf(HttpExchangesReport requests, List<SqlTraceEntryDto> sql) {
+        return assembler.report(
+                requests, sql, true, null, List.of(), List.of(), false, List.of(), false, List.of(), "UP", 0, List.of(),
+                false, List.of(), false, List.of(), false, List.of(), false);
+    }
+
+    private static HttpExchangeDto stamped(String requestId, String traceId) {
+        HttpExchangeDto base = request(requestId, "/orders", traceId, 1_000L);
+        return new HttpExchangeDto(
+                base.id(),
+                base.timestamp(),
+                base.method(),
+                base.path(),
+                base.query(),
+                base.uri(),
+                base.status(),
+                base.statusFamily(),
+                base.durationMs(),
+                base.responseSizeBytes(),
+                base.remoteAddress(),
+                base.principal(),
+                base.sessionId(),
+                base.traceId(),
+                base.requestHeaders(),
+                base.responseHeaders(),
+                null,
+                null,
+                requestId);
+    }
+
+    private static SqlTraceEntryDto stampedSql(long id, String requestId, String traceId) {
+        SqlTraceEntryDto base = sql(id, "select 1", traceId, 1_010L);
+        return new SqlTraceEntryDto(
+                base.id(),
+                base.timestamp(),
+                base.sql(),
+                base.statementType(),
+                base.category(),
+                base.durationMicros(),
+                base.durationMillis(),
+                base.success(),
+                base.errorMessage(),
+                base.affectedRows(),
+                base.batchSize(),
+                base.connectionId(),
+                base.thread(),
+                base.slow(),
+                base.parameters(),
+                base.traceId(),
+                base.callSite(),
+                requestId);
     }
 
     @Test
@@ -1300,6 +1737,14 @@ class LiveActivityAssemblerTests {
         assertThat(report.kpis().restCallP95LatencyMs()).isNull();
     }
 
+    private static ActivityEntryDto onlyEntryOfType(LiveActivityReport report, String type) {
+        List<ActivityEntryDto> ofType = report.entries().stream()
+                .filter(candidate -> type.equals(candidate.type()))
+                .toList();
+        assertThat(ofType).hasSize(1);
+        return ofType.get(0);
+    }
+
     private static ActivityEntryDto entry(LiveActivityReport report, String id) {
         return report.entries().stream()
                 .filter(e -> e.id().equals(id))
@@ -1328,7 +1773,7 @@ class LiveActivityAssemblerTests {
     void nestsFaultToleranceEventUnderRequestSharingTraceIdAndCountsIt() {
         HttpExchangesReport requests = requests(request("req-1", "/orders", "trace-a", 1_000L));
         FaultToleranceEventRecorder recorder = new FaultToleranceEventRecorder(true, 10);
-        recorder.setTraceIdProvider(() -> "trace-a");
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-a", null));
         recorder.record(
                 "paymentGateway",
                 FaultToleranceVocabulary.TYPE_RETRY,
@@ -1353,7 +1798,7 @@ class LiveActivityAssemblerTests {
     void keepsFaultToleranceEventTopLevelWhenNoRequestSharesItsTraceId() {
         HttpExchangesReport requests = requests(request("req-1", "/orders", "trace-a", 1_000L));
         FaultToleranceEventRecorder recorder = new FaultToleranceEventRecorder(true, 10);
-        recorder.setTraceIdProvider(() -> null);
+        recorder.setCorrelationContextProvider(BootUiCorrelation::current);
         recorder.recordStateTransition(
                 "paymentGateway",
                 FaultToleranceVocabulary.PROVIDER_RESILIENCE4J,

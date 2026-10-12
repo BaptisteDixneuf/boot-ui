@@ -25,6 +25,14 @@ public final class CliCommandPaths {
     public static final Map<String, String> BY_TOOL = Map.ofEntries(
             Map.entry("analyze_heap_dump", "memory heap analyze"),
             Map.entry("architecture_scan", "architecture scan"),
+            Map.entry("get_agent_status", "agent status"),
+            Map.entry("enable_agent_sensor", "agent sensor enable"),
+            Map.entry("disable_agent_sensor", "agent sensor disable"),
+            Map.entry("get_code_inventory", "code inventory"),
+            Map.entry("get_code_paths", "code paths"),
+            Map.entry("start_method_probe", "probe start"),
+            Map.entry("get_method_probe", "probe show"),
+            Map.entry("get_side_effects", "side-effects"),
             Map.entry("clear_exceptions", "exceptions clear"),
             Map.entry("clear_rest_client_traces", "rest-client clear"),
             Map.entry("clear_sql_traces", "sql clear"),
@@ -62,6 +70,7 @@ public final class CliCommandPaths {
             Map.entry("get_heap_dump_report", "memory heap report"),
             Map.entry("get_hibernate_report", "hibernate report"),
             Map.entry("get_hibernate_rule_violations", "hibernate violations"),
+            Map.entry("get_hibernate_statistics", "hibernate statistics"),
             Map.entry("get_http_exchanges", "http exchanges"),
             Map.entry("get_http_routes", "http routes"),
             Map.entry("get_http_sessions", "http sessions"),
@@ -82,6 +91,10 @@ public final class CliCommandPaths {
             Map.entry("get_profile_diff", "profile diff"),
             Map.entry("get_rabbitmq_activity", "rabbitmq"),
             Map.entry("get_request_profile", "request-profile"),
+            Map.entry("get_runtime_impact", "insights impact"),
+            Map.entry("get_runtime_insight", "insights show"),
+            Map.entry("get_runtime_insights", "insights list"),
+            Map.entry("get_runtime_run_comparison", "insights compare"),
             Map.entry("get_rest_api_report", "rest-api report"),
             Map.entry("get_rest_api_rule_violations", "rest-api violations"),
             Map.entry("get_rest_client_traces", "rest-client traces"),
@@ -99,6 +112,7 @@ public final class CliCommandPaths {
             Map.entry("get_traces", "traces list"),
             Map.entry("get_transactions", "tx list"),
             Map.entry("get_vulnerabilities_report", "vulnerabilities report"),
+            Map.entry("get_websockets", "websockets"),
             Map.entry("graalvm_scan", "graalvm scan"),
             Map.entry("hibernate_scan", "hibernate scan"),
             Map.entry("memory_scan", "memory scan"),
@@ -122,6 +136,58 @@ public final class CliCommandPaths {
      */
     public static String commandFor(String toolName) {
         return BY_TOOL.get(toolName);
+    }
+
+    /**
+     * The {@code bootui} command line that calls {@code toolName} with these MCP arguments, quoted for a POSIX shell:
+     * the {@code id} positional first, then {@code --query}, {@code --limit}, {@code --scan-id}, and {@code --offset},
+     * the spelling the published CLI binds each schema argument to. A placeholder such as {@code <id>} is left bare.
+     *
+     * @throws IllegalArgumentException when the tool has no command or an argument has no command-line spelling
+     */
+    public static String command(String toolName, Map<String, ?> arguments) {
+        String path = BY_TOOL.get(toolName);
+        if (path == null) {
+            throw new IllegalArgumentException("No command for MCP tool " + toolName);
+        }
+        StringBuilder line = new StringBuilder("bootui ").append(path);
+        Object id = arguments.get("id");
+        boolean dashedId = id != null && String.valueOf(id).startsWith("-");
+        if (id != null && !dashedId) {
+            line.append(' ').append(quote(String.valueOf(id)));
+        }
+        for (Map.Entry<String, ?> argument : arguments.entrySet()) {
+            String flag =
+                    switch (argument.getKey()) {
+                        case "id" -> null;
+                        case "query" -> "--query";
+                        case "limit" -> "--limit";
+                        case "scanId" -> "--scan-id";
+                        case "offset" -> "--offset";
+                        default ->
+                            throw new IllegalArgumentException(
+                                    "No command-line spelling for argument " + argument.getKey());
+                    };
+            if (flag != null) {
+                line.append(' ').append(flag).append(' ').append(quote(String.valueOf(argument.getValue())));
+            }
+        }
+        if (dashedId) {
+            // After "--", picocli reads a value that starts with a dash as the positional, not as an option.
+            line.append(" -- ").append(quote(String.valueOf(id)));
+        }
+        return line.toString();
+    }
+
+    /**
+     * {@code value} as one shell word. Only characters no common shell treats specially stay bare: zsh's extended glob
+     * reads {@code #}, a leading {@code =} expands, and PowerShell splits on {@code ,} and splats on {@code @}.
+     */
+    static String quote(String value) {
+        if (value.matches("<[A-Za-z]+>") || value.matches("[A-Za-z0-9._/:-]+")) {
+            return value;
+        }
+        return "'" + value.replace("'", "'\\''") + "'";
     }
 
     private CliCommandPaths() {}

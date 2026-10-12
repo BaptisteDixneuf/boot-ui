@@ -1,0 +1,959 @@
+package io.github.jdubois.bootui.autoconfigure.activity;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.exceptions.ExceptionsController;
+import io.github.jdubois.bootui.autoconfigure.restclienttrace.RestClientTraceController;
+import io.github.jdubois.bootui.autoconfigure.sqltrace.SqlTraceController;
+import io.github.jdubois.bootui.autoconfigure.web.HttpExchangesController;
+import io.github.jdubois.bootui.autoconfigure.web.SecurityLogsController;
+import io.github.jdubois.bootui.autoconfigure.web.TracesController;
+import io.github.jdubois.bootui.core.dto.ExceptionDetailDto;
+import io.github.jdubois.bootui.core.dto.ExceptionGroupDto;
+import io.github.jdubois.bootui.core.dto.ExceptionOccurrenceDto;
+import io.github.jdubois.bootui.core.dto.ExceptionsReport;
+import io.github.jdubois.bootui.core.dto.HttpExchangeDto;
+import io.github.jdubois.bootui.core.dto.HttpExchangesReport;
+import io.github.jdubois.bootui.core.dto.PageMetadata;
+import io.github.jdubois.bootui.core.dto.RequestProfileDto;
+import io.github.jdubois.bootui.core.dto.RequestProfileSectionDto;
+import io.github.jdubois.bootui.core.dto.RestClientTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.RestClientTraceReport;
+import io.github.jdubois.bootui.core.dto.RestClientTraceStatsDto;
+import io.github.jdubois.bootui.core.dto.SecurityLogEventDto;
+import io.github.jdubois.bootui.core.dto.SecurityLogsReport;
+import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.SqlTraceReport;
+import io.github.jdubois.bootui.core.dto.SqlTraceStatsDto;
+import io.github.jdubois.bootui.engine.cache.CacheActivityEvent;
+import io.github.jdubois.bootui.engine.cache.CacheActivityOperation;
+import io.github.jdubois.bootui.engine.cache.CacheActivityRecorder;
+import io.github.jdubois.bootui.engine.javaagent.AgentBridgeAccess;
+import io.github.jdubois.bootui.engine.javaagent.AgentSetupSnippets;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentSettings;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
+import io.github.jdubois.bootui.engine.web.ProfileCapabilities;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
+
+class LiveActivityCorrelatorTests {
+
+    private static final Instant BASE = Instant.parse("2026-06-14T10:00:00Z");
+    private static final long START = BASE.toEpochMilli();
+
+    @Test
+    void returnsUnavailableWhenRequestNotFound() {
+        LiveActivityCorrelator correlator = correlator(requestsController(), null, null, null, new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("missing");
+
+        assertThat(profile.available()).isFalse();
+        assertThat(profile.unavailableReason()).contains("missing");
+    }
+
+    @Test
+    void reportsThePropagatedTierUnavailableWithTheJavaAgentsReason() {
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L, "trace-abc")),
+                null,
+                null,
+                null,
+                new BootUiProperties());
+        @SuppressWarnings("unchecked")
+        ObjectProvider<JavaAgentService> javaAgent = mock(ObjectProvider.class);
+        when(javaAgent.getIfUnique())
+                .thenReturn(new JavaAgentService(
+                        AgentBridgeAccess.absent(),
+                        () -> null,
+                        JavaAgentSettings.of(AgentSetupSnippets.SPRING, true, null)));
+        correlator.setJavaAgent(javaAgent);
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.correlationTiers())
+                .filteredOn(tier -> tier.tier().equals("PROPAGATED"))
+                .singleElement()
+                .satisfies(tier -> {
+                    assertThat(tier.available()).isFalse();
+                    assertThat(tier.unavailableReason())
+                            .startsWith(JavaAgentService.PROPAGATION_REQUIREMENT + ": ")
+                            .contains("-javaagent");
+                });
+    }
+
+    @Test
+    void correlatesSqlExactlyByTraceIdWhenPresent() {
+        SqlTraceController sql = sqlController(
+                sqlEntry(1, START + 5, "SELECT * FROM t", "SELECT", 3, "trace-abc"),
+                sqlEntry(2, START + 9000, "SELECT * FROM t", "SELECT", 3, "trace-abc"), // outside window, same trace
+                sqlEntry(3, START + 6, "SELECT * FROM other", "SELECT", 3, "trace-zzz")); // in window, other trace
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L, "trace-abc")),
+                sql,
+                null,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.available()).isTrue();
+        assertThat(profile.sql()).hasSize(2);
+        assertThat(profile.sql())
+                .allSatisfy(entry -> assertThat(entry.traceId()).isEqualTo("trace-abc"));
+        assertThat(profile.sqlCorrelationApproximate()).isFalse();
+    }
+
+    @Test
+    void fallsBackToTimeWindowWhenNoSqlMatchesTraceId() {
+        SqlTraceController sql = sqlController(
+                sqlEntry(1, START + 5, "SELECT * FROM t", "SELECT", 3, "trace-other"),
+                sqlEntry(2, START + 90, "SELECT * FROM t", "SELECT", 3, null));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L, "trace-abc")),
+                sql,
+                null,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.sql()).hasSize(2);
+        assertThat(profile.sqlCorrelationApproximate()).isTrue();
+    }
+
+    @Test
+    void sumsSubMillisecondStatementsIntoRealDatabaseTimeInsteadOfZero() {
+        SqlTraceController sql = sqlController(
+                subMillisSqlEntry(1, START + 5, "SELECT * FROM t", 400),
+                subMillisSqlEntry(2, START + 20, "SELECT * FROM t", 400),
+                subMillisSqlEntry(3, START + 40, "SELECT * FROM t", 400));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)),
+                sql,
+                null,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.timing().sqlCount()).isEqualTo(3);
+        assertThat(profile.timing().sqlMs()).isEqualTo(1.2);
+        assertThat(profile.timing().sqlPercent()).isEqualTo(1.2);
+    }
+
+    @Test
+    void correlatesSqlByTimeWindowAndFlagsApproximate() {
+        SqlTraceController sql = sqlController(
+                sqlEntry(1, START + 5, "SELECT * FROM t", "SELECT", 3),
+                sqlEntry(2, START + 90, "SELECT * FROM t", "SELECT", 3),
+                sqlEntry(3, START + 5000, "SELECT * FROM other", "SELECT", 3)); // outside window
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)),
+                sql,
+                null,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.available()).isTrue();
+        assertThat(profile.sql()).hasSize(2);
+        assertThat(profile.sqlCorrelationApproximate()).isTrue();
+        assertThat(profile.timing().sqlCount()).isEqualTo(2);
+        assertThat(profile.timing().sqlMs()).isEqualTo(6L);
+    }
+
+    @Test
+    void detectsNPlusOneWhenIdenticalSelectsRepeatAboveThreshold() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setNPlusOneThreshold(3);
+        SqlTraceController sql = sqlController(
+                sqlEntry(
+                        1,
+                        START + 1,
+                        "SELECT * FROM child WHERE id = ?",
+                        "SELECT",
+                        1,
+                        null,
+                        "com.example.ChildRepository.findByParentId(ChildRepository.java:12)"),
+                sqlEntry(
+                        2,
+                        START + 2,
+                        "SELECT * FROM child WHERE id = ?",
+                        "SELECT",
+                        1,
+                        null,
+                        "com.example.ChildRepository.findByParentId(ChildRepository.java:12)"),
+                sqlEntry(3, START + 3, "SELECT * FROM child WHERE id = ?", "SELECT", 1, null, null));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)), sql, null, null, properties);
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.sqlGroups()).hasSize(1);
+        assertThat(profile.sqlGroups().get(0).executions()).isEqualTo(3);
+        assertThat(profile.sqlGroups().get(0).potentialNPlusOne()).isTrue();
+        assertThat(profile.sqlGroups().get(0).callSites())
+                .containsExactly("com.example.ChildRepository.findByParentId(ChildRepository.java:12)");
+    }
+
+    @Test
+    void doesNotFlagNPlusOneBelowThreshold() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setNPlusOneThreshold(5);
+        SqlTraceController sql = sqlController(
+                sqlEntry(1, START + 1, "SELECT * FROM child WHERE id = ?", "SELECT", 1),
+                sqlEntry(2, START + 2, "SELECT * FROM child WHERE id = ?", "SELECT", 1));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)), sql, null, null, properties);
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.sqlGroups().get(0).potentialNPlusOne()).isFalse();
+    }
+
+    @Test
+    void correlatesExceptionsByPathMethodAndWindow() {
+        ExceptionsController exceptions = exceptionsController(
+                "GET",
+                "/a",
+                START + 10, // matches
+                "POST",
+                "/a",
+                START + 10, // wrong method
+                "GET",
+                "/b",
+                START + 10); // wrong path
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 500, 100L)),
+                null,
+                exceptions,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.exceptions()).hasSize(1);
+        assertThat(profile.exceptions().get(0).exceptionClassName()).isEqualTo("ex-GET-/a");
+    }
+
+    @Test
+    void correlatesExceptionsExactlyByServingThreadAcrossConcurrentIdenticalRequests() {
+        // Two concurrent GET /a requests both threw the same exception in the same window, on
+        // different worker threads. The registry uniquely identifies this exchange's thread, so only
+        // the occurrence thrown on that thread is attributed to it.
+        RequestCorrelationRegistry registry = new RequestCorrelationRegistry(100);
+        registry.record(new RequestCorrelationRegistry.RequestCorrelation(START, START + 100, "exec-1", "GET", "/a"));
+
+        ExceptionsController exceptions = exceptionsControllerWithOccurrences(
+                "GET",
+                "/a",
+                new ExceptionOccurrenceDto(START + 10, "exec-1", "GET", "/a", "h", "web", null),
+                new ExceptionOccurrenceDto(START + 20, "exec-2", "GET", "/a", "h", "web", null));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 500, 100L)),
+                null,
+                exceptions,
+                null,
+                null,
+                registry,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.exceptions()).extracting(dto -> dto.thread()).containsExactly("exec-1");
+        assertThat(profile.notes()).anyMatch(note -> note.contains("serving thread"));
+    }
+
+    @Test
+    void fallsBackToMethodPathWindowForExceptionsWhenServingThreadIsAmbiguous() {
+        // Two genuinely concurrent identical requests overlap, so the request's serving thread cannot
+        // be uniquely identified and exception correlation stays on method + path + window.
+        RequestCorrelationRegistry registry = new RequestCorrelationRegistry(100);
+        registry.record(new RequestCorrelationRegistry.RequestCorrelation(START, START + 100, "exec-1", "GET", "/a"));
+        registry.record(
+                new RequestCorrelationRegistry.RequestCorrelation(START + 10, START + 90, "exec-2", "GET", "/a"));
+
+        ExceptionsController exceptions = exceptionsControllerWithOccurrences(
+                "GET",
+                "/a",
+                new ExceptionOccurrenceDto(START + 10, "exec-1", "GET", "/a", "h", "web", null),
+                new ExceptionOccurrenceDto(START + 20, "exec-2", "GET", "/a", "h", "web", null));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 500, 100L)),
+                null,
+                exceptions,
+                null,
+                null,
+                registry,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.exceptions()).extracting(dto -> dto.thread()).containsExactly("exec-1", "exec-2");
+        assertThat(profile.notes()).noneMatch(note -> note.contains("serving thread"));
+    }
+
+    @Test
+    void correlatesSecurityEventsByTimeWindowAndPrincipal() {
+        SecurityLogsController security = securityController(
+                securityEvent("AUTHENTICATION_SUCCESS", "admin", START + 5), // in window, principal matches
+                securityEvent("AUTHORIZATION_FAILURE", "bob", START + 6), // in window, different principal
+                securityEvent("LOGOUT_SUCCESS", null, START + 7), // in window, no principal -> kept by time
+                securityEvent("AUTHENTICATION_SUCCESS", "admin", START + 9000)); // outside window
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(secureExchange("r1", BASE, "admin")),
+                null,
+                null,
+                null,
+                security,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.security()).hasSize(2);
+        assertThat(profile.security())
+                .extracting(dto -> dto.type())
+                .containsExactly("AUTHENTICATION_SUCCESS", "LOGOUT_SUCCESS");
+        assertThat(profile.security().get(0).principalMatched()).isTrue();
+        assertThat(profile.security().get(1).principalMatched()).isFalse();
+        assertThat(profile.notes()).anyMatch(note -> note.contains("Security events are matched"));
+    }
+
+    @Test
+    void correlatesSecurityExactlyByServingThreadAcrossConcurrentRequestsSharingPrincipal() {
+        // Two concurrent admin requests both raise AUTHORIZATION_FAILURE in the same window; only the
+        // event emitted on this request's serving thread (exec-1) belongs to it.
+        SecurityLogsController security = securityController(
+                securityEvent("AUTHORIZATION_FAILURE", "admin", START + 5),
+                securityEvent("AUTHORIZATION_FAILURE", "admin", START + 40));
+
+        RequestCorrelationRegistry requests = new RequestCorrelationRegistry(100);
+        requests.record(new RequestCorrelationRegistry.RequestCorrelation(
+                START, START + 100, "exec-1", "GET", "/secure/admin"));
+
+        SecurityEventCorrelationRegistry events = new SecurityEventCorrelationRegistry(100);
+        events.record(new SecurityEventCorrelationRegistry.SecurityEventCorrelation(
+                START + 5, "exec-1", "AUTHORIZATION_FAILURE", "admin"));
+        events.record(new SecurityEventCorrelationRegistry.SecurityEventCorrelation(
+                START + 40, "exec-2", "AUTHORIZATION_FAILURE", "admin"));
+
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(secureExchange("r1", BASE, "admin")),
+                null,
+                null,
+                null,
+                security,
+                requests,
+                events,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.security()).hasSize(1);
+        assertThat(profile.security().get(0).timestamp()).isEqualTo(START + 5);
+        assertThat(profile.security().get(0).threadMatched()).isTrue();
+        assertThat(profile.notes()).anyMatch(note -> note.contains("serving thread"));
+    }
+
+    @Test
+    void keepsSecurityEventsWhenServingThreadKnownButEventNotCaptured() {
+        // The serving thread is known but the security registry did not retain the event (UNKNOWN): keep
+        // it via the time-window match rather than dropping a real event.
+        SecurityLogsController security =
+                securityController(securityEvent("AUTHENTICATION_SUCCESS", "admin", START + 5));
+
+        RequestCorrelationRegistry requests = new RequestCorrelationRegistry(100);
+        requests.record(new RequestCorrelationRegistry.RequestCorrelation(
+                START, START + 100, "exec-1", "GET", "/secure/admin"));
+
+        SecurityEventCorrelationRegistry events = new SecurityEventCorrelationRegistry(100); // nothing captured
+
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(secureExchange("r1", BASE, "admin")),
+                null,
+                null,
+                null,
+                security,
+                requests,
+                events,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.security()).hasSize(1);
+        assertThat(profile.security().get(0).threadMatched()).isFalse();
+    }
+
+    @Test
+    void correlatesSqlExactlyByServingThreadWhenNoTraceId() {
+        // The request was handled on thread "exec-1" during [START, START+100].
+        RequestCorrelationRegistry registry = new RequestCorrelationRegistry(100);
+        registry.record(new RequestCorrelationRegistry.RequestCorrelation(START, START + 100, "exec-1", "GET", "/a"));
+
+        SqlTraceController sql = sqlController(
+                sqlEntryOnThread(1, START + 10, "SELECT * FROM t", "SELECT", 3, "exec-1"), // same thread, in window
+                sqlEntryOnThread(2, START + 20, "SELECT * FROM u", "SELECT", 4, "exec-2"), // concurrent other request
+                sqlEntryOnThread(3, START + 50, "SELECT * FROM v", "SELECT", 5, "exec-1")); // same thread, in window
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)),
+                sql,
+                null,
+                null,
+                null,
+                registry,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.sql()).extracting(SqlTraceEntryDto::id).containsExactly(1L, 3L);
+        assertThat(profile.sqlCorrelationApproximate()).isFalse();
+        assertThat(profile.notes()).anyMatch(note -> note.contains("serving thread"));
+    }
+
+    @Test
+    void fallsBackToApproximateWhenServingThreadIsAmbiguous() {
+        // Two genuinely concurrent identical requests have overlapping windows, so the serving thread
+        // cannot be uniquely identified and correlation must stay on the time-window heuristic.
+        RequestCorrelationRegistry registry = new RequestCorrelationRegistry(100);
+        registry.record(new RequestCorrelationRegistry.RequestCorrelation(START, START + 100, "exec-1", "GET", "/a"));
+        registry.record(
+                new RequestCorrelationRegistry.RequestCorrelation(START + 10, START + 90, "exec-2", "GET", "/a"));
+
+        SqlTraceController sql = sqlController(
+                sqlEntryOnThread(1, START + 10, "SELECT 1", "SELECT", 3, "exec-1"),
+                sqlEntryOnThread(2, START + 20, "SELECT 2", "SELECT", 4, "exec-2"));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)),
+                sql,
+                null,
+                null,
+                null,
+                registry,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.sql()).hasSize(2);
+        assertThat(profile.sqlCorrelationApproximate()).isTrue();
+    }
+
+    @Test
+    void correlatesRestClientCallsAndCacheAccessesByTheServingThread() {
+        RequestCorrelationRegistry registry = new RequestCorrelationRegistry(100);
+        registry.record(new RequestCorrelationRegistry.RequestCorrelation(START, START + 100, "exec-1", "GET", "/a"));
+        CacheActivityRecorder cache = new CacheActivityRecorder(true, 100);
+        cache.recordHit("cacheManager", "sample-products", "active");
+        CacheActivityEvent captured = cache.recentEvents().get(0);
+        CacheActivityRecorder recorder = mock(CacheActivityRecorder.class);
+        when(recorder.isEnabled()).thenReturn(true);
+        when(recorder.hasInstrumentedManager()).thenReturn(true);
+        when(recorder.recentEvents())
+                .thenReturn(List.of(
+                        new CacheActivityEvent(
+                                1,
+                                START + 20,
+                                "cacheManager",
+                                "sample-products",
+                                CacheActivityOperation.HIT,
+                                captured.keyHash(),
+                                null,
+                                "exec-1"),
+                        new CacheActivityEvent(
+                                2,
+                                START + 30,
+                                "cacheManager",
+                                "sample-products",
+                                CacheActivityOperation.MISS,
+                                captured.keyHash(),
+                                null,
+                                "scheduling-1")));
+        LiveActivityCorrelator correlator = outboundCorrelator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)),
+                restClientController(
+                        restCall(1, START + 10, "exec-1", "https://inventory.example/items?token=******"),
+                        restCall(2, START + 15, "exec-2", "https://inventory.example/other")),
+                recorder,
+                registry,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.restCalls()).extracting(RestClientTraceEntryDto::id).containsExactly(1L);
+        assertThat(profile.restCalls().get(0).uri()).isEqualTo("https://inventory.example/items?token=******");
+        assertThat(profile.cacheAccesses()).singleElement().satisfies(access -> {
+            assertThat(access.operation()).isEqualTo("HIT");
+            assertThat(access.keyHash()).isEqualTo(captured.keyHash()).doesNotContain("active");
+        });
+        assertThat(profile.sections())
+                .filteredOn(section -> List.of("REST_CLIENT", "CACHE").contains(section.type()))
+                .allSatisfy(section -> {
+                    assertThat(section.available()).isTrue();
+                    assertThat(section.tier()).isEqualTo("SERVING_THREAD");
+                });
+        assertThat(profile.timing().restCallCount()).isEqualTo(1);
+        assertThat(profile.correlationTiers())
+                .filteredOn(tier -> !tier.tier().equals("PROPAGATED"))
+                .allSatisfy(tier -> assertThat(tier.available()).isTrue());
+        assertThat(profile.correlationTiers())
+                .filteredOn(tier -> tier.tier().equals("PROPAGATED"))
+                .singleElement()
+                .satisfies(tier -> {
+                    assertThat(tier.available()).as("without the agent").isFalse();
+                    assertThat(tier.unavailableReason()).isEqualTo(ProfileCapabilities.PROPAGATION_REASON);
+                });
+    }
+
+    @Test
+    void reportsCacheAccessesUnavailableUntilACacheManagerIsInstrumented() {
+        CacheActivityRecorder cache = new CacheActivityRecorder(true, 10);
+        cache.recordHit("cacheManager", "orders", "key");
+        LiveActivityCorrelator correlator = outboundCorrelator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)),
+                null,
+                cache,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.sections())
+                .filteredOn(section -> "CACHE".equals(section.type()))
+                .singleElement()
+                .satisfies(section -> {
+                    assertThat(section.available()).isFalse();
+                    assertThat(section.unavailableReason())
+                            .isEqualTo(
+                                    "No cache manager is instrumented for cache access capture on this application.");
+                });
+    }
+
+    @Test
+    void attributesExceptionsOfTwoCapturedConcurrentIdenticalRequestsToNeither() {
+        // Both requests are captured and overlap, so neither serving thread is unique and the
+        // method + path + window tier cannot tell which one threw: the occurrence is counted, not shown.
+        ExceptionsController exceptions = exceptionsControllerWithOccurrences(
+                "GET", "/a", new ExceptionOccurrenceDto(START + 50, "exec-1", "GET", "/a", "h", "web", null));
+        LiveActivityCorrelator correlator = correlator(
+                requestsController(
+                        exchange("r1", BASE, "GET", "/a", 500, 100L),
+                        exchange("r2", BASE.plusMillis(10), "GET", "/a", 500, 100L)),
+                null,
+                exceptions,
+                null,
+                new BootUiProperties());
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.exceptions()).isEmpty();
+        assertThat(profile.sections())
+                .filteredOn(section -> "EXCEPTION".equals(section.type()))
+                .singleElement()
+                .satisfies(section -> assertThat(section.ambiguous()).isEqualTo(1));
+        assertThat(profile.notes()).anyMatch(note -> note.contains("could equally belong to another captured request"));
+    }
+
+    @Test
+    void reportsDisabledRestClientAndCachePanelsWithoutReadingThem() {
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.REST_CLIENT_TRACE).setEnabled(false);
+        properties.panel(BootUiPanels.CACHE).setEnabled(false);
+        RestClientTraceController restClient = restClientController(restCall(1, START + 10, "exec-1", "https://a"));
+        CacheActivityRecorder cache = mock(CacheActivityRecorder.class);
+        LiveActivityCorrelator correlator = outboundCorrelator(
+                requestsController(exchange("r1", BASE, "GET", "/a", 200, 100L)), restClient, cache, null, properties);
+
+        RequestProfileDto profile = correlator.profile("r1");
+
+        assertThat(profile.restCalls()).isEmpty();
+        assertThat(profile.cacheAccesses()).isEmpty();
+        assertThat(profile.sections())
+                .filteredOn(section -> List.of("REST_CLIENT", "CACHE").contains(section.type()))
+                .extracting(RequestProfileSectionDto::available, RequestProfileSectionDto::unavailableReason)
+                .containsExactly(
+                        tuple(false, "The REST Client panel is disabled."),
+                        tuple(false, "The Cache panel is disabled."));
+        verify(restClient, never()).trace();
+        verify(cache, never()).recentEvents();
+    }
+
+    // --- helpers ---
+
+    private LiveActivityCorrelator correlator(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            TracesController traces,
+            BootUiProperties properties) {
+        return correlator(requests, sql, exceptions, traces, null, properties);
+    }
+
+    private LiveActivityCorrelator correlator(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            TracesController traces,
+            SecurityLogsController security,
+            BootUiProperties properties) {
+        return correlator(requests, sql, exceptions, traces, security, null, properties);
+    }
+
+    private LiveActivityCorrelator correlator(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            TracesController traces,
+            SecurityLogsController security,
+            RequestCorrelationRegistry requestCorrelations,
+            BootUiProperties properties) {
+        return correlator(requests, sql, exceptions, traces, security, requestCorrelations, null, properties);
+    }
+
+    private LiveActivityCorrelator correlator(
+            HttpExchangesController requests,
+            SqlTraceController sql,
+            ExceptionsController exceptions,
+            TracesController traces,
+            SecurityLogsController security,
+            RequestCorrelationRegistry requestCorrelations,
+            SecurityEventCorrelationRegistry securityCorrelations,
+            BootUiProperties properties) {
+        return new LiveActivityCorrelator(
+                provider(requests),
+                provider(sql),
+                provider(null),
+                provider(exceptions),
+                provider(security),
+                provider(traces),
+                provider(null),
+                provider(requestCorrelations),
+                provider(securityCorrelations),
+                properties);
+    }
+
+    private LiveActivityCorrelator outboundCorrelator(
+            HttpExchangesController requests,
+            RestClientTraceController restClient,
+            CacheActivityRecorder cache,
+            RequestCorrelationRegistry requestCorrelations,
+            BootUiProperties properties) {
+        return new LiveActivityCorrelator(
+                provider(requests),
+                provider(null),
+                provider(restClient),
+                provider(null),
+                provider(null),
+                provider(null),
+                provider(cache),
+                provider(requestCorrelations),
+                provider(null),
+                properties);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> provider(T value) {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(value);
+        return provider;
+    }
+
+    private static HttpExchangesController requestsController(HttpExchangeDto... exchanges) {
+        HttpExchangesController controller = mock(HttpExchangesController.class);
+        HttpExchangesReport report = new HttpExchangesReport(
+                exchanges.length,
+                exchanges.length,
+                0,
+                List.of(exchanges),
+                new PageMetadata(0, exchanges.length, exchanges.length, 1, 0, false),
+                null);
+        when(controller.exchanges(eq(null), eq(null), eq(null), eq(0), anyInt()))
+                .thenReturn(report);
+        return controller;
+    }
+
+    private static RestClientTraceController restClientController(RestClientTraceEntryDto... entries) {
+        RestClientTraceController controller = mock(RestClientTraceController.class);
+        RestClientTraceReport report = new RestClientTraceReport(
+                true,
+                null,
+                true,
+                false,
+                100,
+                entries.length,
+                1000,
+                List.of("RestClient"),
+                RestClientTraceStatsDto.empty(),
+                List.of(entries),
+                List.of(),
+                List.of());
+        when(controller.trace()).thenReturn(report);
+        return controller;
+    }
+
+    private static RestClientTraceEntryDto restCall(long id, long timestamp, String thread, String uri) {
+        return new RestClientTraceEntryDto(
+                id,
+                timestamp,
+                "GET",
+                uri,
+                "inventory.example",
+                "/items",
+                200,
+                12L,
+                true,
+                null,
+                false,
+                "RestClient",
+                Map.of(),
+                null,
+                thread,
+                null);
+    }
+
+    private static SecurityLogsController securityController(SecurityLogEventDto... events) {
+        SecurityLogsController controller = mock(SecurityLogsController.class);
+        SecurityLogsReport report = new SecurityLogsReport(
+                true,
+                null,
+                1000,
+                List.of(),
+                List.of(events),
+                new PageMetadata(0, events.length, events.length, 1, 0, false));
+        when(controller.logs(any(), any(), any(), any(), any())).thenReturn(report);
+        return controller;
+    }
+
+    private static SecurityLogEventDto securityEvent(String type, String principal, long epochMillis) {
+        return new SecurityLogEventDto(Instant.ofEpochMilli(epochMillis).toString(), principal, type, List.of(), null);
+    }
+
+    private static SqlTraceController sqlController(SqlTraceEntryDto... entries) {
+        SqlTraceController controller = mock(SqlTraceController.class);
+        SqlTraceReport report = new SqlTraceReport(
+                true,
+                null,
+                true,
+                false,
+                100,
+                entries.length,
+                1000,
+                List.of("ds"),
+                SqlTraceStatsDto.empty(),
+                List.of(entries),
+                List.of(),
+                List.of());
+        when(controller.trace()).thenReturn(report);
+        return controller;
+    }
+
+    private static ExceptionsController exceptionsController(Object... methodPathTimeTriples) {
+        ExceptionsController controller = mock(ExceptionsController.class);
+        int count = methodPathTimeTriples.length / 3;
+        ExceptionGroupDto[] groups = new ExceptionGroupDto[count];
+        for (int i = 0; i < count; i++) {
+            String method = (String) methodPathTimeTriples[i * 3];
+            String path = (String) methodPathTimeTriples[i * 3 + 1];
+            long ts = (long) methodPathTimeTriples[i * 3 + 2];
+            String id = "g" + i;
+            groups[i] = new ExceptionGroupDto(
+                    id,
+                    "ex-" + method + "-" + path,
+                    "boom",
+                    1,
+                    ts,
+                    ts,
+                    "Foo.java:1",
+                    true,
+                    "t",
+                    method,
+                    path,
+                    "h",
+                    "s",
+                    null,
+                    "OPEN",
+                    0,
+                    null);
+            ExceptionDetailDto detail = new ExceptionDetailDto(
+                    groups[i],
+                    List.of(),
+                    List.of(),
+                    List.of(new ExceptionOccurrenceDto(ts, "t", method, path, "h", "s", null)));
+            when(controller.detail(id)).thenReturn(detail);
+        }
+        ExceptionsReport report = new ExceptionsReport(true, null, 50, count, List.of(groups));
+        when(controller.list()).thenReturn(report);
+        return controller;
+    }
+
+    private static ExceptionsController exceptionsControllerWithOccurrences(
+            String method, String path, ExceptionOccurrenceDto... occurrences) {
+        ExceptionsController controller = mock(ExceptionsController.class);
+        long firstTs = occurrences.length == 0 ? 0 : occurrences[0].timestamp();
+        long lastTs = occurrences.length == 0 ? 0 : occurrences[occurrences.length - 1].timestamp();
+        String lastThread = occurrences.length == 0 ? "t" : occurrences[occurrences.length - 1].thread();
+        ExceptionGroupDto group = new ExceptionGroupDto(
+                "g0",
+                "ex-" + method + "-" + path,
+                "boom",
+                occurrences.length,
+                firstTs,
+                lastTs,
+                "Foo.java:1",
+                true,
+                lastThread,
+                method,
+                path,
+                "h",
+                "web",
+                null,
+                "OPEN",
+                0,
+                null);
+        ExceptionDetailDto detail = new ExceptionDetailDto(group, List.of(), List.of(), List.of(occurrences));
+        when(controller.detail("g0")).thenReturn(detail);
+        ExceptionsReport report = new ExceptionsReport(true, null, 50, 1, List.of(group));
+        when(controller.list()).thenReturn(report);
+        return controller;
+    }
+
+    private static HttpExchangeDto exchange(
+            String id, Instant timestamp, String method, String path, int status, Long durationMs) {
+        return exchange(id, timestamp, method, path, status, durationMs, null);
+    }
+
+    private static HttpExchangeDto secureExchange(String id, Instant timestamp, String principal) {
+        return new HttpExchangeDto(
+                id,
+                timestamp,
+                "GET",
+                "/secure/admin",
+                null,
+                "/secure/admin",
+                200,
+                "SUCCESS",
+                100L,
+                null,
+                null,
+                principal,
+                null,
+                null,
+                List.of(),
+                List.of());
+    }
+
+    private static HttpExchangeDto exchange(
+            String id, Instant timestamp, String method, String path, int status, Long durationMs, String traceId) {
+        return new HttpExchangeDto(
+                id,
+                timestamp,
+                method,
+                path,
+                null,
+                path,
+                status,
+                status >= 500 ? "SERVER_ERROR" : "SUCCESS",
+                durationMs,
+                null,
+                null,
+                null,
+                null,
+                traceId,
+                List.of(),
+                List.of());
+    }
+
+    private static SqlTraceEntryDto sqlEntry(
+            long id, long timestamp, String sql, String category, long durationMillis) {
+        return sqlEntry(id, timestamp, sql, category, durationMillis, null);
+    }
+
+    private static SqlTraceEntryDto sqlEntryOnThread(
+            long id, long timestamp, String sql, String category, long durationMillis, String thread) {
+        return new SqlTraceEntryDto(
+                id,
+                timestamp,
+                sql,
+                category,
+                category,
+                durationMillis * 1_000L,
+                durationMillis,
+                true,
+                null,
+                null,
+                0,
+                "conn-1",
+                thread,
+                false,
+                List.of(),
+                null,
+                null);
+    }
+
+    private static SqlTraceEntryDto sqlEntry(
+            long id, long timestamp, String sql, String category, long durationMillis, String traceId) {
+        return sqlEntry(id, timestamp, sql, category, durationMillis, traceId, null);
+    }
+
+    private static SqlTraceEntryDto sqlEntry(
+            long id,
+            long timestamp,
+            String sql,
+            String category,
+            long durationMillis,
+            String traceId,
+            String callSite) {
+        return new SqlTraceEntryDto(
+                id,
+                timestamp,
+                sql,
+                category,
+                category,
+                durationMillis * 1_000L,
+                durationMillis,
+                true,
+                null,
+                null,
+                0,
+                "conn-1",
+                "http-thread",
+                false,
+                List.of(),
+                traceId,
+                callSite);
+    }
+
+    /** A sub-millisecond execution, the normal case against a local database. */
+    private static SqlTraceEntryDto subMillisSqlEntry(long id, long timestamp, String sql, long durationMicros) {
+        return new SqlTraceEntryDto(
+                id,
+                timestamp,
+                sql,
+                "SELECT",
+                "SELECT",
+                durationMicros,
+                Math.round(durationMicros / 1_000.0),
+                true,
+                null,
+                null,
+                0,
+                "conn-1",
+                "http-thread",
+                false,
+                List.of(),
+                null,
+                null);
+    }
+}

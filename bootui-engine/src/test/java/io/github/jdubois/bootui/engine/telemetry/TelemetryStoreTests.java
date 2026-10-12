@@ -3,6 +3,13 @@ package io.github.jdubois.bootui.engine.telemetry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.journal.AiCallEvents;
+import io.github.jdubois.bootui.engine.journal.AiPayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.spi.CorrelationContext;
 import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -34,6 +41,143 @@ class TelemetryStoreTests {
                 null,
                 Map.of(),
                 List.of());
+    }
+
+    @Test
+    void theGenAiSpanOfACallTheFrameworkAlreadyReportedIsNotPublishedTwice() {
+        TelemetryStore store = new TelemetryStore(TelemetrySettings.of(true, true, 500, 500, 4096));
+        List<RuntimeEvent> published = new ArrayList<>();
+        store.setRuntimeEventSink(published::add);
+        AiCallEvents.publish(
+                published::add,
+                CorrelationContext.forRequest("r1"),
+                "trace-native",
+                "span-native",
+                5,
+                1,
+                null,
+                new AiPayload("chat", "openai", "gpt-4o", null, null, null, false));
+        NormalizedSpan chat = new NormalizedSpan(
+                "trace-native",
+                "span-native",
+                null,
+                "chat gpt-4o",
+                "CLIENT",
+                "sample",
+                "spring-ai",
+                5_000_000L,
+                45_000_000L,
+                "OK",
+                null,
+                Map.of("gen_ai.operation.name", AttributeValue.ofString("chat")),
+                List.of());
+
+        store.add(chat);
+
+        assertThat(published).as("only the framework's own event").hasSize(1);
+    }
+
+    @Test
+    void storedAiSpansArePublishedToTheJournalAsMetadataLinkedByTraceId() {
+        TelemetryStore store = new TelemetryStore(TelemetrySettings.of(true, true, 500, 500, 4096));
+        List<RuntimeEvent> published = new ArrayList<>();
+        store.setRuntimeEventSink(published::add);
+        NormalizedSpan chat = new NormalizedSpan(
+                "trace-1",
+                "span-1",
+                null,
+                "chat gpt-4o",
+                "CLIENT",
+                "sample",
+                "spring-ai",
+                5_000_000L,
+                45_000_000L,
+                "OK",
+                null,
+                Map.of(
+                        "gen_ai.operation.name", AttributeValue.ofString("chat"),
+                        "gen_ai.system", AttributeValue.ofString("openai"),
+                        "gen_ai.request.model", AttributeValue.ofString("gpt-4o"),
+                        "gen_ai.usage.input_tokens", AttributeValue.ofNumber(1200),
+                        "gen_ai.usage.output_tokens", AttributeValue.ofNumber(300),
+                        "gen_ai.response.finish_reasons", AttributeValue.ofList(List.of("length")),
+                        "gen_ai.prompt", AttributeValue.ofString("never published")),
+                List.of());
+
+        store.add(chat);
+        store.add(span("trace-2", "span-2"));
+        store.add(span("trace-3", "span-3"), true);
+
+        assertThat(published).singleElement().satisfies(event -> {
+            assertThat(event.source()).isEqualTo(JournalSource.AI);
+            assertThat(event.requestId()).isNull();
+            assertThat(event.traceId()).isEqualTo("trace-1");
+            assertThat(event.epochMillis()).isEqualTo(5);
+            assertThat(event.durationNanos()).isEqualTo(40_000_000L);
+            AiPayload ai = (AiPayload) event.payload();
+            assertThat(ai).isEqualTo(new AiPayload("chat", "openai", "gpt-4o", 1200L, 300L, "length", false, "span-1"));
+            assertThat(ai.lengthLimited()).isTrue();
+        });
+    }
+
+    @Test
+    void onlyAnImportedApplicationAiSpanIsPublishedAsImported() {
+        TelemetryStore store = new TelemetryStore(TelemetrySettings.of(true, true, 500, 500, 4096));
+        List<RuntimeEvent> regular = new ArrayList<>();
+        List<RuntimeEvent> imported = new ArrayList<>();
+        store.setRuntimeEventSink(new RuntimeEventSink() {
+            @Override
+            public boolean offer(RuntimeEvent event) {
+                regular.add(event);
+                return true;
+            }
+
+            @Override
+            public boolean offerImported(RuntimeEvent event) {
+                imported.add(event);
+                return true;
+            }
+        });
+
+        store.addImported(aiSpan("trace-imported", "span-imported", "sample"), false, true);
+        store.addImported(aiSpan("trace-self", "span-self", "sample"), true, true);
+        store.addImported(aiSpan("trace-self", "span-self-child", "sample"), false, true);
+        store.add(aiSpan("trace-local", "span-local", "sample"));
+
+        assertThat(imported).extracting(RuntimeEvent::traceId).containsExactly("trace-imported");
+        assertThat(regular).extracting(RuntimeEvent::traceId).containsExactly("trace-local");
+    }
+
+    @Test
+    void anotherServicesImportedAiSpanIsStoredButNeverJournaledUnlessThisApplicationStartedIt() {
+        TelemetryStore store = new TelemetryStore(TelemetrySettings.of(true, true, 500, 500, 4096));
+        List<RuntimeEvent> imported = new ArrayList<>();
+        store.setRuntimeEventSink(new RuntimeEventSink() {
+            @Override
+            public boolean offer(RuntimeEvent event) {
+                return true;
+            }
+
+            @Override
+            public boolean offerImported(RuntimeEvent event) {
+                imported.add(event);
+                return true;
+            }
+        });
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forRequest("0123456789abcdef"))) {
+            store.spanStarted("trace-owned", "span-owned");
+        }
+
+        assertThat(store.addImported(aiSpan("trace-foreign", "span-foreign", "other-service"), false, false))
+                .isTrue();
+        store.addImported(aiSpan("trace-owned", "span-owned", "other-service"), false, false);
+
+        assertThat(store.findTrace("trace-foreign")).isNotNull();
+        assertThat(imported).singleElement().satisfies(event -> {
+            assertThat(event.traceId()).isEqualTo("trace-owned");
+            assertThat(event.requestId()).isEqualTo("0123456789abcdef");
+        });
     }
 
     @Test
@@ -184,6 +328,23 @@ class TelemetryStoreTests {
         Field lockField = TelemetryStore.class.getDeclaredField("lock");
         lockField.setAccessible(true);
         return (ReentrantReadWriteLock) lockField.get(store);
+    }
+
+    private static NormalizedSpan aiSpan(String traceId, String spanId, String serviceName) {
+        return new NormalizedSpan(
+                traceId,
+                spanId,
+                null,
+                "chat gpt-4o",
+                "CLIENT",
+                serviceName,
+                "spring-ai",
+                5_000_000L,
+                45_000_000L,
+                "OK",
+                null,
+                Map.of("gen_ai.operation.name", AttributeValue.ofString("chat")),
+                List.of());
     }
 
     private static void awaitCondition(Condition condition) throws Exception {

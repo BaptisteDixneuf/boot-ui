@@ -1,13 +1,18 @@
 <script setup>
-import {computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch} from 'vue'
+import {computed, defineAsyncComponent, inject, onBeforeUnmount, onMounted, ref, watch} from 'vue'
 import {useRoute} from 'vue-router'
-import {apiFetch, getJson} from '../api.js'
+import {ApiError, apiFetch, getJson} from '../api.js'
 import PanelHeader from './components/PanelHeader.vue'
 import PanelSkeleton from './components/PanelSkeleton.vue'
 import UnavailableState from './components/UnavailableState.vue'
 import AiExportPreview from './components/AiExportPreview.vue'
 import FlashBanner from './components/FlashBanner.vue'
 import SpinnerButton from './components/SpinnerButton.vue'
+import {insightsUsable} from '../utils/insightsPanel.js'
+import RequestCodePath from './components/RequestCodePath.vue'
+import RequestJournalProfile from './components/RequestJournalProfile.vue'
+import RuntimeJournalStatus from './components/RuntimeJournalStatus.vue'
+import RuntimeResources from './components/RuntimeResources.vue'
 import {formatBytes, formatClockTime, formatMillis, formatNumber} from '../utils/format.js'
 import {formatLoadError} from '../utils/loadError.js'
 import {panelProps, usePanelState} from '../utils/panelState.js'
@@ -17,16 +22,23 @@ import {useFlashMessage} from '../utils/useFlashMessage.js'
 import {useEventStreamRefresh} from '../utils/useEventStreamRefresh.js'
 import {useCopyToClipboard} from '../utils/useCopyToClipboard.js'
 import {
+  diagnosticActionError,
+  getDiagnosticAcknowledgement,
+  isDatasourceSwitchAcknowledgement
+} from '../utils/diagnosticAcknowledgement.js'
+import {
   cacheAccessSummary,
   childTierLabel,
   profileSections,
   restCallSummary,
+  securityEventExact,
   unavailableTiersText
 } from '../utils/requestProfile.js'
 import {loadProfileExceptionDetails, profileMarkdown} from '../utils/markdownExport.js'
 import {
   appendOlderPage,
   bucketEntries,
+  markerPositions,
   buildActivityQueryParams,
   deepLink,
   filterEntries,
@@ -49,7 +61,14 @@ const TYPES = [
   'MESSAGING',
   'MAIL',
   'REST_CLIENT',
-  'FAULT_TOLERANCE'
+  'FAULT_TOLERANCE',
+  'TRANSACTION',
+  'AI',
+  'LOG',
+  'APP_EVENT',
+  'WEBSOCKET',
+  'ORM',
+  'ASYNC'
 ]
 const SEVERITIES = ['OK', 'SLOW', 'WARN', 'ERROR']
 const FILTERS_STORAGE_KEY = 'bootui.activity.filters'
@@ -73,19 +92,79 @@ const typeFilter = ref('')
 const severityFilter = ref('')
 const textFilter = ref('')
 const errorsOnly = ref(false)
+// Where the feed comes from: '' leaves it to bootui.activity.feed-source, 'journal' asks for the feed rendered from the
+// runtime journal, which alone can filter by route, request id, and work outside any request, and 'buffers' asks for
+// 1.x's feed merged from the panel buffers (docs/PLAN-v2.md §5.3).
+const feedSource = ref('')
+const routeFilter = ref('')
+const requestIdFilter = ref('')
+const runFilter = ref('')
+const noRequestOnly = ref(false)
+const JOURNAL_SOURCE_LABEL = 'Runtime journal'
+// The journal serves the feed when asked for, or by default when the server's last report came from it.
+const fromJournal = computed(
+  () =>
+    feedSource.value === 'journal' ||
+    (feedSource.value === '' && (report.value?.sources ?? []).includes(JOURNAL_SOURCE_LABEL))
+)
 
 // "Use a database" disclosure: reveals setup documentation (and, when a DataSource is already
 // configured, the "Use the existing datasource" switch action) next to the title. Collapsed by
 // default so the panel never surprises the user with an unsolicited call to action.
 const showDatabaseInfo = ref(false)
+// The runtime journal's status block, opened on demand so the panel makes no extra request on render.
+const showJournal = ref(false)
+// The CPU ledger and resource track, opened on demand like the journal status (docs/PLAN-v2.md §5.11).
+const showResources = ref(false)
 const switchingToDatabase = ref(false)
+const journalStatus = ref(null)
+const journalStatusLoading = ref(false)
+const journalStatusError = ref('')
+let journalStatusToken = 0
+const datasourceSwitchReason = computed(() => {
+  if (journalStatusLoading.value) return 'Checking the runtime journal status before switching.'
+  if (journalStatusError.value) return journalStatusError.value
+  if (!journalStatus.value) return 'The runtime journal status must be checked before switching.'
+  return journalStatus.value.enabled
+    ? ''
+    : 'The runtime journal is disabled. Enable bootui.runtime-journal.enabled to save events to a database.'
+})
+
+async function loadJournalStatus() {
+  const token = ++journalStatusToken
+  journalStatusLoading.value = true
+  journalStatusError.value = ''
+  try {
+    const loaded = await getJson('api/activity/journal')
+    if (typeof loaded?.enabled !== 'boolean') throw new Error('Invalid runtime journal status response')
+    if (disposed || token !== journalStatusToken) return
+    journalStatus.value = loaded
+  } catch (err) {
+    if (disposed || token !== journalStatusToken) return
+    journalStatus.value = null
+    journalStatusError.value = formatLoadError(err, 'Could not verify the runtime journal status')
+  } finally {
+    if (token === journalStatusToken) journalStatusLoading.value = false
+  }
+}
+
+function onJournalStatus(loaded) {
+  journalStatusToken++
+  journalStatusLoading.value = false
+  journalStatus.value = typeof loaded?.enabled === 'boolean' ? loaded : null
+  journalStatusError.value = journalStatus.value ? '' : 'Could not verify the runtime journal status.'
+}
 
 const profile = ref(null)
 const profileLoading = ref(false)
 const profileError = ref(null)
 const profileRequestId = ref(null)
+// The runtime journal's view of the open request, loaded right after its profile (docs/PLAN-v2.md §5.3).
+const journalProfile = ref(null)
 const drawerEl = ref(null)
 const profileOpenerEl = ref(null)
+// Bumped by every profile load and by closing the drawer, so a late response never lands on a different row.
+let profileLoadToken = 0
 // The "Copy for AI" preview of the open profile, or null while the profile itself is shown.
 const aiExport = ref(null)
 
@@ -97,6 +176,26 @@ const aiExport = ref(null)
 const olderEntries = ref([])
 const olderPageInfo = ref(null)
 const loadingOlder = ref(false)
+const activityGeneration = ref(0)
+const headGeneration = ref(-1)
+let headLoadToken = 0
+let disposed = false
+
+function resetOlderPages() {
+  activityGeneration.value++
+  olderEntries.value = []
+  olderPageInfo.value = null
+  loadingOlder.value = false
+}
+
+function invalidateAfterMutation() {
+  activityGeneration.value++
+  loadingOlder.value = false
+}
+
+function backingFeed(report) {
+  return `${report?.pageInfo?.persistent === true}:${(report?.sources ?? []).includes(JOURNAL_SOURCE_LABEL)}`
+}
 
 const {copiedKey, copyToClipboard} = useCopyToClipboard(2000)
 
@@ -129,6 +228,13 @@ function activityUrl(extra = {}) {
     })
     for (const [key, value] of Object.entries(filterParams)) params.set(key, value)
   }
+  if (feedSource.value && !persistent.value) params.set('source', feedSource.value)
+  if (fromJournal.value && !persistent.value) {
+    if (routeFilter.value.trim()) params.set('route', routeFilter.value.trim())
+    if (requestIdFilter.value.trim()) params.set('requestId', requestIdFilter.value.trim())
+    if (runFilter.value.trim()) params.set('run', runFilter.value.trim())
+    if (noRequestOnly.value) params.set('noRequest', 'true')
+  }
   for (const [key, value] of Object.entries(extra)) {
     if (value != null) params.set(key, value)
   }
@@ -136,19 +242,28 @@ function activityUrl(extra = {}) {
   return qs ? `api/activity?${qs}` : 'api/activity'
 }
 
-async function loadActivity() {
+async function loadActivity({propagateError = true} = {}) {
+  if (disposed) return
+  const generation = activityGeneration.value
+  const token = ++headLoadToken
+  const isCurrent = () => !disposed && generation === activityGeneration.value && token === headLoadToken
   try {
     const response = await apiFetch(activityUrl())
     if (!response.ok) {
       throw new Error(`Request failed with status ${response.status}`)
     }
-    report.value = await response.json()
+    const loaded = await response.json()
+    if (!isCurrent()) return
+    if (backingFeed(loaded) !== backingFeed(report.value)) resetOlderPages()
+    report.value = loaded
+    headGeneration.value = activityGeneration.value
     error.value = null
     lastFetched.value = Date.now()
     flowRefreshTick.value += 1
   } catch (err) {
+    if (!isCurrent()) return
     error.value = err.message || 'Could not load activity'
-    throw err
+    if (propagateError) throw err
   }
 }
 
@@ -167,12 +282,18 @@ const {
 // its pageInfo takes over from the live head's, so repeated clicks keep paging further back.
 const effectivePageInfo = computed(() => olderPageInfo.value ?? report.value?.pageInfo ?? null)
 const canLoadOlder = computed(
-  () => persistent.value && !!effectivePageInfo.value?.hasMore && !!effectivePageInfo.value?.nextCursor
+  () =>
+    persistent.value &&
+    headGeneration.value === activityGeneration.value &&
+    !!effectivePageInfo.value?.hasMore &&
+    !!effectivePageInfo.value?.nextCursor
 )
 
 async function loadOlder() {
   const info = effectivePageInfo.value
-  if (!info?.hasMore || !info.nextCursor || loadingOlder.value) return
+  if (!canLoadOlder.value || !info?.hasMore || !info.nextCursor || loadingOlder.value) return
+  const generation = activityGeneration.value
+  const isCurrent = () => !disposed && generation === activityGeneration.value
   loadingOlder.value = true
   try {
     const response = await apiFetch(activityUrl({cursor: info.nextCursor}))
@@ -180,18 +301,21 @@ async function loadOlder() {
       throw new Error(`Request failed with status ${response.status}`)
     }
     const page = await response.json()
+    if (!isCurrent()) return
     olderEntries.value = appendOlderPage(report.value?.entries, olderEntries.value, page.entries)
     olderPageInfo.value = page.pageInfo ?? null
     error.value = null
   } catch (err) {
+    if (!isCurrent()) return
     error.value = err.message || 'Could not load older activity'
   } finally {
-    loadingOlder.value = false
+    if (isCurrent()) loadingOlder.value = false
   }
 }
 
 function toggleDatabaseInfo() {
   showDatabaseInfo.value = !showDatabaseInfo.value
+  if (showDatabaseInfo.value && dataSourceAvailable.value) void loadJournalStatus()
 }
 
 // Hot-switches this running instance from the in-memory buffer to the existing DataSource, gated by
@@ -200,6 +324,10 @@ function toggleDatabaseInfo() {
 async function useExistingDatasource() {
   if (readOnly.value) {
     flash(readOnlyReason.value, 'warning')
+    return
+  }
+  if (datasourceSwitchReason.value) {
+    flash(datasourceSwitchReason.value, 'warning')
     return
   }
   const confirmed = await confirm({
@@ -216,21 +344,28 @@ async function useExistingDatasource() {
   switchingToDatabase.value = true
   clearBanner()
   try {
-    const res = await apiFetch('api/activity/use-existing-datasource', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({confirm: true})
-    })
-    const result = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      flash(result.message || `HTTP ${res.status}`, 'warning')
-      return
-    }
-    flash(result.message || 'Live Activity is now saving to a database.', 'success')
+    const result = await getDiagnosticAcknowledgement(
+      'api/activity/use-existing-datasource',
+      {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({confirm: true})
+      },
+      isDatasourceSwitchAcknowledgement
+    )
+    flash(result.message, 'success')
     showDatabaseInfo.value = false
-    await loadActivity()
+    invalidateAfterMutation()
+    await loadActivity({propagateError: false})
   } catch (err) {
-    flash(formatLoadError(err, 'Could not switch Live Activity to a database'), 'danger')
+    flash(
+      diagnosticActionError(err, 'Could not switch Live Activity to a database'),
+      err instanceof ApiError ? 'warning' : 'danger'
+    )
+    if (!(err instanceof ApiError) || err.status >= 500) {
+      invalidateAfterMutation()
+      await loadActivity({propagateError: false})
+    }
   } finally {
     switchingToDatabase.value = false
   }
@@ -253,6 +388,14 @@ const slowestEndpointLink = computed(() => {
   return k.slowestEndpointRouteId
     ? {path: '/http-exchanges', query: {route: k.slowestEndpointRouteId, rank: 'maxDurationMs'}}
     : {path: '/http-exchanges', query: {q: k.slowestEndpoint}}
+})
+
+// The slowest route's time breakdown in Runtime Insights, when that panel can be opened.
+const panels = inject('panels', ref(null))
+const whySlowLink = computed(() => {
+  const routeId = kpis.value?.slowestEndpointRouteId
+  if (!routeId || !insightsUsable(panels.value)) return null
+  return {path: '/runtime-insights', query: {q: routeId}}
 })
 
 const slowestEndpointTitle = computed(() => {
@@ -314,6 +457,8 @@ const SPARKLINE_BUCKETS = 32
 const SPARKLINE_HEIGHT = 36
 const sparkline = computed(() => bucketEntries(report.value?.entries ?? [], SPARKLINE_BUCKETS))
 const sparklineMax = computed(() => sparkline.value.reduce((max, bucket) => Math.max(max, bucket.count), 0))
+// BootUI actions, availability changes, refreshes, and shutdown, drawn on the same axis to explain a change in traffic.
+const sparkMarkers = computed(() => markerPositions(report.value?.entries ?? []))
 const sparkBars = computed(() => {
   const data = sparkline.value
   const max = sparklineMax.value
@@ -347,8 +492,11 @@ const paused = computed(() => !autoRefresh.value)
 const timingSummary = computed(() => {
   const timing = profile.value?.timing
   if (!timing) return ''
-  let text = `${timing.sqlCount} SQL statement(s), ${formatMillis(timing.sqlMs)} ms in SQL`
-  if (timing.sqlPercent != null) {
+  const sqlAvailable = profileSections(profile.value).SQL?.available !== false
+  let text = sqlAvailable
+    ? `${timing.sqlCount} SQL statement(s), ${formatMillis(timing.sqlMs)} ms in SQL`
+    : 'SQL execution timing unavailable'
+  if (sqlAvailable && timing.sqlPercent != null) {
     text += ` (${timing.sqlPercent}% of request)`
   }
   if (timing.restCallCount) {
@@ -377,9 +525,40 @@ function typeIcon(type) {
       SCHEDULED: 'bi-clock-history',
       MESSAGING: 'bi-diagram-3',
       MAIL: 'bi-envelope',
-      FAULT_TOLERANCE: 'bi-shield-check'
+      FAULT_TOLERANCE: 'bi-shield-check',
+      TRANSACTION: 'bi-arrow-repeat',
+      AI: 'bi-cpu',
+      LOG: 'bi-journal-text',
+      MARKER: 'bi-flag',
+      APP_EVENT: 'bi-broadcast',
+      WEBSOCKET: 'bi-plug',
+      ORM: 'bi-layers',
+      ASYNC: 'bi-signpost-split'
     }[type] || 'bi-dot'
   )
+}
+
+// An ASYNC entry's state (docs/PLAN-v2.md M5-2): a task the BootUI agent propagated from its request to an executor.
+const ENTRY_BADGES = {
+  AFTER_RESPONSE: {
+    label: 'after response',
+    title: 'Still running once the response started',
+    className: 'text-bg-warning'
+  },
+  RUNNING: {label: 'running', title: 'Still running now', className: 'text-bg-info'},
+  CAPPED: {
+    label: 'past deadline',
+    title:
+      'Ended more than bootui.agent.executors.max-handoff after it started: its later work is not attributed to the request',
+    className: 'text-bg-secondary'
+  }
+}
+
+function entryBadges(entry) {
+  return (entry?.badges ?? []).map((badge) => ({
+    id: badge,
+    ...(ENTRY_BADGES[badge] ?? {label: badge, title: badge, className: 'text-bg-light'})
+  }))
 }
 
 function severityBadgeClass(severity) {
@@ -448,37 +627,71 @@ async function openProfile(
   opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
 ) {
   if (!entry.profileable) return
-  await loadProfile(entry.id, opener)
+  await loadProfile(entry.id, opener, entry.type === 'SCHEDULED' || (entry.type === 'MESSAGING' && fromJournal.value))
 }
 
-async function loadProfile(id, opener) {
+async function loadProfile(id, opener, execution = false) {
   profileOpenerEl.value =
     opener?.matches?.('button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])') === true
       ? opener
       : opener?.querySelector?.('.bootui-keyboard-target') || null
   profileRequestId.value = id
+  const token = ++profileLoadToken
+  const isCurrent = () => token === profileLoadToken
   profileLoading.value = true
   profileError.value = null
   profile.value = null
+  journalProfile.value = null
   aiExport.value = null
   try {
-    const response = await apiFetch(`api/activity/request/${encodeURIComponent(id)}`)
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}`)
+    if (!execution) {
+      const response = await apiFetch(`api/activity/request/${encodeURIComponent(id)}`)
+      if (!isCurrent()) return
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`)
+      }
+      const loaded = await response.json()
+      if (!isCurrent()) return
+      profile.value = loaded
     }
-    profile.value = await response.json()
+    await loadJournalProfile(profile.value?.request?.requestId || id, isCurrent)
   } catch (err) {
-    profileError.value = err.message || 'Could not load request profile'
+    if (!isCurrent()) return
+    await loadJournalProfile(id, isCurrent)
+    if (isCurrent() && !journalProfile.value?.available) {
+      profileError.value = err.message || 'Could not load request profile'
+    }
   } finally {
-    profileLoading.value = false
-    focusDrawer()
+    if (isCurrent()) {
+      profileLoading.value = false
+      focusDrawer()
+    }
+  }
+}
+
+async function loadJournalProfile(requestId, isCurrent) {
+  try {
+    const response = await apiFetch(`api/activity/request/${encodeURIComponent(requestId)}/journal`)
+    if (!isCurrent()) return
+    if (!response.ok) throw new Error(`status ${response.status}`)
+    const loaded = await response.json()
+    if (isCurrent()) journalProfile.value = loaded
+  } catch (err) {
+    if (!isCurrent()) return
+    journalProfile.value = {
+      available: false,
+      unavailableReason: `Could not load the runtime journal's record of this request (${err.message}).`
+    }
   }
 }
 
 function closeProfile() {
+  profileLoadToken++
+  profileLoading.value = false
   const opener = profileOpenerEl.value
   profileRequestId.value = null
   profile.value = null
+  journalProfile.value = null
   profileError.value = null
   profileOpenerEl.value = null
   aiExport.value = null
@@ -560,6 +773,7 @@ function restoreFilters() {
   if (saved.severity === '' || SEVERITIES.includes(saved.severity)) severityFilter.value = saved.severity
   if (typeof saved.text === 'string') textFilter.value = saved.text
   if (typeof saved.errorsOnly === 'boolean') errorsOnly.value = saved.errorsOnly
+  if (['', 'journal', 'buffers'].includes(saved.source)) feedSource.value = saved.source
 }
 
 function persistFilters() {
@@ -567,7 +781,8 @@ function persistFilters() {
     type: typeFilter.value,
     severity: severityFilter.value,
     text: textFilter.value,
-    errorsOnly: errorsOnly.value
+    errorsOnly: errorsOnly.value,
+    source: feedSource.value
   })
 }
 
@@ -581,11 +796,24 @@ let filterReloadTimer = null
 watch([typeFilter, severityFilter, textFilter, errorsOnly], () => {
   persistFilters()
   if (!persistent.value) return
-  olderEntries.value = []
-  olderPageInfo.value = null
+  resetOlderPages()
   if (filterReloadTimer) clearTimeout(filterReloadTimer)
   filterReloadTimer = setTimeout(refreshNow, 300)
 })
+
+// The journal's filters run on the server, so changing one reloads the feed.
+watch([feedSource, routeFilter, requestIdFilter, runFilter, noRequestOnly], () => {
+  persistFilters()
+  resetOlderPages()
+  if (filterReloadTimer) clearTimeout(filterReloadTimer)
+  filterReloadTimer = setTimeout(refreshNow, 300)
+})
+
+const hasJournalFilters = computed(
+  () =>
+    fromJournal.value &&
+    (!!routeFilter.value.trim() || !!requestIdFilter.value.trim() || !!runFilter.value.trim() || noRequestOnly.value)
+)
 
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
@@ -597,6 +825,8 @@ onMounted(() => {
   }
 })
 onBeforeUnmount(() => {
+  disposed = true
+  resetOlderPages()
   window.removeEventListener('keydown', onKeydown)
   if (filterReloadTimer) clearTimeout(filterReloadTimer)
 })
@@ -606,6 +836,10 @@ function clearFilters() {
   severityFilter.value = ''
   textFilter.value = ''
   errorsOnly.value = false
+  routeFilter.value = ''
+  requestIdFilter.value = ''
+  runFilter.value = ''
+  noRequestOnly.value = false
 }
 
 function toggleFlow() {
@@ -640,12 +874,43 @@ function toggleFlow() {
           :aria-expanded="showDatabaseInfo"
           @click="toggleDatabaseInfo"
         >
-          <i class="bi bi-database-add me-1"></i>Use a database
+          <i class="bi bi-database-add me-1" aria-hidden="true"></i>Use a database
+        </button>
+        <button
+          v-if="report"
+          type="button"
+          class="btn btn-outline-secondary btn-sm"
+          aria-controls="activity-runtime-journal"
+          :aria-expanded="showJournal"
+          @click="showJournal = !showJournal"
+        >
+          <i class="bi bi-journal-text me-1" aria-hidden="true"></i>Recording
+        </button>
+        <button
+          v-if="report"
+          type="button"
+          class="btn btn-outline-secondary btn-sm"
+          aria-controls="activity-runtime-resources"
+          :aria-expanded="showResources"
+          @click="showResources = !showResources"
+        >
+          <i class="bi bi-cpu me-1" aria-hidden="true"></i>Resources
         </button>
       </template>
     </PanelHeader>
 
     <FlashBanner :message="banner" @dismiss="clearBanner" />
+
+    <RuntimeJournalStatus
+      v-if="showJournal"
+      id="activity-runtime-journal"
+      :read-only="readOnly"
+      :read-only-reason="readOnlyReason"
+      @flash="flash"
+      @loaded="onJournalStatus"
+    />
+
+    <RuntimeResources v-if="showResources" id="activity-runtime-resources" />
 
     <div
       v-if="showDatabaseInfo && report && !persistent"
@@ -664,19 +929,29 @@ function toggleFlow() {
         <template v-if="dataSourceAvailable">
           <p class="mb-2">
             A <code>DataSource</code> is already configured in this application. You can configure a dedicated, second
-            datasource just for Live Activity, or reuse the existing one right now.
+            datasource just for Live Activity, or reuse the existing one while the runtime journal is recording.
           </p>
+          <p v-if="datasourceSwitchReason" class="mb-2" role="note">{{ datasourceSwitchReason }}</p>
           <div class="d-flex flex-wrap align-items-center gap-2">
             <SpinnerButton
               :loading="switchingToDatabase"
-              :disabled="readOnly || switchingToDatabase"
-              :title="readOnly ? readOnlyReason : 'Switch this running instance to the existing datasource'"
+              :disabled="readOnly || switchingToDatabase || Boolean(datasourceSwitchReason)"
+              :title="
+                readOnly
+                  ? readOnlyReason
+                  : datasourceSwitchReason || 'Switch this running instance to the existing datasource'
+              "
               class="btn btn-sm btn-outline-primary"
               icon="bi-database-up"
               label="Use the existing datasource"
               @click="useExistingDatasource"
             />
-            <a :href="PERSISTENCE_DOCS_URL" class="small" rel="noopener noreferrer" target="_blank">
+            <a
+              :href="PERSISTENCE_DOCS_URL"
+              class="btn btn-outline-secondary btn-sm"
+              rel="noopener noreferrer"
+              target="_blank"
+            >
               View setup documentation <i class="bi bi-box-arrow-up-right"></i>
             </a>
           </div>
@@ -687,7 +962,12 @@ function toggleFlow() {
             <code>bootui.activity.persistence.enabled=true</code> (or add a dedicated JDBC URL) to store Live Activity
             durably.
           </p>
-          <a :href="PERSISTENCE_DOCS_URL" class="small" rel="noopener noreferrer" target="_blank">
+          <a
+            :href="PERSISTENCE_DOCS_URL"
+            class="btn btn-outline-secondary btn-sm"
+            rel="noopener noreferrer"
+            target="_blank"
+          >
             View setup documentation <i class="bi bi-box-arrow-up-right"></i>
           </a>
         </template>
@@ -863,6 +1143,11 @@ function toggleFlow() {
           </router-link>
         </div>
       </div>
+      <p v-if="available && whySlowLink" class="small mb-3 activity-why-slow">
+        <router-link :to="whySlowLink" class="btn btn-outline-secondary btn-sm">
+          Why is <code>{{ kpis.slowestEndpointRouteId }}</code> slow? Open its time breakdown in Runtime Insights
+        </router-link>
+      </p>
 
       <section class="activity-flow mb-3" aria-labelledby="activity-flow-title">
         <div class="activity-flow__header">
@@ -920,7 +1205,60 @@ function toggleFlow() {
             <input id="activity-errors-only" v-model="errorsOnly" class="form-check-input" type="checkbox" />
             <label class="form-check-label small" for="activity-errors-only">Errors only</label>
           </div>
-          <button v-if="hasActiveFilters" class="btn btn-sm btn-outline-secondary" type="button" @click="clearFilters">
+          <div v-if="!persistent">
+            <label class="form-label small mb-1" for="activity-feed-source">Recorded by</label>
+            <select id="activity-feed-source" v-model="feedSource" class="form-select form-select-sm">
+              <option value="">Default</option>
+              <option value="journal">Runtime journal</option>
+              <option value="buffers">Panel buffers</option>
+            </select>
+          </div>
+          <p v-if="persistent" class="small text-muted mb-0" role="note">
+            The source, route, request, run, and no-request filters apply to the in-memory feed; persisted history is
+            recorded by the runtime journal and keeps no run or request grouping.
+          </p>
+          <template v-if="fromJournal && !persistent">
+            <div>
+              <label class="form-label small mb-1" for="activity-route-filter">Route</label>
+              <input
+                id="activity-route-filter"
+                v-model="routeFilter"
+                type="search"
+                class="form-control form-control-sm"
+                placeholder="GET /api/orders/{id}"
+              />
+            </div>
+            <div>
+              <label class="form-label small mb-1" for="activity-request-filter">Request id</label>
+              <input
+                id="activity-request-filter"
+                v-model="requestIdFilter"
+                type="search"
+                class="form-control form-control-sm"
+                placeholder="Request id"
+              />
+            </div>
+            <div>
+              <label class="form-label small mb-1" for="activity-run-filter">Run id</label>
+              <input
+                id="activity-run-filter"
+                v-model="runFilter"
+                type="search"
+                class="form-control form-control-sm"
+                placeholder="Run id (see Runtime journal)"
+              />
+            </div>
+            <div class="form-check mb-1">
+              <input id="activity-no-request" v-model="noRequestOnly" class="form-check-input" type="checkbox" />
+              <label class="form-check-label small" for="activity-no-request">No request</label>
+            </div>
+          </template>
+          <button
+            v-if="hasActiveFilters || hasJournalFilters"
+            class="btn btn-sm btn-outline-secondary"
+            type="button"
+            @click="clearFilters"
+          >
             Clear
           </button>
           <div class="ms-auto">
@@ -941,7 +1279,11 @@ function toggleFlow() {
         </div>
 
         <figure v-if="sparkBars.length" class="activity-sparkline mb-3" aria-hidden="true">
-          <figcaption class="text-muted small mb-1">Events over time (red = errors)</figcaption>
+          <figcaption class="text-muted small mb-1">
+            Events over time (red = errors<template v-if="sparkMarkers.length"
+              >, lines = BootUI actions and lifecycle changes</template
+            >)
+          </figcaption>
           <svg viewBox="0 0 100 36" preserveAspectRatio="none" class="w-100 activity-sparkline-svg">
             <g v-for="bar in sparkBars" :key="bar.key">
               <rect :x="bar.x" :y="bar.y" :width="bar.width" :height="bar.height" class="activity-spark-bar">
@@ -956,6 +1298,18 @@ function toggleFlow() {
                 class="activity-spark-error"
               />
             </g>
+            <line
+              v-for="marker in sparkMarkers"
+              :key="marker.key"
+              :x1="marker.x"
+              :x2="marker.x"
+              y1="0"
+              y2="36"
+              class="activity-spark-marker"
+              vector-effect="non-scaling-stroke"
+            >
+              <title>{{ marker.label }}</title>
+            </line>
           </svg>
         </figure>
 
@@ -998,7 +1352,7 @@ function toggleFlow() {
                   <td class="activity-summary-cell">
                     <button
                       v-if="hasChildren(entry)"
-                      class="btn btn-link btn-sm p-0 me-2 align-baseline activity-disclosure"
+                      class="btn btn-outline-secondary btn-sm me-2 align-baseline activity-disclosure"
                       type="button"
                       :aria-expanded="!isCollapsed(entry.id)"
                       :title="isCollapsed(entry.id) ? 'Expand correlated signals' : 'Collapse correlated signals'"
@@ -1030,6 +1384,13 @@ function toggleFlow() {
                       class="badge rounded-pill text-bg-danger ms-2"
                       title="Correlated SQL includes a suspected N+1 query pattern — open the profile for details"
                       >N+1</span
+                    >
+                    <span
+                      v-for="badge in entryBadges(entry)"
+                      :key="badge.id"
+                      :class="['badge', 'rounded-pill', 'ms-2', 'activity-entry-badge', badge.className]"
+                      :title="badge.title"
+                      >{{ badge.label }}</span
                     >
                     <span v-if="entry.detail" class="d-block text-muted small">{{ entry.detail }}</span>
                   </td>
@@ -1072,6 +1433,13 @@ function toggleFlow() {
                   </td>
                   <td class="activity-summary-cell">
                     <span>{{ child.summary }}</span>
+                    <span
+                      v-for="badge in entryBadges(child)"
+                      :key="badge.id"
+                      :class="['badge', 'rounded-pill', 'ms-2', 'activity-entry-badge', badge.className]"
+                      :title="badge.title"
+                      >{{ badge.label }}</span
+                    >
                     <span v-if="child.detail" class="d-block text-muted small">{{ child.detail }}</span>
                   </td>
                   <td class="text-end text-nowrap small">{{ formatDurationMs(child.durationMs) }}</td>
@@ -1088,7 +1456,22 @@ function toggleFlow() {
                 </tr>
               </template>
               <tr v-if="!visibleEntries.length">
-                <td colspan="6" class="text-center text-muted py-4">No activity matches the current filters.</td>
+                <td
+                  v-if="hasActiveFilters || (hasJournalFilters && !persistent)"
+                  colspan="6"
+                  class="text-center text-muted py-4"
+                >
+                  No activity matches the current filters.
+                </td>
+                <td v-else-if="persistent" colspan="6" class="text-center text-muted py-4">
+                  No visible rows on this page. Rows from a disabled panel are hidden<template v-if="canLoadOlder"
+                    >; older history is available below</template
+                  >.
+                </td>
+                <td v-else colspan="6" class="text-center text-muted py-4">
+                  No activity recorded yet. Send a request to the application, and its requests, SQL, exceptions, and
+                  security events appear here.
+                </td>
               </tr>
             </tbody>
           </table>
@@ -1145,8 +1528,39 @@ function toggleFlow() {
             heading="Copy profile for AI"
             @close="closeAiExport"
           />
-          <div v-else-if="profile && !profile.available" class="alert alert-warning">
-            {{ profile.unavailableReason }}
+          <div v-else-if="!profile?.available">
+            <section v-if="journalProfile?.available" class="mb-3">
+              <h3 class="h6">
+                {{
+                  journalProfile.route?.startsWith('Scheduled:') || journalProfile.route?.startsWith('Message:')
+                    ? 'Execution'
+                    : 'Request'
+                }}
+              </h3>
+              <dl class="row small mb-0">
+                <dt class="col-4">Route</dt>
+                <dd class="col-8">
+                  <code>{{ journalProfile.route }}</code>
+                </dd>
+                <template v-if="journalProfile.status != null">
+                  <dt class="col-4">Status</dt>
+                  <dd class="col-8">{{ journalProfile.status }}</dd>
+                </template>
+                <dt class="col-4">Duration</dt>
+                <dd class="col-8">{{ formatDurationMs(journalProfile.durationMicros / 1000) }}</dd>
+              </dl>
+            </section>
+            <p v-if="profile?.unavailableReason && journalProfile?.status != null" class="small text-muted">
+              HTTP-exchange details unavailable: {{ profile.unavailableReason }}
+            </p>
+            <div v-if="profile?.unavailableReason && !journalProfile?.available" class="alert alert-warning">
+              {{ profile.unavailableReason }}
+            </div>
+            <RequestJournalProfile v-if="journalProfile" :profile="journalProfile" />
+            <RequestCodePath
+              :request-id="journalProfile?.requestId || profileRequestId"
+              :route="journalProfile?.route"
+            />
           </div>
           <div v-else-if="profile">
             <section class="mb-3">
@@ -1177,6 +1591,12 @@ function toggleFlow() {
               <h3 class="h6">Timing</h3>
               <p class="small mb-1">{{ timingSummary }}</p>
             </section>
+
+            <RequestJournalProfile v-if="journalProfile" :profile="journalProfile" />
+            <RequestCodePath
+              :request-id="journalProfile?.requestId || profileRequestId"
+              :route="journalProfile?.route"
+            />
 
             <p v-if="profile.approximate" class="alert alert-secondary small py-2 mb-3" role="note">
               <i class="bi bi-info-circle me-1" aria-hidden="true"></i>Parts of this profile are approximate: some
@@ -1277,9 +1697,9 @@ function toggleFlow() {
                 <code>{{ event.type }}</code>
                 <span v-if="event.principal" class="text-muted"> · {{ event.principal }}</span>
                 <span
-                  v-if="event.threadMatched"
+                  v-if="securityEventExact(sections.SECURITY, event, index)"
                   class="badge text-bg-success ms-1"
-                  title="Correlated exactly by the request's serving thread"
+                  title="Correlated exactly by the request's serving thread or its BootUI request id"
                 >
                   exact
                 </span>
@@ -1414,7 +1834,8 @@ function toggleFlow() {
   z-index: 1050;
 }
 
-.activity-drawer {
+.activity-drawer.card {
+  background: var(--bootui-surface-solid);
   width: min(560px, 100%);
   height: 100%;
   border-radius: 0;
@@ -1475,17 +1896,6 @@ function toggleFlow() {
   overflow-wrap: anywhere;
   word-break: break-word;
   white-space: normal;
-}
-
-.activity-disclosure {
-  color: var(--bs-secondary-color);
-  text-decoration: none;
-  line-height: 1;
-}
-
-.activity-disclosure:hover,
-.activity-disclosure:focus-visible {
-  color: var(--bs-primary);
 }
 
 .activity-child-row > td {
@@ -1560,6 +1970,11 @@ function toggleFlow() {
 
 .activity-spark-error {
   fill: var(--bs-danger, #dc3545);
+}
+.activity-spark-marker {
+  stroke: var(--bootui-text-muted);
+  stroke-width: 1px;
+  stroke-dasharray: 3 2;
 }
 @media (prefers-reduced-motion: reduce) {
   .activity-kpi-link {

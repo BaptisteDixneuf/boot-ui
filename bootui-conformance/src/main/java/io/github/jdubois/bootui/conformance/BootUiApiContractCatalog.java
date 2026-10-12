@@ -28,7 +28,8 @@ public final class BootUiApiContractCatalog {
                             "frameworkVersion", JsonType.NULLABLE_STRING,
                             "javaVersion", JsonType.STRING,
                             "activeProfiles", JsonType.ARRAY,
-                            "activation", JsonType.OBJECT)),
+                            "activation", JsonType.OBJECT,
+                            "run", JsonType.OBJECT)),
             read(
                     "health",
                     "/health",
@@ -111,7 +112,7 @@ public final class BootUiApiContractCatalog {
             inventory("data", "/data/repositories", "springDataPresent", "repositories"),
             inventory("flyway", "/flyway/migrations", "flywayPresent", "databases"),
             inventory("liquibase", "/liquibase/changesets", "liquibasePresent", "databases"),
-            inventory("database-connection-pools", "/database-connection-pools/pools", "hikariPresent", "pools"),
+            inventory("database-connection-pools", "/database-connection-pools/pools", "poolLibraryPresent", "pools"),
             locatedAdvisor("hibernate", "/hibernate", "results"),
             advisor("database-advisor", "/database-advisor", "results"),
             // A runtime view, not an advisor: no severities, no findings, no score. The contract is the
@@ -192,6 +193,9 @@ public final class BootUiApiContractCatalog {
                     "/ai/overview",
                     fields(
                             "enabled", JsonType.BOOLEAN,
+                            "springAiDetected", JsonType.BOOLEAN,
+                            "langChain4jDetected", JsonType.BOOLEAN,
+                            "aiFrameworkDetected", JsonType.BOOLEAN,
                             "totalChats", JsonType.INTEGER,
                             "tokensByModel", JsonType.OBJECT,
                             "callsByModel", JsonType.OBJECT,
@@ -205,7 +209,13 @@ public final class BootUiApiContractCatalog {
                             "capacity", JsonType.INTEGER,
                             "traces", JsonType.ARRAY)),
             array("log-tail", "/log-tail/recent"),
-            capabilityList("exceptions", "/exceptions", "groups", "totalExceptions", Map.of()),
+            capabilityList(
+                    "exceptions",
+                    "/exceptions",
+                    "groups",
+                    "totalExceptions",
+                    // Caught in application code (PLAN-v2 M5-6): null without the agent's caught-exceptions sensor.
+                    fields("caughtInCode", JsonType.NULLABLE_OBJECT)),
             pagedList(
                     "http-exchanges",
                     "/http-exchanges",
@@ -227,7 +237,9 @@ public final class BootUiApiContractCatalog {
                             "vulnerable", JsonType.INTEGER,
                             "severityCounts", JsonType.ARRAY,
                             "scan", JsonType.OBJECT,
-                            "dependencies", JsonType.ARRAY)),
+                            "dependencies", JsonType.ARRAY,
+                            // Runtime reach (PLAN-v2 §5.15): unavailable, with why, without the agent.
+                            "runtimeReach", JsonType.NULLABLE_OBJECT)),
             read(
                     "dev-services",
                     "/dev-services",
@@ -276,6 +288,10 @@ public final class BootUiApiContractCatalog {
                             "configuredMode", JsonType.STRING,
                             "overridden", JsonType.BOOLEAN,
                             "endpoint", JsonType.STRING,
+                            "supportedProtocolVersions", JsonType.ARRAY,
+                            "timeouts", JsonType.INTEGER,
+                            "cancellations", JsonType.INTEGER,
+                            "progressDropped", JsonType.INTEGER,
                             "toolCount", JsonType.INTEGER,
                             "tools", JsonType.ARRAY)),
             read(
@@ -301,6 +317,77 @@ public final class BootUiApiContractCatalog {
                             "warnings", JsonType.ARRAY,
                             "pageInfo", JsonType.NULLABLE_OBJECT,
                             "persistenceOption", JsonType.NULLABLE_OBJECT)),
+            read(
+                    "runtime-insights",
+                    "/runtime-insights",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "window", JsonType.NULLABLE_OBJECT,
+                            "coverage", JsonType.ARRAY,
+                            "checks", JsonType.ARRAY,
+                            "observations", JsonType.ARRAY,
+                            "limitations", JsonType.ARRAY,
+                            "notExercised", JsonType.ARRAY,
+                            "notExercisedOmitted", JsonType.INTEGER)),
+            read(
+                    "java-agent",
+                    "/java-agent",
+                    fields(
+                            "state", JsonType.STRING,
+                            "reason", JsonType.NULLABLE_STRING,
+                            "agentVersion", JsonType.NULLABLE_STRING,
+                            "bootUiVersion", JsonType.STRING,
+                            "protocol", JsonType.NULLABLE_INTEGER,
+                            "expectedProtocol", JsonType.INTEGER,
+                            "jdk", JsonType.STRING,
+                            "loadMode", JsonType.NULLABLE_STRING,
+                            "jarPath", JsonType.NULLABLE_STRING,
+                            "startupMicros", JsonType.NULLABLE_INTEGER,
+                            "claim", JsonType.NULLABLE_OBJECT,
+                            "heldBy", JsonType.NULLABLE_STRING,
+                            "sensors", JsonType.ARRAY,
+                            "toggles", JsonType.ARRAY,
+                            "retransformation", JsonType.NULLABLE_OBJECT,
+                            "counters", JsonType.NULLABLE_OBJECT,
+                            "messages", JsonType.ARRAY,
+                            "warnings", JsonType.ARRAY,
+                            "setup", JsonType.OBJECT,
+                            "setup.jarPath", JsonType.STRING,
+                            "setup.jarFound", JsonType.BOOLEAN,
+                            "setup.buildTool", JsonType.STRING,
+                            "setup.snippets", JsonType.ARRAY)),
+            read(
+                    "code-inventory",
+                    "/code-inventory",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "run", JsonType.NULLABLE_OBJECT,
+                            "scan", JsonType.NULLABLE_OBJECT,
+                            "methods", JsonType.NULLABLE_OBJECT,
+                            "changes", JsonType.NULLABLE_OBJECT,
+                            "dependencies", JsonType.NULLABLE_OBJECT,
+                            "limitations", JsonType.ARRAY,
+                            "recordingClearedAt", JsonType.NULLABLE_INTEGER)),
+            read(
+                    "code-paths",
+                    "/code-paths",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "status", JsonType.NULLABLE_OBJECT,
+                            "routes", JsonType.ARRAY,
+                            "excludedMethods", JsonType.ARRAY,
+                            "limitations", JsonType.ARRAY)),
+            read(
+                    "side-effects",
+                    "/side-effects",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "sensors", JsonType.ARRAY,
+                            "limitations", JsonType.ARRAY)),
             capabilityList("email", "/email", "messages", "total", fields("devTrapEnabled", JsonType.BOOLEAN)),
             capture("kafka", "/kafka", "messages"),
             capture("rabbitmq", "/rabbitmq", "messages"),
@@ -361,6 +448,308 @@ public final class BootUiApiContractCatalog {
                     "correlationTiers", JsonType.ARRAY,
                     "approximate", JsonType.BOOLEAN));
 
+    /**
+     * The runtime journal's status block, a detail read of the {@code activity} panel ({@code docs/PLAN-v2.md} §5.2),
+     * kept out of {@link #reads()} like {@link #requestProfile()}. {@code oldestRetainedAt} is a nullable number, so it
+     * is not listed.
+     */
+    private static final ReadContract RUNTIME_JOURNAL = read(
+            "activity",
+            "/activity/journal",
+            fields(
+                    "enabled", JsonType.BOOLEAN,
+                    "runId", JsonType.NULLABLE_STRING,
+                    "retainedEvents", JsonType.INTEGER,
+                    "retainedBytes", JsonType.INTEGER,
+                    "maxEvents", JsonType.INTEGER,
+                    "maxBytes", JsonType.INTEGER,
+                    "reservedEvents", JsonType.INTEGER,
+                    "reservedCapacity", JsonType.INTEGER,
+                    "evictedEvents", JsonType.INTEGER,
+                    "bindingBound", JsonType.NULLABLE_STRING,
+                    "queueDepth", JsonType.INTEGER,
+                    "queueCapacity", JsonType.INTEGER,
+                    "recorded", JsonType.OBJECT,
+                    "dropped", JsonType.OBJECT,
+                    "droppedEvents", JsonType.INTEGER,
+                    "previousRuns", JsonType.ARRAY,
+                    "previousRunsUnavailable", JsonType.NULLABLE_STRING,
+                    "agentEvidence", JsonType.NULLABLE_OBJECT));
+
+    /**
+     * The run's resource track and CPU ledger, a detail read of the {@code activity} panel ({@code docs/PLAN-v2.md}
+     * §5.11), kept out of {@link #reads()} like {@link #runtimeJournal()}.
+     */
+    private static final ReadContract RUNTIME_RESOURCES = read(
+            "activity",
+            "/activity/resources",
+            fields(
+                    "available", JsonType.BOOLEAN,
+                    "unavailableReason", JsonType.NULLABLE_STRING,
+                    "families", JsonType.ARRAY,
+                    "points", JsonType.ARRAY,
+                    "totals", JsonType.OBJECT));
+
+    /**
+     * Code Inventory's paged lists ({@code docs/PLAN-v2.md} §5.15), reads of the {@code code-inventory} panel kept out
+     * of {@link #reads()}: each answers the same shape with or without the BootUI agent, {@code available: false} and
+     * empty without it.
+     */
+    private static final List<ReadContract> CODE_INVENTORY_LISTS = List.of(
+            read(
+                    "code-inventory",
+                    "/code-inventory/changes",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "counts", JsonType.NULLABLE_OBJECT,
+                            "changes", JsonType.ARRAY,
+                            "page", JsonType.OBJECT)),
+            read(
+                    "code-inventory",
+                    "/code-inventory/methods?status=never-executed",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "packages", JsonType.ARRAY,
+                            "classes", JsonType.ARRAY,
+                            "methods", JsonType.ARRAY,
+                            "page", JsonType.OBJECT)),
+            read(
+                    "code-inventory",
+                    "/code-inventory/dependencies",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "counts", JsonType.NULLABLE_OBJECT,
+                            "dependencies", JsonType.ARRAY,
+                            "page", JsonType.OBJECT)));
+
+    /**
+     * The Exceptions panel's <b>Caught in application code</b> section ({@code docs/PLAN-v2.md} M5-6), a read of the
+     * {@code exceptions} panel kept out of {@link #reads()}: it answers the same shape with or without the BootUI agent,
+     * {@code available: false} and no rows without it.
+     */
+    private static final ReadContract CAUGHT_EXCEPTIONS = read(
+            "exceptions",
+            "/exceptions/caught",
+            fields(
+                    "available", JsonType.BOOLEAN,
+                    "unavailableReason", JsonType.NULLABLE_STRING,
+                    "limitations", JsonType.ARRAY,
+                    "settling", JsonType.INTEGER,
+                    "occurrences", JsonType.INTEGER,
+                    "findings", JsonType.INTEGER,
+                    "rows", JsonType.ARRAY));
+
+    /**
+     * One Side Effects sensor's rows ({@code docs/PLAN-v2.md} §5.16), a read of the {@code side-effects} panel kept out of
+     * {@link #reads()}: it answers the same shape with or without the BootUI agent, {@code available: false} and no rows
+     * without it.
+     */
+    private static final ReadContract SIDE_EFFECTS_SENSOR = read(
+            "side-effects",
+            "/side-effects/sensor?sensor=processes",
+            fields(
+                    "available", JsonType.BOOLEAN,
+                    "unavailableReason", JsonType.NULLABLE_STRING,
+                    "sensor", JsonType.OBJECT,
+                    "sensor.id", JsonType.STRING,
+                    "sensor.state", JsonType.STRING,
+                    "rows", JsonType.ARRAY,
+                    "page", JsonType.OBJECT,
+                    "limitations", JsonType.ARRAY));
+
+    /**
+     * Code Paths' tree reads, Beans at runtime, and method probes ({@code docs/PLAN-v2.md} §5.14), reads of the
+     * {@code code-paths} panel kept out of {@link #reads()}: each answers the same shape with or without the BootUI agent, {@code available:
+     * false} and empty without it, and {@code found: false} for a route or request this run has no tree for.
+     */
+    private static final List<ReadContract> CODE_PATHS_TREES = List.of(
+            read(
+                    "code-paths",
+                    "/code-paths/route?route=GET%20%2Fnot-a-route",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "route", JsonType.NULLABLE_STRING,
+                            "found", JsonType.BOOLEAN,
+                            "assemblyOnly", JsonType.BOOLEAN,
+                            "warmRequests", JsonType.NUMBER,
+                            "firstRequestMillis", JsonType.NULLABLE_NUMBER,
+                            "firstRequestId", JsonType.NULLABLE_STRING,
+                            "ownMillis", JsonType.NUMBER,
+                            "handlerMillis", JsonType.NULLABLE_NUMBER,
+                            "shareOf", JsonType.STRING,
+                            "depth", JsonType.NUMBER,
+                            "nodes", JsonType.ARRAY,
+                            "methods", JsonType.ARRAY,
+                            "exemplarRequestIds", JsonType.ARRAY,
+                            "page", JsonType.OBJECT,
+                            "limitations", JsonType.ARRAY)),
+            read(
+                    "code-paths",
+                    "/code-paths/requests/0000000000000000",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "requestId", JsonType.NULLABLE_STRING,
+                            "found", JsonType.BOOLEAN,
+                            "route", JsonType.NULLABLE_STRING,
+                            "assemblyOnly", JsonType.BOOLEAN,
+                            "ownMillis", JsonType.NUMBER,
+                            "asyncMillis", JsonType.NUMBER,
+                            "cut", JsonType.BOOLEAN,
+                            "droppedCalls", JsonType.NUMBER,
+                            "nodes", JsonType.ARRAY,
+                            "topMethods", JsonType.ARRAY,
+                            "limitations", JsonType.ARRAY)),
+            read(
+                    "code-paths",
+                    "/code-paths/beans",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "beansAvailable", JsonType.BOOLEAN,
+                            "edges", JsonType.ARRAY,
+                            "observedEdges", JsonType.NUMBER,
+                            "declaredEdges", JsonType.NUMBER,
+                            "notCalled", JsonType.NUMBER,
+                            "omitted", JsonType.NUMBER,
+                            "limitations", JsonType.ARRAY)),
+            read(
+                    "code-paths",
+                    "/code-paths/probes",
+                    fields(
+                            "available", JsonType.BOOLEAN,
+                            "unavailableReason", JsonType.NULLABLE_STRING,
+                            "maxActive", JsonType.NUMBER,
+                            "maxInvocations", JsonType.NUMBER,
+                            "windowSeconds", JsonType.NUMBER,
+                            "probes", JsonType.ARRAY,
+                            "limitations", JsonType.ARRAY,
+                            "shapesAvailable", JsonType.BOOLEAN,
+                            "shapesUnavailableReason", JsonType.NULLABLE_STRING)));
+
+    /**
+     * One Runtime Insights observation with its evidence, a detail read of the {@code runtime-insights} panel
+     * ({@code docs/PLAN-v2.md} §5.5), kept out of {@link #reads()}. An unknown id answers the same shape, unavailable.
+     */
+    private static final ReadContract RUNTIME_INSIGHT = read(
+            "runtime-insights",
+            "/runtime-insights/insights/conformance-unknown:0000000000",
+            fields(
+                    "available", JsonType.BOOLEAN,
+                    "unavailableReason", JsonType.NULLABLE_STRING,
+                    "observation", JsonType.NULLABLE_OBJECT,
+                    "columns", JsonType.ARRAY,
+                    "rows", JsonType.ARRAY,
+                    "truncated", JsonType.INTEGER));
+
+    /**
+     * The current run compared with a kept run, a read of the {@code runtime-insights} panel ({@code docs/PLAN-v2.md}
+     * §5.8), kept out of {@link #reads()} like {@link #runtimeInsight()}. Its run and restart-cost objects are nullable
+     * when no run is kept or the journal is off.
+     */
+    private static final ReadContract RUN_COMPARISON = read(
+            "runtime-insights",
+            "/runtime-insights/comparison",
+            fields(
+                    "status", JsonType.STRING,
+                    "reason", JsonType.NULLABLE_STRING,
+                    "current", JsonType.NULLABLE_OBJECT,
+                    "previous", JsonType.NULLABLE_OBJECT,
+                    "runs", JsonType.ARRAY,
+                    "notComparableReasons", JsonType.ARRAY,
+                    "behavior", JsonType.ARRAY,
+                    "edges", JsonType.ARRAY,
+                    "restartCost", JsonType.OBJECT,
+                    "latency", JsonType.ARRAY,
+                    "limitations", JsonType.ARRAY,
+                    "codeChanges", JsonType.NULLABLE_OBJECT,
+                    "sideEffects", JsonType.NULLABLE_OBJECT));
+
+    /**
+     * The <b>Profile resources</b> session's state, a read of the {@code runtime-insights} panel ({@code docs/PLAN-v2.md}
+     * §5.11) kept out of {@link #reads()}: reading it starts nothing, and it answers the same shape whether no session
+     * ran, one runs, or JFR is unavailable. Its nullable times are not listed.
+     */
+    private static final ReadContract RESOURCE_PROFILE = read(
+            "runtime-insights",
+            "/runtime-insights/resource-profile",
+            fields(
+                    "state", JsonType.STRING,
+                    "reason", JsonType.NULLABLE_STRING,
+                    "sampler", JsonType.NULLABLE_STRING,
+                    "maxDurationSeconds", JsonType.INTEGER,
+                    "cpuSamples", JsonType.INTEGER,
+                    "outsideSamples", JsonType.INTEGER,
+                    "requests", JsonType.INTEGER,
+                    "routes", JsonType.ARRAY,
+                    "routesOmitted", JsonType.INTEGER,
+                    "limitations", JsonType.ARRAY));
+
+    /**
+     * What a change to one symbol reaches, a read of the {@code runtime-insights} panel ({@code docs/PLAN-v2.md} §5.7),
+     * kept out of {@link #reads()}: an unknown symbol answers the same shape, not found or unavailable.
+     */
+    private static final ReadContract CHANGE_IMPACT = read(
+            "runtime-insights",
+            "/runtime-insights/impact?symbol=conformanceUnknownSymbol",
+            fields(
+                    "status", JsonType.STRING,
+                    "reason", JsonType.NULLABLE_STRING,
+                    "symbol", JsonType.STRING,
+                    "node", JsonType.NULLABLE_STRING,
+                    "candidates", JsonType.ARRAY,
+                    "structuralReach", JsonType.INTEGER,
+                    "observed", JsonType.ARRAY,
+                    "observedTotal", JsonType.INTEGER,
+                    "notExercised", JsonType.ARRAY,
+                    "notExercisedTotal", JsonType.INTEGER,
+                    "notExercisedUndetermined", JsonType.BOOLEAN,
+                    "sharedResources", JsonType.ARRAY,
+                    "sharedResourcesTotal", JsonType.INTEGER,
+                    "limitations", JsonType.ARRAY,
+                    "observedFrom", JsonType.NULLABLE_STRING,
+                    "methods", JsonType.ARRAY,
+                    "methodStatus", JsonType.NULLABLE_STRING,
+                    "notObserved", JsonType.ARRAY,
+                    "notObservedTotal", JsonType.INTEGER,
+                    "next", JsonType.ARRAY));
+
+    /**
+     * The symbols change impact can check that match what was typed, a read of the {@code runtime-insights} panel
+     * ({@code docs/PLAN-v2.md} §5.7) kept out of {@link #reads()}: a query nothing matches answers the same shape.
+     */
+    private static final ReadContract CHANGE_IMPACT_SYMBOLS = read(
+            "runtime-insights",
+            "/runtime-insights/impact/symbols?query=conformanceUnknownSymbol",
+            fields(
+                    "available", JsonType.BOOLEAN,
+                    "unavailableReason", JsonType.NULLABLE_STRING,
+                    "query", JsonType.STRING,
+                    "symbols", JsonType.ARRAY,
+                    "total", JsonType.INTEGER));
+
+    /**
+     * One request as the runtime journal recorded it, a detail read of the {@code activity} panel ({@code docs/PLAN-v2.md}
+     * §5.3, §5.11), kept out of {@link #reads()} like {@link #requestProfile()}. Its nullable objects and numbers are
+     * not listed.
+     */
+    private static final ReadContract REQUEST_JOURNAL_PROFILE = read(
+            "activity",
+            "/activity/request/conformance-unknown-request/journal",
+            fields(
+                    "available", JsonType.BOOLEAN,
+                    "unavailableReason", JsonType.NULLABLE_STRING,
+                    "requestId", JsonType.NULLABLE_STRING,
+                    "route", JsonType.NULLABLE_STRING,
+                    "timeline", JsonType.ARRAY,
+                    "gcPauses", JsonType.ARRAY,
+                    "touched", JsonType.OBJECT,
+                    "notes", JsonType.ARRAY));
+
     private static final List<ActionContract> ACTIONS = buildActions();
 
     private BootUiApiContractCatalog() {}
@@ -380,6 +769,66 @@ public final class BootUiApiContractCatalog {
         return REQUEST_PROFILE;
     }
 
+    /** The runtime journal's status block, a detail read of the {@code activity} panel. */
+    public static ReadContract runtimeJournal() {
+        return RUNTIME_JOURNAL;
+    }
+
+    /** The journal request profile's read contract ({@code docs/PLAN-v2.md} §5.3, §5.11). */
+    public static ReadContract requestJournalProfile() {
+        return REQUEST_JOURNAL_PROFILE;
+    }
+
+    /** The Exceptions panel's caught-in-code read contract ({@code docs/PLAN-v2.md} M5-6). */
+    public static ReadContract caughtExceptions() {
+        return CAUGHT_EXCEPTIONS;
+    }
+
+    /** One Side Effects sensor's rows' read contract ({@code docs/PLAN-v2.md} §5.16). */
+    public static ReadContract sideEffectsSensor() {
+        return SIDE_EFFECTS_SENSOR;
+    }
+
+    /** Code Paths' tree reads' contracts ({@code docs/PLAN-v2.md} §5.14). */
+    public static List<ReadContract> codePathsTrees() {
+        return CODE_PATHS_TREES;
+    }
+
+    /** Code Inventory's paged lists' read contracts ({@code docs/PLAN-v2.md} §5.15). */
+    public static List<ReadContract> codeInventoryLists() {
+        return CODE_INVENTORY_LISTS;
+    }
+
+    /** The resource track's read contract ({@code docs/PLAN-v2.md} §5.11). */
+    public static ReadContract runtimeResources() {
+        return RUNTIME_RESOURCES;
+    }
+
+    /** One Runtime Insights observation's evidence, a detail read of its panel ({@code docs/PLAN-v2.md} §5.5). */
+    public static ReadContract runtimeInsight() {
+        return RUNTIME_INSIGHT;
+    }
+
+    /** The change impact's read contract ({@code docs/PLAN-v2.md} §5.7). */
+    public static ReadContract changeImpact() {
+        return CHANGE_IMPACT;
+    }
+
+    /** The change impact's symbol suggestions' read contract ({@code docs/PLAN-v2.md} §5.7). */
+    public static ReadContract changeImpactSymbols() {
+        return CHANGE_IMPACT_SYMBOLS;
+    }
+
+    /** The <b>Profile resources</b> session's read contract ({@code docs/PLAN-v2.md} §5.11). */
+    public static ReadContract resourceProfile() {
+        return RESOURCE_PROFILE;
+    }
+
+    /** The run comparison's read contract ({@code docs/PLAN-v2.md} §5.8). */
+    public static ReadContract runComparison() {
+        return RUN_COMPARISON;
+    }
+
     public static List<ActionContract> actions() {
         return ACTIONS;
     }
@@ -396,11 +845,24 @@ public final class BootUiApiContractCatalog {
         springMvc(actions, "http-sessions.clear", "http-sessions", "POST", "/http-sessions/session-key/clear");
         springMvc(
                 actions, "http-sessions.invalidate", "http-sessions", "POST", "/http-sessions/session-key/invalidate");
+        all(actions, "live-memory.offload", "live-memory", "POST", "/live-memory/offload");
         all(actions, "heap-dump.capture", "heap-dump", "POST", "/heap-dump/capture");
         all(actions, "heap-dump.analyze", "heap-dump", "POST", "/heap-dump/analyze");
         all(actions, "heap-dump.delete", "heap-dump", "POST", "/heap-dump/delete");
         all(actions, "threads.download", "threads", "POST", "/threads/download");
         all(actions, "memory.scan", "memory", "POST", "/memory/scan");
+        all(
+                actions,
+                "runtime-insights.resource-profile",
+                "runtime-insights",
+                "POST",
+                "/runtime-insights/resource-profile");
+        all(
+                actions,
+                "runtime-insights.resource-profile.stop",
+                "runtime-insights",
+                "POST",
+                "/runtime-insights/resource-profile/stop");
         spring(actions, "graalvm.scan.cancel", "graalvm", "POST", "/graalvm/scan/cancel");
         spring(actions, "graalvm.scan", "graalvm", "POST", "/graalvm/scan");
         spring(actions, "graalvm.install", "graalvm", "POST", "/graalvm/install");
@@ -420,6 +882,10 @@ public final class BootUiApiContractCatalog {
         all(actions, "traces.clear", "traces", "DELETE", "/traces");
         all(actions, "exceptions.clear", "exceptions", "DELETE", "/exceptions");
         all(actions, "exceptions.status", "exceptions", "POST", "/exceptions/conformance-unknown-fingerprint/status");
+        all(actions, "code-paths.probe.start", "code-paths", "POST", "/code-paths/probes");
+        all(actions, "code-paths.probe.stop", "code-paths", "POST", "/code-paths/probes/0/stop");
+        all(actions, "code-paths.probe.delete", "code-paths", "DELETE", "/code-paths/probes/0");
+        all(actions, "java-agent.sensor.switch", "java-agent", "POST", "/java-agent/sensors/environment");
         all(actions, "http-probe.execute", "http-probe", "POST", "/http-probe");
         all(actions, "architecture.scan", "architecture", "POST", "/architecture/scan");
         all(actions, "vulnerabilities.scan", "vulnerabilities", "POST", "/vulnerabilities/scan");
@@ -445,6 +911,7 @@ public final class BootUiApiContractCatalog {
         all(actions, "rest-client-trace.recording", "rest-client-trace", "POST", "/rest-client-trace/recording");
         all(actions, "mcp-server.toggle", "mcp-server", "POST", "/mcp-server/toggle");
         all(actions, "activity.use-existing-datasource", "activity", "POST", "/activity/use-existing-datasource");
+        all(actions, "activity.clear-recording", "activity", "POST", "/activity/journal/clear");
         all(actions, "email.clear", "email", "DELETE", "/email");
         all(actions, "kafka.clear", "kafka", "DELETE", "/kafka");
         all(actions, "rabbitmq.clear", "rabbitmq", "DELETE", "/rabbitmq");
@@ -657,7 +1124,9 @@ public final class BootUiApiContractCatalog {
         ARRAY,
         OBJECT,
         NULLABLE_STRING,
-        NULLABLE_OBJECT
+        NULLABLE_OBJECT,
+        NULLABLE_INTEGER,
+        NULLABLE_NUMBER
     }
 
     public record ReadContract(

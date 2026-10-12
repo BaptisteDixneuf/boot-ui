@@ -133,6 +133,28 @@ export function bucketEntries(entries, bucketCount = 24) {
 }
 
 /**
+ * Where each control or availability marker (a MARKER entry: a BootUI action, an availability change, a configuration
+ * refresh, or shutdown) falls on the same time axis as {@link bucketEntries}, in percent of its width.
+ */
+export function markerPositions(entries) {
+  const list = (entries || []).filter((entry) => typeof entry.timestamp === 'number')
+  const markers = list.filter((entry) => entry.type === 'MARKER')
+  if (!markers.length) return []
+  let min = Infinity
+  let max = -Infinity
+  for (const entry of list) {
+    if (entry.timestamp < min) min = entry.timestamp
+    if (entry.timestamp > max) max = entry.timestamp
+  }
+  const span = max - min
+  return markers.map((entry) => ({
+    key: entry.id,
+    x: span <= 0 ? 100 : ((entry.timestamp - min) / span) * 100,
+    label: entry.detail ? `${entry.summary}: ${entry.detail}` : entry.summary
+  }))
+}
+
+/**
  * Build a deep link from a merged stream entry to the dedicated panel that owns that signal, so the
  * Live Activity view is a launchpad rather than a dead end. Most link types prefill the target panel's
  * free-text filter (read from {@code ?q=}) to surface the originating record; {@code MAIL} instead links
@@ -145,6 +167,9 @@ export function bucketEntries(entries, bucketCount = 24) {
  * @param {object} entry a merged activity entry
  * @returns {{path: string, query?: object, label: string}|null}
  */
+// A runtime journal event id: the run id, then the event's sequence in that run.
+const JOURNAL_EVENT_ID = /^[0-9a-f]{8}-\d+$/
+
 export function deepLink(entry) {
   if (!entry) return null
   switch (entry.type) {
@@ -167,6 +192,8 @@ export function deepLink(entry) {
     case 'CACHE':
       return {path: '/cache', label: 'Open in Cache'}
     case 'MAIL':
+      // A row from the runtime journal carries no Email panel id, so it opens the panel itself.
+      if (JOURNAL_EVENT_ID.test(entry.id || '')) return {path: '/email', label: 'Open in Email'}
       return entry.id ? {path: '/email', query: {id: entry.id}, label: 'Open in Email'} : null
     case 'FAULT_TOLERANCE': {
       const needle = faultToleranceNeedle(entry.summary)
@@ -174,12 +201,23 @@ export function deepLink(entry) {
         ? {path: '/fault-tolerance', query: {q: needle}, label: 'Open in Fault Tolerance'}
         : {path: '/fault-tolerance', label: 'Open in Fault Tolerance'}
     }
+    case 'TRANSACTION':
+      return {path: '/transactions', label: 'Open in Transactions'}
+    case 'LOG':
+      return {path: '/log-tail', label: 'Open in Log Tail'}
+    case 'AI':
+      return {path: '/ai', label: 'Open in AI Framework'}
+    case 'WEBSOCKET':
+      return {path: '/websockets', label: 'Open in WebSockets'}
+    case 'ORM':
+      return {path: '/hibernate-statistics', label: 'Open in Hibernate Statistics'}
     case 'MESSAGING': {
-      if ((entry.id || '').startsWith('jms-')) {
+      // Rows rendered from the runtime journal name their broker in the detail line instead of an id prefix.
+      if ((entry.id || '').startsWith('jms-') || entry.detail === 'jms') {
         const needle = jmsNeedle(entry.summary)
         return needle ? {path: '/jms', query: {q: needle}, label: 'Open in JMS'} : {path: '/jms', label: 'Open in JMS'}
       }
-      if ((entry.id || '').startsWith('rabbit-')) {
+      if ((entry.id || '').startsWith('rabbit-') || entry.detail === 'rabbitmq') {
         const needle = rabbitNeedle(entry)
         return needle
           ? {path: '/rabbitmq', query: {q: needle}, label: 'Open in RabbitMQ'}

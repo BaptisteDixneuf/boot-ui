@@ -1,0 +1,171 @@
+# Known limitations of BootUI 2.0
+
+BootUI 2.0 adds exact correlation, the runtime journal, Runtime Insights, the change loop, and the optional BootUI Java
+agent. This page lists what the delivered code does not do, or does only in part, so you can tell a gap from a healthy
+result. Unavailable panels, checks, and measurements report their reason; an empty result is not proof of complete
+coverage or safety.
+
+Items marked **deferred** are not implemented in the current code. They are not promises for a later release.
+
+## Runtime Insights
+
+- **Several kinds are not listed by default.** `route-time-breakdown`, `exception-hotspots`,
+  `connections-per-request`, and `ai-usage-by-route` are reached from the panels that show the same evidence;
+  `repeated-selects`, `lazy-sql-after-handler`, `split-transaction-writes`, `framework-warnings-by-route`, and
+  `anonymous-data-reach` only with **Show all routes**, a search, or an agent query naming them. Every row stays
+  reachable, and any row is a fact to verify against the code before acting on it.
+- **Side Effects rows stay in their own panel**, not a dedicated Runtime Insights observation kind. Their keys also
+  feed run comparison. Runtime Insights does use other agent evidence, such as `changed-code-not-executed`,
+  `work-after-response`, and synchronous handler timing.
+- **Kafka Streams processing is not recorded** on any stack. Producer sends and listener executions are. Runtime
+  Insights names this first among its limitations whenever Kafka Streams is on the classpath, as it does R2DBC.
+- **Non-JDBC data stores are not recorded** on any stack: Redis, MongoDB, and similar commands do not enter the journal,
+  so `repeated-selects` and the runtime model do not cover them.
+- **Many narrower observations are deferred** until after 2.0, such as retry amplification, cache effectiveness, pool
+  pressure by route, and virtual-thread pinning.
+
+## Spring WebFlux
+
+See [WebFlux design notes](WEBFLUX-SUPPORT.md) for the panel-by-panel detail.
+
+- **R2DBC statements are not recorded.** Only JDBC statements are, so on an R2DBC application SQL Trace stays empty, the
+  Runtime Insights checks that read SQL, such as `repeated-selects`, `connections-per-request`, and `safe-method-dml`,
+  report `UNAVAILABLE`, and no SQL time appears in `route-time-breakdown`. R2DBC capture is deferred until after 2.0.
+- **`route-time-breakdown` has no handler or response phase.** It times authentication and the recorded calls; the
+  rest of a request's time is reported as unattributed, never as application code.
+- **A reactive transaction has no thread-bound context.** A `ReactiveTransactionManager`'s transactions are recorded
+  without a parent transaction or isolation level, and `transaction-across-remote-call` and `split-transaction-writes`
+  place one in a request only when its pipeline carried the request's context to the thread it began on.
+- **`lazy-sql-after-handler` does not apply**, and WebSocket frames and the HTTP Sessions panel are unavailable.
+
+## Quarkus
+
+See [Quarkus design notes](QUARKUS-SUPPORT.md) for the panel-by-panel detail.
+
+- **55 of the 65 panels ship.** GraalVM, CRaC, Conditions, Startup Timeline, HTTP Sessions, Spring Data, Spring Security,
+  Spring DevTools, and Transactions do not apply to Quarkus; JMS is not available yet.
+- **No transaction capture.** SQL statements carry no transaction id, and `transaction-across-remote-call` and
+  `split-transaction-writes` are unavailable.
+- **Hibernate ORM statement inspection observes preparation, not execution.** Rows stay visible and qualified, but
+  do not establish execution counts, touched tables, N+1 queries, or event-loop blocking. ORM session metrics can
+  supply aggregate SQL time to `route-time-breakdown`, not prove which inspected statement executed; plain JDBC
+  executions are timed and counted even at zero duration.
+- **No cache events and no WebSocket frames.** `quarkus-cache` exposes no access listener.
+- **`route-time-breakdown` has no authentication phase**, run-start facts are a live-reload total without steps, and
+  application events are recorded on the observer side only.
+- **The Java agent runs in dev and test modes only**, never in native mode or in production (`LaunchMode.NORMAL`).
+
+## Spring MVC and Spring WebFlux
+
+- **No application events beside the application's own event multicaster.** BootUI records application events as the
+  context's `applicationEventMulticaster`, and backs off when the application defines its own, as Spring Modulith's
+  event publication registry does. Then no application event is recorded, `transactional-listener-skipped` and
+  `after-commit-writes` report `UNAVAILABLE`, and change impact and run comparison say so.
+
+## Spring MVC
+
+- **Executors that are not beans keep no request link** without the BootUI agent: an executor an `AsyncConfigurer`
+  creates without `@Bean`, a `FactoryBean`'s product, a `SimpleAsyncTaskScheduler`'s tasks, and a
+  `VirtualThreadTaskExecutor`. The application's executor and scheduler beans, and a pool another executor bean wraps,
+  are followed (also on WebFlux), including a task one of a request's tasks hands on to them. A periodic or cron task
+  belongs to the request that scheduled it on its first run only.
+- **CPU on virtual threads** is not read by the per-request scope readings; use the opt-in JFR attribution (**Profile
+  resources**) for it.
+
+## MCP
+
+- **A legacy cancellation can reach another client's call.** MCP 2025-06-18 over HTTP has no sessions, and clients
+  number their request ids from 0 per connection. A late `notifications/cancelled` from one client, sent after its own
+  call finished, cancels another local client's in-flight `tools/call` that uses the same id; that call's progress
+  stream then ends with no response. Two calls in flight with the same id are never cancelled. BootUI does not add an
+  `Mcp-Session-Id`, which would change MCP 2025-06-18's bytes. See [AI agents](AI-AGENTS.md#protocol-eras).
+- **Only `architecture_scan` and `vulnerabilities_scan` report progress**. Other tools return one JSON response;
+  scans, database collection, and first-time session parsing can still take seconds or reach the execution timeout.
+
+## The BootUI Java agent
+
+The agent is optional: without it, every 2.0 feature that does not name it works. With it, BootUI records what the
+application's own code did. See [Java Agent](features/java-agent.md).
+
+**Ships in 2.0** (delivered on the `v2` branch):
+
+- the published `bootui-agent` jar, its claim lifecycle across DevTools restarts and Quarkus live reloads, and the
+  **Java Agent** panel;
+- executor propagation and work still running after the response (`work-after-response`);
+- **Code Inventory**: executed and changed methods since the previous run, dependency use, and
+  `changed-code-not-executed`;
+- **Code Paths**: route trees, component-boundary timing, and the handler split of `route-time-breakdown`;
+- change impact by method, and a run comparison led by code changes;
+- metadata-only method probes: invocations, durations, outcomes, and request ids, never arguments or return values,
+  with optional argument and return shapes, shown in the panel only: types and sizes, plus an enum constant's name and
+  a string's length under `FULL`;
+- runtime reach in the Vulnerabilities panel;
+- the **Side Effects** panel with the default `network` (outbound hosts), `processes`, `files`, `blocking`, and
+  `resources` (streams and sockets a request left open, `resource-not-closed`) sensors, and the opt-in `environment`, `thread-activity` (threads per request), and `thread-locals` (`thread-local-left-set`)
+  sensors; `files`, `environment`, `thread-activity`, and `thread-locals` are switched on and off at run time from the
+  Java Agent and Side Effects panels;
+- side effects in the run comparison: hosts, file patterns, processes, and variable names new or gone since the
+  previous run;
+- the Exceptions panel's **Caught in application code** section, with the agent's opt-in `caught-exceptions` sensor;
+- `request-input-in-sink` as opt-in Security sinks rows: request input reaching SQL text, a command, a file path, or
+  an outbound URL unchanged, with query and path parameters; matching additionally requires the separate
+  `bootui.agent.security-sinks.request-values=true` startup setting;
+- the opt-in Security sinks JDK checks: deserialization without a filter, weak algorithms, and trust managers and
+  hostname verifiers; the panels switch the `security-sinks` sensor on and off at run time too, and its request-value
+  matching turns on with its own transformer, so when that transformer fails to install or its self-test fails, matching
+  is off too;
+- agent guidance in the MCP instructions and prompts, and the scripted "did my change run?" agent investigation.
+
+**Deferred, not implemented:**
+
+- caught exceptions as evidence of `errors-behind-2xx`;
+- the rest of security sinks: form values in `request-input-in-sink`, and outbound URLs opened through `HttpClient` or
+  `URL.openConnection`;
+- side effects in change impact, and methods no longer executed on routes exercised in both runs;
+- dynamic access recording.
+
+**Limits of the agent itself:**
+
+- JVM mode only, normally attached with `-javaagent`; the jar also has an `agentmain` entry point for an external
+  attach client, but BootUI offers no self-attach property or panel control. It is unavailable in a GraalVM native image.
+- Executor and thread snapshot registries each retain at most 32,768 application entries across all generations plus
+  64 reserved self-test markers. Overflow leaves new submissions unowned. If a refused task object is later submitted
+  under another owner after capacity becomes available, an earlier run can use that later snapshot; status warns once
+  executor overflow occurred. `overflow` and `neverApplied` remain cumulative after sensor disable, until JVM exit.
+- A method `NOT_TRACKED` is unknown, never evidence that it was not executed. A metadata probe is conclusive only
+  after it became `active` and covered the whole reproduction window; starting one requires separate approval.
+- It appends itself to the bootstrap class path, so class data sharing, AppCDS, and AOT caches stop applying outside
+  the boot loader and HotSpot prints a warning. A development tool: never attach it to a production or AOT-cached JVM.
+
+## Overhead budget
+
+These are the targets 2.0 is measured against. The measured values are recorded in the
+[release sign-off](V2-VALIDATION-REPORT.md#release-sign-off).
+
+| Path | Budget |
+| --- | --- |
+| Application thread: capture into the journal | < 2 µs p99 on a reference machine; never blocks |
+| Sample-app throughput, journal on versus off | Within 10 % |
+| Retained journal rows | At most the smaller of 32 MB and 5 % of the maximum heap; evictions are counted |
+| Java agent, default sensors claimed | Sample-app throughput within 10 % of the same scenario without the agent |
+| Java agent claim | Retransformation of already-loaded classes within 1 second on Spring PetClinic |
+
+BootUI itself, with or without the journal, is not free: on a worst-case route that answers in about 0.7 ms, the
+Spring MVC sample sustains about 83 to 87 % of the throughput it reaches with BootUI off. Slower, realistic requests
+dilute this cost. The 2026-10-09 journal-on/off CI benchmark measured 14.1 % lower median throughput with the journal
+on for one Spring MVC sample route, against the then-current 5 % target; its 96 % distribution-free interval for overhead was
+9–16 %. This is one workload, not a general application estimate. The maintainer explicitly decided to keep the
+journal enabled by default despite this measured miss; see the [validation report](V2-VALIDATION-REPORT.md#release-sign-off).
+
+On 2026-10-12 the maintainer increased the journal throughput target to 10 %, without changing the workload or
+historical results. Source `58e4936` (CI run `38167277335`) measured 10.1 % overhead, with a 96.5 % interval of
+8.0–12.7 %. The later source `60749f232` (CI run `38229746745`) measured **12.1 %**, with a 96.5 % interval of
+8.8–16.0 %, median p99 25.81 ms on versus 23.30 ms off, and zero reported drops. It still misses the 10 % target.
+The maintainer accepted this measured 12.1 % exception on 2026-10-12; that is not a throughput improvement,
+a universal overhead bound, or overall release approval. The capture-p99, memory and agent budgets remain unchanged.
+
+The synced source `b113a7216` (CI run `38251418783`) subsequently measured **16.8 % journal overhead**,
+with a 96.5 % interval of 10.6–20.6 %, median p99 24.05 ms on versus 21.15 ms off, and zero reported drops.
+Its runtime bytes are unchanged from `60749f232`; this difference establishes neither a code regression nor
+infrastructure noise. The 10 % target remains **Not met**, and the new result must be included in overall
+release sign-off rather than extending the earlier 12.1 % acceptance implicitly.

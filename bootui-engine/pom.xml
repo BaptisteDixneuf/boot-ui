@@ -12,14 +12,9 @@
 
     <artifactId>bootui-engine</artifactId>
     <name>BootUI :: Engine</name>
-    <description>Framework-neutral services and advisor engines that implement BootUI behavior for every adapter.</description>
+    <description>Framework-neutral DTOs, services, and advisor engines that implement BootUI behavior for every adapter.</description>
 
     <dependencies>
-        <dependency>
-            <groupId>com.julien-dubois.bootui</groupId>
-            <artifactId>bootui-core</artifactId>
-        </dependency>
-
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
@@ -67,6 +62,16 @@
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!--
+              Test only: the javaagent tests drive the real bridge class, loaded from the test class path. The engine
+              itself never links it; it looks the bridge up on the bootstrap class loader (PLAN-v2 §5.13).
+            -->
+            <groupId>com.julien-dubois.bootui</groupId>
+            <artifactId>bootui-agent-bridge</artifactId>
+            <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -255,7 +260,7 @@
         <dependency>
             <groupId>org.springframework.modulith</groupId>
             <artifactId>spring-modulith-events-api</artifactId>
-            <version>2.1.1</version>
+            <version>${spring-modulith.version}</version>
             <scope>test</scope>
         </dependency>
 
@@ -272,7 +277,32 @@
     </dependencies>
 
     <build>
+        <!--
+          Only bootui-version.properties is filtered (BootUiInfo reads the project version from it); every other
+          resource, such as the bundled ASM licence, is copied untouched.
+        -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>bootui-version.properties</include>
+                </includes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <excludes>
+                    <exclude>bootui-version.properties</exclude>
+                </excludes>
+            </resource>
+        </resources>
         <plugins>
+            <!-- Published: Maven Central receives a flattened, parentless POM (configured in the root POM). -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+            </plugin>
             <!--
               Compiles the Kotlin advisor fixtures under src/test/kotlin before the Java test sources that
               reference them. Test scope only: no Kotlin source, and no Kotlin dependency, reaches any

@@ -17,26 +17,26 @@ participating you are expected to uphold this code.
   `frontend-maven-plugin` when you run the build. You do not need to install
   Node manually.
 - **Framework targets**. The Spring MVC and WebFlux adapters target Spring Boot
-  4.0+; the Quarkus adapter targets the LTS version declared by
-  `quarkus.platform.version` in the root `pom.xml`. BootUI does not support
+  4.0+; the Quarkus build baseline is declared by `quarkus.platform.version` in the root `pom.xml`, while
+  `requiresQuarkusCore` and the `quarkus-lts` CI job pin compatibility with the older 3.33 LTS line. BootUI does not support
   Spring Boot 3.x.
 
 ## Project layout
 
 ```
-bootui-core/                         Shared DTOs, secret masking, and core helpers
-bootui-engine/                       Framework-neutral services/advisors and SPI ports
-bootui-spring-autoconfigure/         Spring MVC + WebFlux adapter (auto-config, endpoints, safety)
-bootui-spring-boot-starter/          Spring MVC starter
-bootui-spring-boot-starter-reactive/ Spring WebFlux starter
+bootui-engine/                       Shared DTOs, secret masking, and core helpers (JDK-only core package),
+                                     and the framework-neutral services/advisors and SPI ports
+bootui-spring-boot-starter/          Spring MVC + WebFlux adapter and starter (auto-config, endpoints, safety)
 bootui-ui/                           Vue 3 SPA bundled into META-INF/resources/bootui
 bootui-conformance/                  Shared HTTP contract suite + golden manifests for all adapters
 bootui-coverage/                     Aggregated coverage report (coverage profile only)
-bootui-client/                       Dependency-free client for the command-line endpoint
-bootui-cli/                          The `bootui` CLI, projected from the engine's MCP tool catalog
+bootui-cli/                          The `bootui` CLI, projected from the engine's MCP tool catalog, and its
+                                     dependency-free client package
+bootui-agent-bridge/                 JDK-only agent/engine contract, shaded into bootui-agent (never published)
+bootui-agent/                        The optional `-javaagent` jar, dormant until BootUI claims it
 bootui-spring-sample-app/            Reference Spring MVC app + Playwright e2e
 bootui-spring-webflux-sample-app/    Reference Spring WebFlux app
-bootui-quarkus-parent/               Shared Quarkus LTS BOM and plugin management
+bootui-quarkus-parent/               Shared Quarkus platform BOM and plugin management
 bootui-quarkus/                      Quarkus runtime adapter
 bootui-quarkus-deployment/           Quarkus deployment/build-time wiring
 bootui-quarkus-integration-tests/    Quarkus @QuarkusTest suites
@@ -57,7 +57,7 @@ When updating compatibility text in docs (README, `docs/SETUP.md`, `docs/feature
 `AGENTS.md`, and `.github/instructions/{spring-adapter,quarkus-adapter}.instructions.md`),
 reference those properties and refresh any explicit version strings in the same PR.
 All Quarkus modules, including the non-published sample app, inherit the Quarkus platform through
-`bootui-quarkus-parent`; keep its LangChain4j BOM compatible with that shared LTS line.
+`bootui-quarkus-parent`; keep its LangChain4j BOM compatible with the shared platform and the supported older LTS line.
 
 ## Build
 
@@ -68,6 +68,9 @@ All Quarkus modules, including the non-published sample app, inherit the Quarkus
 This downloads Node + npm, runs `npm install`, runs the Vue unit tests with Vitest,
 builds the Vue UI with Vite, and packages every module. A full clean build takes
 about a minute on a warm cache.
+
+`-DskipTests` skips both unit tests and Failsafe integration tests. The Failsafe executions bind their
+supported `skipITs` parameter to that property, preserving the same switch across the build.
 
 For a faster local build, add `-T 1C` (one reactor thread per CPU core) to build modules in parallel:
 
@@ -216,6 +219,16 @@ Use the CI-equivalent build before opening or updating a pull request:
 ./mvnw -B -ntp clean install
 ```
 
+Surefire and Failsafe write each test class's standard output and error to
+`target/surefire-reports/<class>-output.txt` (`target/failsafe-reports/` for the Spring sample app's integration
+tests) instead of the console, so look there for application logs and stack traces printed by tests. Failures and
+errors are still reported in the console. CI uploads these files as the `test-output` artifacts.
+
+CI splits that build across parallel jobs: the main job runs the reactor with
+`-Dbootui.skipQuarkusExtensionIts`, which leaves out the per-extension Quarkus integration-test modules (every
+`bootui-quarkus-integration-tests` child except `base`, plus the JDK-gated Hibernate module), and a separate job tests
+those modules. Without the property, a local build includes them.
+
 For frontend-only unit test iteration:
 
 ```bash
@@ -273,6 +286,125 @@ installing the reactor dependencies, run the affected conformance class:
 ./mvnw -B -ntp -pl bootui-quarkus-integration-tests/base test -Dtest=BootUiQuarkusApiConformanceTest
 ```
 
+The correlation coverage scenario (`AbstractCorrelationCoverageTest`, [PLAN-v2.md](docs/PLAN-v2.md) §5.1) measures
+how much request-thread work Live Activity nests under its request when identical requests are paced, sent
+back-to-back, or sent simultaneously. It fails when a floor is missed, when a child is nested under a request that was
+not running when it happened, when work on an executor the application did not wrap is nested under a request, or
+when a request-thread profile reads as approximate. The Spring MVC and Quarkus runners also run with tracing off, and
+the Spring MVC runners send Kafka messages to an in-JVM broker. Each runner writes its report and the raw feed to
+`target/correlation-coverage/`:
+
+```bash
+./mvnw -B -ntp -pl bootui-spring-sample-app test -Dtest='SpringCorrelationCoverage*'
+./mvnw -B -ntp -pl bootui-spring-webflux-sample-app test -Dtest=WebFluxCorrelationCoverageTest
+./mvnw -B -ntp -pl bootui-quarkus-integration-tests/otel test -Dtest='BootUiQuarkusCorrelationCoverage*'
+```
+
+The engine, the Spring adapter, and the Quarkus adapter run every test under `CorrelationLeakGuard`, registered in
+each module's `junit-platform.properties`. It fails a test that leaves a BootUI correlation scope open on its thread,
+because that scope would leak into whichever test the thread runs next. Close every scope a test opens, for example
+with try-with-resources.
+
+The capture overhead benchmark (`CaptureOverheadBenchmarkTest`) compares the Spring MVC sample app's throughput and
+latency with BootUI on and off; the runtime journal is on whenever BootUI is, so it does not isolate the journal's cost.
+Timings depend on the machine, so it is opt-in and never a CI gate. It takes about three minutes and writes its report
+to `target/capture-overhead/`:
+
+```bash
+./mvnw -B -ntp -pl bootui-spring-sample-app test -Dtest=CaptureOverheadBenchmarkTest -Dbootui.benchmark=true
+```
+
+The runtime journal overhead benchmark (`JournalOverheadBenchmarkIT`) measures the journal's own cost against
+[PLAN-v2.md](docs/PLAN-v2.md) §2.2's 10 % target: the Spring sample's executable jar, BootUI on and no agent in both
+configurations, with the journal on and with `bootui.runtime-journal.enabled=false`, on the same route and load as the
+capture overhead benchmark. Like the agent overhead benchmark below, it runs the configurations in pairs whose order
+alternates and reports each pair's throughput ratio, their median, and the median's 95 % interval, with p99 latency, to
+`target/journal-overhead/spring-mvc-journal.md` and `.properties`. It only reports; `bootui.benchmark.passes` sets the
+number of pairs (3 by default):
+
+```bash
+./mvnw -B -ntp -pl bootui-spring-sample-app verify -Dbootui.benchmark=true -Dit.test=JournalOverheadBenchmarkIT \
+  -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+CI runs it with fifteen pairs as the runtime journal leg of `build.yml`'s `agent-overhead-extra-legs` matrix, on
+pushes, manual runs, and pull requests labelled `agent`; the `agent-overhead` job publishes the report to its summary,
+and the leg never fails the build.
+
+Executable-jar benchmarks enable Actuator health probes and wait for both the BootUI Java Agent API to answer with
+HTTP 200 and `/actuator/health/readiness` to answer with HTTP 200 and a textual `status` of `UP`. The BootUI endpoint
+alone can answer before `ApplicationRunner` seed work finishes. Readiness does not prove that arbitrary background
+work or journal dispatch has finished: capture comparisons must also reconcile completed SQL/HTTP evidence with
+the global admission counters before and after their request window. Readiness probes are application HTTP, not
+BootUI self-traffic; keep their pre-window admissions visible rather than subtracting them or selecting only
+successfully attributed SQL. Earlier measurements retain their original source and protocol qualifications; this
+readiness correction does not rescore them or establish a throughput improvement.
+
+The agent overhead benchmark (`AgentOverheadBenchmarkIT`) measures the BootUI agent's cumulative cost against
+[PLAN-v2.md](docs/PLAN-v2.md) §8's budget: the Spring sample's executable jar, BootUI on in both configurations, without
+the agent and with every default sensor claimed (`executors`, `inventory`, `code-paths`, `processes`, `network`,
+`files`, `blocking`, `resources`), on the same route and load as
+the capture overhead benchmark. It runs the configurations in pairs whose order alternates and reports each pair's
+throughput ratio and their median to `target/agent-overhead/`. The budget is 10 %. `bootui.benchmark.passes` sets the
+number of pairs (3 by default), `bootui.benchmark.agent.sensors` claims other sensors than the defaults (for example
+`executors` alone, to measure one sensor's share or a new sensor's cost), and
+`bootui.benchmark.agent.fail-above-percent` makes it fail when the median paired overhead exceeds that value; without it
+the benchmark only reports. `bootui.benchmark.route=io` drives `/api/side-effects/benchmark-io` instead, the same search
+plus one outbound connect to a stub server the benchmark runs and one file read per request, so the side-effect sensors
+that hook connects and files are measured on a route that exercises them; `bootui.benchmark.route=threads` drives
+`/api/thread-activity/benchmark`, the same search plus one thread started and joined and one executor created and shut
+down per request, for the `thread-activity` sensor's A/B (the `resources` sensor's A/B uses the I/O route); `bootui.benchmark.agent.baseline-sensors`
+runs the other arm with the agent and those sensors instead of without the agent, an A/B of the sensors it leaves out;
+and `bootui.benchmark.report` names the report (`spring-mvc-agent` by default):
+
+```bash
+./mvnw -B -ntp -pl bootui-spring-sample-app verify -Dbootui.benchmark=true -Dit.test=AgentOverheadBenchmarkIT \
+  -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+CI runs each measurement as its own leg of `build.yml`'s `agent-overhead-legs` matrix (or `agent-overhead-extra-legs`
+for the measurements below that run only with the `agent` label), all at the same time on separate runners (each A/B
+alternates its arms on one runner), then gathers their reports and runs the checks in the `agent-overhead` job. It
+runs fifteen pairs on a four-processor runner, then on the I/O route with nine pairs: every default sensor against no
+agent (`spring-mvc-agent-io`) on every agent run, and, on pushes, manual runs, and pull requests labelled `agent`
+only, each default side-effect sensor's own share against the same agent without it: `network`
+(`spring-mvc-network-ab`), `blocking` (`spring-mvc-blocking-ab`), `files` on the I/O route (`spring-mvc-files-ab`),
+fifteen pairs each but `network`'s nine, and the opt-in `environment`'s against the default sensors, on a route adding
+fifty `System.getProperty` reads per request (`spring-mvc-environment-ab`), fifteen pairs. The load generator
+shares the processors with the sample and single pairs vary by more than ten points. That job records the report in its
+summary; its median alarm warns above the 10 % budget and fails above 30 %: a clear regression, not noise. The first CI runs measured
+a median of about 17 % (pairs from 9 to 22 %), above the budget, so a gate at the budget, or at twice it, would fail
+on noise alone. Those initial measurements are historical; the budget enforcement added since then is described below.
+
+The 30 % alarm is not the only gate. The extra legs also enforce budgets for sensors that ship on by default:
+`AgentOverheadBenchmarkIT`'s `bootui.benchmark.agent.enforce-when-default` and `...gate=interval` enforce the
+10 % cumulative budget and the 3 % increment for `files` when the lower bound of the median's 95 % interval exceeds
+the budget. `resources` has its own increment/cumulative checks. Opt-in `environment`, `caught-exceptions`,
+`thread-activity`, `thread-locals`, request-value matching and security-sinks JDK checks have dedicated A/B and cumulative
+legs; their default-sensor enforcement activates only if the named sensor joins the defaults. A green alarm-only
+opt-in leg is not proof that its 3 % or 10 % budget passed.
+
+The journal capture budget benchmark (`JournalCaptureBudgetBenchmarkTest`) times the application thread's path into
+the runtime journal, with one and eight producers, the stack walk that keeps a statement's application frames, and the
+dispatcher's sustained rate, against [PLAN-v2.md](docs/PLAN-v2.md) §8's budgets. It is opt-in too, takes about a
+minute, and writes its report to `target/capture-budgets/`:
+
+```bash
+./mvnw -B -ntp -pl bootui-engine test -Dtest=JournalCaptureBudgetBenchmarkTest -Dbootui.benchmark=true
+```
+
+The Spring sample's agent integration tests start the sample in a JVM of its own with the BootUI agent attached:
+`SpringAgentScenarioIT` on the test class path, and `SpringAgentExecutableJarIT` on the repackaged executable jar, run
+with `java -javaagent:... -jar`, whose classes and libraries load from `jar:nested:` URLs. The latter asserts the claim
+arms with the default sensors, Code Inventory scans `BOOT-INF/classes` and maps `BOOT-INF/lib` to its artifacts, and
+Code Paths times the seeded slow route. Both run at `verify` in the Java 17 build and on the Java 21, 25, and 27 lanes of
+`jdk-compatibility.yml`:
+
+```bash
+./mvnw -B -ntp -Dmaven.repo.local="$PWD/.m2" -pl bootui-spring-sample-app -am verify -Dit.test='SpringAgent*IT' \
+  -Dfailsafe.failIfNoSpecifiedTests=false -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false
+```
+
 The Architecture ThreadFactory exemption also has packaged-runtime regressions. The Spring check runs at
 `verify`, after the executable jar is repackaged; it scans nested resources and Java 27 bytecode with an intentionally
 older host ASM alongside ArchUnit's embedded reader, and verifies that the engine does not bundle another ASM copy.
@@ -299,7 +431,7 @@ The Spring fixture's ASM 9.8 dependency must remain older than the reader so it 
 
 MySQL diagnostics require **real Oracle MySQL 8.4** evidence, not the existing MariaDB advisor tests or mocked JDBC
 rows. The tested fixture image is `mysql:8.4.6`. Spring uses Connector/J 9.7.0 with HikariCP 7.0.2; Quarkus uses
-Connector/J 9.6.0 with Agroal 3.0.1.
+Connector/J 9.7.0 with Agroal 3.2.1.
 MariaDB reached through MySQL Connector/J has no automated live coverage by design: the panel labels it unsupported, and
 it was checked manually on MariaDB 11.4 and 11.8. When a change touches collector SQL or session guards, recheck MariaDB
 manually against a disposable `mariadb` container started with `--performance-schema=ON`.
@@ -317,7 +449,7 @@ Then run the live collectors and opt-in Quarkus HTTP fixture:
 
 ```bash
 ./mvnw -B -ntp -Dmaven.repo.local="$PWD/.m2" \
-  -pl bootui-spring-autoconfigure test -Dtest='MySql*LiveTests'
+  -pl bootui-spring-boot-starter test -Dtest='MySql*LiveTests'
 
 ./mvnw -B -ntp -Dmaven.repo.local="$PWD/.m2" \
   -pl bootui-quarkus-integration-tests/datasource \
@@ -388,15 +520,39 @@ UI, browser-facing API responses, or sample-app behavior:
 (cd bootui-spring-sample-app/e2e && npm ci && npx playwright install chromium)
 (cd bootui-spring-sample-app/e2e && npm test)
 (cd bootui-spring-sample-app/e2e && npm run test:webflux)
+# The whole MVC suite with the BootUI agent attached, after ./mvnw install -pl bootui-spring-sample-app -am
+(cd bootui-spring-sample-app/e2e && npm run test:agent)
+# The agent's evidence specs beside the OpenTelemetry Java agent (both orders) and JaCoCo's agent
+(cd bootui-spring-sample-app/e2e && npm run test:agent:opentelemetry-first)
+(cd bootui-spring-sample-app/e2e && npm run test:agent:opentelemetry-last)
+(cd bootui-spring-sample-app/e2e && npm run test:agent:jacoco)
+# The whole WebFlux suite with the BootUI agent attached
+(cd bootui-spring-sample-app/e2e && npm run test:webflux:agent)
 
 # Quarkus (requires JDK 17 to 27 and Docker/Podman for Dev Services)
 (cd bootui-quarkus-sample-app/e2e && npm ci && npx playwright install chromium)
 (cd bootui-quarkus-sample-app/e2e && npm test)
+# The whole Quarkus suite with the BootUI agent attached, after ./mvnw install -pl bootui-agent -am
+(cd bootui-quarkus-sample-app/e2e && npm run test:agent)
 ```
 
 Playwright starts the relevant sample app automatically and reuses an existing
 server on port `8080` (Spring MVC), `8081` (Spring WebFlux), or `8082`
 (Quarkus).
+
+The agent suites start their sample with `-javaagent:` and the jar `./mvnw install` built in `bootui-agent/target`, or
+`BOOTUI_AGENT_JAR`, and set the `agentAttached` fixture option, so the Java Agent, Code Inventory, and Code Paths specs
+assert the armed claim and the recorded run instead of the not-attached state. The Quarkus agent suite passes the jar to
+`quarkus:dev` as `-Djvm.args`. To run one beside another sample, set `SERVER_PORT` with `BOOTUI_AGENT_SAMPLE_PORT`
+(Spring MVC), `BOOTUI_WEBFLUX_AGENT_PORT` (WebFlux), or `BOOTUI_SAMPLE_PORT` with `BOOTUI_OSV_FIXTURE_PORT` (Quarkus).
+The companion suites attach the OpenTelemetry Java agent or JaCoCo's agent beside BootUI's, from the jars the sample's
+build copies from Maven Central to `bootui-spring-sample-app/target/agent-companions` (versions pinned in the root POM);
+set `BOOTUI_JACOCO_PORT` to move JaCoCo's TCP server off port `6300`.
+CI runs each as its own leg of `build.yml`'s `spring-e2e` and `quarkus-e2e` jobs, on Java 17, and the whole MVC agent
+suite again on Java 21 and 25 in `jdk-compatibility.yml`'s `agent-e2e` job. These agent legs, the
+`agent-overhead` job, and the Java 21, 25, and 27 lanes run on every push to `main` and `v2`, every pull request into
+`main`, and nightly. A pull request into `v2` runs them only when it changes an agent-related path, listed in
+`.github/scripts/agent-changes.sh`, or carries the `agent` label; add the label to run them on any other change.
 
 ## Formatting
 
@@ -469,6 +625,12 @@ run its sample without `-am`:
 The Quarkus sample requires JDK 17 to 27 for augmentation and uses Dev
 Services, so Docker or Podman must be available.
 
+Each sample also has launchers that build it with the isolated `.m2`
+repository, then run it: `run-local.sh`, `run-local-agent.sh` (with the BootUI
+Java agent and its default sensors) and `run-local-all.sh` (with every sensor),
+for example `./bootui-spring-webflux-sample-app/run-local-agent.sh`. The Spring
+MVC sample has more; see its README.
+
 ## Front-end development
 
 The Vue source lives in `bootui-ui/src/main/frontend`. For a fast inner loop:
@@ -490,7 +652,7 @@ run `./mvnw install -pl bootui-ui` once to re-bundle the assets into the JAR.
 
 To develop against custom BootUI mounts, set `BOOTUI_DEV_PATH` for the Vite shell base and, when the API path is not
 `<BOOTUI_DEV_PATH>/api`, set `BOOTUI_DEV_API_PATH` independently. When the host application has a non-root context,
-also set `BOOTUI_DEV_APPLICATION_PATH` so the Overview link targets that application root:
+also set `BOOTUI_DEV_APPLICATION_PATH` so the Scorecard's homepage link targets that application root:
 
 ```bash
 BOOTUI_DEV_PATH=/host/dev-console \
@@ -529,8 +691,25 @@ uploads it through the Central Portal Publisher API with
 ```bash
 ./mvnw -B -ntp -Prelease clean install -pl <publication reactor> -am
 python3 .github/scripts/assemble_central_bundle.py ~/.m2/repository VERSION target/central-bundle.zip
+unzip -q target/central-bundle.zip -d target/central-bundle
+python3 .github/scripts/check-central-bundle.py target/central-bundle VERSION
+RELEASE_KEY_FINGERPRINT=7B7C0BD038603E5A9F1476D0498BA5AC9BABBAF9 \
+  bash .github/scripts/verify-release-signatures.sh bundle target/central-bundle
 python3 .github/scripts/publish_central_bundle.py target/central-bundle.zip bootui-VERSION true
 ```
+
+The assembler bundles only the seven published coordinates, so `bootui-agent-bridge`
+(shaded into `bootui-agent`) and both parent POMs, which the reactor installs, never
+reach Central; `check-central-bundle.py` refuses any other coordinate or file and
+any POM that is not flattened. Every signature must verify and be by the pinned
+release key before the upload; the workflow also checks the build's signatures before
+the tag.
+
+Normal version preparation stages the exact unsigned candidate bundle and runs the consumer smoke tests before the
+release commit and tag. A tag-entry or `skip_build` run that did not pass that smoke stages and tests from the immutable
+tagged checkout before uploading instead; successful pre-tag smoke is not rerun after tagging. After publication,
+the consumers resolve the same seven coordinates from Maven Central. `resume_after_publish` skips staging/upload and
+continues with availability, published-consumer smoke and eligible tag-pinned documentation deployment.
 
 It does not run `deploy` through the Sonatype Central Publishing plugin: under
 Maven 3.10 that plugin stages resolver bookkeeping (`maven-metadata-local.xml`) in
@@ -587,7 +766,9 @@ the non-distribution artifact exclusions, before importing signing credentials.
 The workflow then resolves the remote tag to its peeled commit SHA, checks out that
 SHA in detached state, rechecks the Maven/npm/tag identity, and publishes exactly
 that checkout. After auto-publication it polls every published coordinate, runs the
-Spring MVC, Spring WebFlux, and Quarkus consumer smoke tests, and dispatches the
+Spring MVC, Spring WebFlux, and Quarkus consumer smoke tests and the Java agent smoke
+test (a consumer resolves `bootui-agent` with no dependency, and a JVM started with it
+as its `-javaagent` reports it dormant), and dispatches the
 Pages workflow at the immutable tag rather than at a branch that may have advanced.
 The documentation site follows the newest major only: the workflow redeploys it when
 the release's major is at least the highest major among the stable tags on origin,

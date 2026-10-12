@@ -1,0 +1,347 @@
+package io.github.jdubois.bootui.autoconfigure.reactive;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.web.BootUiMounts;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.correlation.RequestIds;
+import io.github.jdubois.bootui.engine.correlation.RequestPhases;
+import io.github.jdubois.bootui.engine.javaagent.AgentCodePaths;
+import io.github.jdubois.bootui.engine.javaagent.AgentRequestValues;
+import io.github.jdubois.bootui.engine.journal.HttpPayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RequestTiming;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.engine.resources.ResourceUsage;
+import io.github.jdubois.bootui.engine.resources.SegmentMeter;
+import io.github.jdubois.bootui.engine.web.RequestSlowThreshold;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import java.util.function.Supplier;
+import org.reactivestreams.Publisher;
+import org.springframework.core.Ordered;
+import org.springframework.http.server.reactive.HttpHandler;
+import org.springframework.http.server.reactive.HttpHandlerDecoratorFactory;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.web.reactive.HandlerMapping;
+import org.springframework.web.reactive.function.server.RouterFunctions;
+import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.server.WebFilterChain;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
+
+/**
+ * Reactive sibling of {@code RequestCorrelationFilter} ({@code docs/PLAN-v2.md} §5.1): gives each application request
+ * BootUI's own request id, with or without tracing, and keeps it on the {@link ServerWebExchange}.
+ *
+ * <p>As an {@link HttpHandlerDecoratorFactory}, it wraps the whole handler, so the id also covers WebFlux's exception
+ * handlers and the response commit, where Actuator's {@code HttpExchangesWebFilter} records the exchange of a failed
+ * request. The id's {@link CorrelationContext} is current on the thread that assembles the handler and is written into
+ * the Reactor context under {@link #CONTEXT_KEY}. With {@code spring.reactor.context-propagation=auto}, which BootUI
+ * contributes as an overridable default, Reactor restores it on every thread the request hops to through
+ * {@link BootUiCorrelationThreadLocalAccessor}, so blocking JDBC on {@code boundedElastic} and the exchange recorded in
+ * {@code beforeCommit} read it from {@link BootUiCorrelation}. Without Micrometer context propagation, or with it
+ * limited, only the assembling thread sees it, and other events carry no request id rather than a guessed one.</p>
+ *
+ * <p>As a WebFilter ordered just after the highest precedence, it publishes the request's context as an exchange
+ * attribute, creating it there if no decorator ran. BootUI's own requests are skipped.</p>
+ */
+public final class ReactiveRequestCorrelationFilter extends AbstractReactiveBootUiFilter
+        implements HttpHandlerDecoratorFactory, Ordered {
+
+    /** The Reactor context and {@code ThreadLocalAccessor} key of the request's {@link CorrelationContext}. */
+    public static final String CONTEXT_KEY = "bootui.correlation";
+
+    /** The exchange attribute holding the request's {@link CorrelationContext}. */
+    public static final String CORRELATION_ATTRIBUTE =
+            ReactiveRequestCorrelationFilter.class.getName() + ".correlation";
+
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
+    private volatile long requestSlowThresholdMs = RequestSlowThreshold.DEFAULT_MILLIS;
+    private volatile RequestPhases phases;
+
+    public ReactiveRequestCorrelationFilter(BootUiProperties properties) {
+        super(properties);
+    }
+
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives one {@code HTTP} event per request
+     * when its filter chain completes, with the matched route and its status, or, for a failed chain, once WebFlux's
+     * exception handlers rendered the failure and the response commits, with the status they rendered.
+     *
+     * @param requestSlowThresholdMs {@code bootui.activity.request-slow-threshold-ms}, which marks a request slow
+     * @param phases the phase markers of recent requests, which this filter begins and ends for each request so the
+     *     GraphQL operation and Spring Security authentication observations are recorded against it; {@code null}
+     *     tracks none
+     */
+    public void setRuntimeEventSink(RuntimeEventSink journal, long requestSlowThresholdMs, RequestPhases phases) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+        this.requestSlowThresholdMs = requestSlowThresholdMs;
+        this.phases = phases;
+    }
+
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE + 100;
+    }
+
+    @Override
+    public HttpHandler apply(HttpHandler handler) {
+        return (request, response) -> {
+            if (isBootUiPath(request)) {
+                // BootUI's own request: never recorded, and the work it does, on whichever scheduler, stays out of
+                // the runtime journal (docs/PLAN-v2.md §5.2).
+                return correlated(CorrelationContext.BOOTUI, () -> handler.handle(request, response));
+            }
+            CorrelationContext correlation = CorrelationContext.forRequest(RequestIds.next());
+            return correlated(correlation, () -> assembled(correlation, () -> handler.handle(request, response)));
+        };
+    }
+
+    @Override
+    protected boolean shouldNotFilter(ServerWebExchange exchange) {
+        return isBootUiPath(exchange.getRequest());
+    }
+
+    @Override
+    protected Mono<Void> doFilterInternal(ServerWebExchange exchange, WebFilterChain chain) {
+        return Mono.deferContextual(context -> {
+            // Subscribed on the event loop the request arrived on: the agent's blocking sensor watches it (M5-5c).
+            ReactiveThreadKinds.registerIfEventLoop();
+            Object existing = context.getOrDefault(CONTEXT_KEY, null);
+            if (existing instanceof CorrelationContext correlation) {
+                exchange.getAttributes().put(CORRELATION_ATTRIBUTE, correlation);
+                try (BootUiCorrelation.Scope ignored = BootUiCorrelation.open(correlation)) {
+                    return tracked(exchange, correlation, chain);
+                }
+            }
+            CorrelationContext correlation = CorrelationContext.forRequest(RequestIds.next());
+            exchange.getAttributes().put(CORRELATION_ATTRIBUTE, correlation);
+            return correlated(correlation, () -> assembled(correlation, () -> tracked(exchange, correlation, chain)));
+        });
+    }
+
+    /**
+     * Starts the request's marker timeline before the chain is assembled, so an observation a downstream filter makes
+     * while it assembles, such as Spring Security authenticating the request, is already recorded against it, then
+     * runs it through {@link #published}.
+     */
+    private Mono<Void> tracked(ServerWebExchange exchange, CorrelationContext correlation, WebFilterChain chain) {
+        if (!AgentRequestValues.active()) {
+            return trackedChain(exchange, correlation, chain);
+        }
+        String requestId = correlation.requestId();
+        pushRequestValues(exchange, requestId);
+        Mono<Void> tracked;
+        try {
+            tracked = trackedChain(exchange, correlation, chain);
+        } catch (RuntimeException ex) {
+            AgentRequestValues.end(requestId);
+            throw ex;
+        }
+        return tracked.doFinally(signal -> AgentRequestValues.end(requestId));
+    }
+
+    /**
+     * The path variable attributes a WebFlux handler mapping sets once it matched: an annotated controller's, then a
+     * router function's.
+     */
+    static final String[] PATH_VARIABLE_ATTRIBUTES = {
+        HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE, RouterFunctions.URI_TEMPLATE_VARIABLES_ATTRIBUTE
+    };
+
+    /**
+     * Hands the request's values to the BootUI agent's request value holder ({@code docs/PLAN-v2.md} §5.16, M5-6b),
+     * only while request-value matching is on: the query parameters WebFlux already parsed from the URI, never a body
+     * (the form data is never subscribed to), and the exchange's attributes, from which the holder reads the path
+     * variables at the request's first check, once the handler mapping set them. The request's chain ending removes
+     * them, on completion, error, or cancellation. Observes only, and never fails the request.
+     */
+    static void pushRequestValues(ServerWebExchange exchange, String requestId) {
+        try {
+            AgentRequestValues.Values values =
+                    new AgentRequestValues.Values().addAll(exchange.getRequest().getQueryParams());
+            AgentRequestValues.begin(requestId, values, exchange.getAttributes(), PATH_VARIABLE_ATTRIBUTES);
+        } catch (RuntimeException | LinkageError ex) {
+            // Request-value matching is diagnostics only; the request continues untouched.
+        }
+    }
+
+    private Mono<Void> trackedChain(ServerWebExchange exchange, CorrelationContext correlation, WebFilterChain chain) {
+        RuntimeEventSink sink = journal;
+        RequestPhases requestPhases = phases;
+        if (requestPhases != null) {
+            // The timeline the GraphQL operation and Spring Security authentication observation handlers write into,
+            // ended by published() on completion, failure, and cancellation. WebFlux marks no phase inside it, so the
+            // request's phase stays unknown rather than reported as the filters (docs/PLAN-v2.md §5.1). A request id
+            // already tracked keeps its timeline, so a chain subscribed again never drops what the first attempt
+            // recorded; its attempts then share one authentication total, which is the physical request's.
+            requestPhases.beginUnphased(correlation.requestId());
+        }
+        if (sink == RuntimeEventSink.NONE && requestPhases == null) {
+            return chain.filter(exchange);
+        }
+        return published(exchange, correlation, sink, requestPhases, chain);
+    }
+
+    /**
+     * {@code chain} that ends the request's phase markers and publishes its {@code HTTP} event to the journal when it
+     * completes.
+     */
+    private Mono<Void> published(
+            ServerWebExchange exchange,
+            CorrelationContext correlation,
+            RuntimeEventSink sink,
+            RequestPhases requestPhases,
+            WebFilterChain chain) {
+        long startNanos = System.nanoTime();
+        long start = System.currentTimeMillis();
+        if (sink.records(JournalSource.RESOURCES)) {
+            SegmentMeter.shared().begin(correlation.requestId());
+        }
+        Mono<Void> filtered;
+        try {
+            filtered = chain.filter(exchange);
+        } catch (RuntimeException ex) {
+            // A chain that fails while it assembles still has a timeline to end and a request to publish.
+            filtered = Mono.error(ex);
+        }
+        return filtered.doFinally(signal -> {
+            try {
+                if (requestPhases != null) {
+                    // The request's chain terminated: WebFlux renders a failure after it unwinds, so a failed
+                    // request ends here rather than when its response is written.
+                    requestPhases.end(correlation.requestId());
+                }
+                if (sink == RuntimeEventSink.NONE) {
+                    return;
+                }
+                // Ends the request's measurement (docs/PLAN-v2.md §5.11) with its chain, as its timeline ends.
+                ResourceUsage resources = SegmentMeter.shared().take(correlation.requestId());
+                // A failure is published once WebFlux's exception handlers rendered it, with the status they chose.
+                ReactiveHttpExchangeTraceFilter.whenRendered(
+                        exchange,
+                        signal,
+                        rendered -> publish(
+                                exchange,
+                                correlation,
+                                sink,
+                                requestPhases,
+                                signal,
+                                rendered,
+                                resources,
+                                startNanos,
+                                start));
+            } catch (RuntimeException ex) {
+                // Publishing never disturbs the response.
+            }
+        });
+    }
+
+    private void publish(
+            ServerWebExchange exchange,
+            CorrelationContext correlation,
+            RuntimeEventSink sink,
+            RequestPhases requestPhases,
+            SignalType signal,
+            int rendered,
+            ResourceUsage resources,
+            long startNanos,
+            long start) {
+        long durationNanos = System.nanoTime() - startNanos;
+        int status = rendered;
+        if (status == 0 && signal == SignalType.ON_COMPLETE) {
+            // A handler that completes without setting a status renders 200 when the response commits; a cancelled
+            // request keeps 0, as it has no status.
+            status = 200;
+        }
+        ServerHttpRequest request = exchange.getRequest();
+        String requestId = correlation.requestId();
+        sink.offer(RuntimeEvent.of(
+                JournalSource.HTTP,
+                start,
+                durationNanos,
+                correlation,
+                traceId(exchange, correlation),
+                // The thread the request completed on, whose kind the journal records: a reactive request has no
+                // single serving thread.
+                Thread.currentThread().getName(),
+                null,
+                RequestSlowThreshold.isFailedOrSlow(status, durationNanos / 1_000_000, requestSlowThresholdMs),
+                new HttpPayload(
+                        request.getMethod() == null ? null : request.getMethod().name(),
+                        request.getURI() == null ? null : request.getURI().getPath(),
+                        ReactiveHttpExchangeTraceFilter.routeTemplate(exchange),
+                        requestPhases == null ? null : requestPhases.operationOf(requestId),
+                        status,
+                        resources,
+                        // WebFlux marks no handler or response phase, so only the request's start and the
+                        // authentication time Spring Security observed are known.
+                        RequestTiming.of(
+                                startNanos, requestPhases == null ? null : requestPhases.markers(requestId)))));
+    }
+
+    /**
+     * The request's trace id: the one its correlation carries, else the one the innermost trace filter read while the
+     * request's span was current, since this outermost filter completes after the span closed.
+     */
+    private static String traceId(ServerWebExchange exchange, CorrelationContext correlation) {
+        if (correlation.traceId() != null) {
+            return correlation.traceId();
+        }
+        Object traceId = exchange.getAttribute(ReactiveHttpExchangeTraceFilter.TRACE_ID_ATTRIBUTE);
+        return traceId instanceof String value && !value.isBlank() ? value : null;
+    }
+
+    /** The request's correlation, or {@link CorrelationContext#NONE} when this filter did not see it. */
+    public static CorrelationContext correlation(ServerWebExchange exchange) {
+        Object attribute = exchange.getAttribute(CORRELATION_ATTRIBUTE);
+        return attribute instanceof CorrelationContext context ? context : CorrelationContext.NONE;
+    }
+
+    /**
+     * The request's pipeline, whose subscription, where WebFlux runs its filters and invokes the handler up to its first
+     * asynchronous boundary, is the BootUI agent's code-paths fragment of this request on the subscribing thread
+     * ({@code docs/PLAN-v2.md} §5.14, M5-4b): the fragment opens inside the request's correlation scope, so it captures
+     * the request, and is flushed once that synchronous part returned. The scope covers only the fragment's opening and
+     * the pipeline's assembly, as {@link #correlated} does without the agent, so the subscription sees the thread's
+     * correlation exactly as it would without the agent. The work the handler's publisher does later runs elsewhere, so
+     * every WebFlux tree is assembly only: the reactive configuration tells Code Paths so once for the stack, and no
+     * request is marked here.
+     */
+    private static Mono<Void> assembled(CorrelationContext correlation, Supplier<Mono<Void>> work) {
+        if (!AgentCodePaths.bound()) {
+            // Without the agent, the pipeline is exactly what it was.
+            return work.get();
+        }
+        return Mono.fromDirect((Publisher<Void>) subscriber -> {
+            try {
+                Mono<Void> pipeline;
+                try (BootUiCorrelation.Scope ignored = BootUiCorrelation.open(correlation)) {
+                    AgentCodePaths.begin();
+                    try {
+                        pipeline = work.get();
+                    } catch (RuntimeException ex) {
+                        // A pipeline that fails while it assembles still answers its subscriber.
+                        pipeline = Mono.error(ex);
+                    }
+                }
+                pipeline.subscribe(subscriber);
+            } finally {
+                AgentCodePaths.end();
+            }
+        });
+    }
+
+    private static Mono<Void> correlated(CorrelationContext correlation, Supplier<Mono<Void>> work) {
+        return Mono.defer(() -> {
+                    try (BootUiCorrelation.Scope ignored = BootUiCorrelation.open(correlation)) {
+                        return work.get();
+                    }
+                })
+                .contextWrite(context -> context.put(CONTEXT_KEY, correlation));
+    }
+
+    private boolean isBootUiPath(ServerHttpRequest request) {
+        return BootUiMounts.contains(pathWithinApplication(request), properties.getPath(), properties.getApiPath());
+    }
+}

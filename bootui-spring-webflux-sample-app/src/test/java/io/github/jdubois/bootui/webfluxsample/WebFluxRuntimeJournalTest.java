@@ -1,0 +1,211 @@
+package io.github.jdubois.bootui.webfluxsample;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import io.github.jdubois.bootui.conformance.BootUiHttpProbe;
+import io.github.jdubois.bootui.engine.journal.AuthorizationPayload;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates.RouteResources;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates.RouteStats;
+import io.github.jdubois.bootui.engine.journal.JournalEntry;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RunStart;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournal;
+import io.github.jdubois.bootui.engine.journal.StartupStepTiming;
+import io.github.jdubois.bootui.engine.resources.ResourceTrack;
+import java.time.Duration;
+import java.util.List;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.boot.test.web.server.LocalServerPort;
+
+/**
+ * The runtime journal on Spring WebFlux ({@code docs/PLAN-v2.md} §5.2): each application request publishes one
+ * {@code HTTP} event when its filter chain completes, and its blocking JDBC on a Reactor scheduler publishes
+ * {@code SQL} events carrying the same request id, so the aggregates fold the statements into the route.
+ */
+@SpringBootTest(
+        classes = BootUiWebfluxSampleApplication.class,
+        webEnvironment = WebEnvironment.RANDOM_PORT,
+        properties = {
+            "spring.profiles.active=dev",
+            "bootui.show-banner=false",
+            "bootui.overrides-file=target/runtime-journal/application-bootui.properties",
+            "bootui.resources.sample-interval=200ms"
+        })
+class WebFluxRuntimeJournalTest {
+
+    @LocalServerPort
+    int port;
+
+    @Value("${spring.threads.virtual.enabled:false}")
+    boolean virtualThreads;
+
+    @Autowired
+    RuntimeJournal journal;
+
+    @Autowired
+    JournalAggregates aggregates;
+
+    @Test
+    void theRunStartRecordsTheTimeToReadyTheSlowestBeansAndTheComparabilityFacts() throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (aggregates.runStart() == null && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+
+        RunStart start = aggregates.runStart();
+        assertThat(start).isNotNull();
+        assertThat(start.readyNanos()).isPositive();
+        assertThat(start.slowestSteps()).isNotEmpty().allSatisfy(step -> {
+            assertThat(step.name()).isEqualTo("spring.beans.instantiate");
+            assertThat(step.bean()).isNotBlank();
+        });
+        assertThat(start.slowestSteps())
+                .extracting(StartupStepTiming::durationNanos)
+                .isSortedAccordingTo(java.util.Comparator.reverseOrder());
+        assertThat(start.facts().activeProfiles()).containsExactly("dev");
+        assertThat(start.facts().journalSources()).contains("lifecycle", "http", "sql");
+    }
+
+    @Test
+    void theResourceSamplerSweepsAtTheConfiguredIntervalWithABalancedLedger() throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (aggregates.resourceTrack().points().size() < 3 && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+
+        List<ResourceTrack.Point> points = aggregates.resourceTrack().points();
+        assertThat(points).hasSizeGreaterThanOrEqualTo(3);
+        ResourceTrack.Point last = points.get(points.size() - 1);
+        assertThat(last.intervalNanos())
+                .as("bootui.resources.sample-interval=200ms")
+                .isLessThan(Duration.ofMillis(900).toNanos());
+        assertThat(last.heapUsedBytes()).isPositive();
+        assertThat(points).allSatisfy(point -> {
+            long measuredThreadCpu = point.requestCpuNanos() + point.familiesCpuNanos();
+            assertThat(point.requestCpuNanos()).isNotNegative();
+            assertThat(point.familiesCpuNanos()).isNotNegative();
+            if (point.internalCpuNanos() >= 0) {
+                assertThat(point.processCpuNanos()).isNotNegative();
+                assertThat(measuredThreadCpu + point.internalCpuNanos()).isEqualTo(point.processCpuNanos());
+            } else {
+                assertThat(point.internalCpuNanos()).isEqualTo(-1);
+                if (point.processCpuNanos() >= 0) {
+                    assertThat(measuredThreadCpu).isGreaterThan(point.processCpuNanos());
+                } else {
+                    assertThat(point.processCpuNanos()).isEqualTo(-1);
+                }
+            }
+        });
+        assertThat(points)
+                .anySatisfy(point -> assertThat(point.processCpuNanos()).isPositive());
+        assertThat(points)
+                .anySatisfy(point -> assertThat(point.familiesCpuNanos()).isPositive());
+        assertThat(aggregates.resourceTrack().families()).contains(ResourceTrack.BOOTUI_FAMILY);
+    }
+
+    @Test
+    void eachReactiveAuthorizationDecisionJoinsItsRequestThroughTheExchange() throws Exception {
+        BootUiHttpProbe probe = new BootUiHttpProbe("http://localhost:" + port);
+
+        assertThat(probe.get("/api/greetings/Ada").status()).isEqualTo(200);
+        assertThat(journal.awaitDrained(Duration.ofSeconds(10))).isTrue();
+
+        List<RuntimeEvent> decisions = journal.entries().stream()
+                .map(JournalEntry::event)
+                .filter(event -> event.source() == JournalSource.AUTHORIZATION)
+                .toList();
+        assertThat(decisions).anySatisfy(event -> {
+            AuthorizationPayload decision = (AuthorizationPayload) event.payload();
+            assertThat(decision.target()).isEqualTo(AuthorizationPayload.REQUEST);
+            assertThat(decision.granted()).isTrue();
+            // permitAll() never asks for the caller, and a reactive context is not readable from a thread.
+            assertThat(decision.authentication()).isEqualTo(AuthorizationPayload.UNKNOWN);
+            assertThat(event.requestId()).isNotBlank();
+        });
+    }
+
+    @Test
+    void cacheAndExceptionEventsFoldIntoTheRouteThatProducedThem() throws Exception {
+        BootUiHttpProbe probe = new BootUiHttpProbe("http://localhost:" + port);
+
+        assertThat(probe.get("/api/greetings/bootui").status()).isEqualTo(200);
+        assertThat(probe.get("/api/sample/boom").status()).isEqualTo(500);
+        awaitRequests("GET /api/greetings/{name}", 1);
+        awaitRequests("GET /api/sample/boom", 1);
+
+        assertThat(aggregates.snapshot().routes())
+                .anySatisfy(route -> {
+                    assertThat(route.route()).startsWith("GET /api/greetings/");
+                    assertThat(route.childCounts()).containsKey(JournalSource.CACHE);
+                })
+                .anySatisfy(route -> {
+                    assertThat(route.route()).isEqualTo("GET /api/sample/boom");
+                    assertThat(route.childCounts()).containsKey(JournalSource.EXCEPTION);
+                    assertThat(route.statusClasses().get(4)).isPositive();
+                });
+    }
+
+    @Test
+    void requestsAndTheirSqlReachTheJournalAndFoldIntoTheMatchedRoute() throws Exception {
+        BootUiHttpProbe probe = new BootUiHttpProbe("http://localhost:" + port);
+
+        for (int i = 0; i < 3; i++) {
+            assertThat(probe.get("/api/notes").status()).isEqualTo(200);
+        }
+        assertThat(probe.get("/bootui/api/overview").status()).isEqualTo(200);
+        awaitRequests("GET /api/notes", 3);
+
+        RouteStats route = aggregates.snapshot().routes().stream()
+                .filter(candidate -> candidate.route().equals("GET /api/notes"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(route.requests()).isEqualTo(3);
+        assertThat(route.statusClasses().get(1)).isEqualTo(3);
+        assertThat(route.childCounts().get(JournalSource.SQL)).isGreaterThanOrEqualTo(3);
+        assertThat(route.childCounts().get(JournalSource.CONNECTION))
+                .as("each request's logical connections, published when released")
+                .isGreaterThanOrEqualTo(3);
+        RouteResources resources = route.resources();
+        if (virtualThreads && Runtime.version().feature() >= 21) {
+            // Each request's event-loop segments are measured, but its JDBC work hops to boundedElastic, which
+            // spring.threads.virtual.enabled runs on virtual threads that the JVM does not measure (§5.11).
+            assertThat(resources.partialRequests()).as(resources.toString()).isEqualTo(3);
+        } else {
+            assertThat(resources.measuredRequests())
+                    .as("each request's segments, summed across its Reactor hops: " + resources)
+                    .isEqualTo(3);
+            assertThat(resources.cpuNanos()).isPositive();
+            assertThat(resources.allocatedBytes()).isPositive();
+        }
+        assertThat(journal.entries())
+                .filteredOn(entry -> entry.event().source() == JournalSource.HTTP)
+                .isNotEmpty()
+                .allSatisfy(entry -> assertThat(entry.event().threadKind()).isNotNull());
+        assertThat(aggregates.snapshot().routes())
+                .extracting(RouteStats::route)
+                .noneMatch(name -> name.contains("/bootui"));
+    }
+
+    /**
+     * Waits until {@code route} has recorded {@code requests}. A WebFlux request publishes its event when its filter
+     * chain completes, which can be after the client has read the response, so draining the journal is not enough.
+     */
+    private void awaitRequests(String route, long requests) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (System.nanoTime() < deadline) {
+            assertThat(journal.awaitDrained(Duration.ofSeconds(10))).isTrue();
+            boolean recorded = aggregates.snapshot().routes().stream()
+                    .anyMatch(candidate -> candidate.route().equals(route) && candidate.requests() >= requests);
+            if (recorded) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+    }
+}

@@ -9,13 +9,79 @@ import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
 import io.github.jdubois.bootui.core.dto.SqlTraceGroupDto;
 import io.github.jdubois.bootui.core.dto.SqlTraceReport;
 import io.github.jdubois.bootui.core.dto.SqlTraceStatsDto;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.correlation.ExecutionIds;
+import io.github.jdubois.bootui.engine.correlation.RequestPhase;
+import io.github.jdubois.bootui.engine.correlation.RequestPhases;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.SqlPayload;
+import io.github.jdubois.bootui.engine.mcp.McpControlAcks;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder.Category;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder.StatementType;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
 class SqlTraceRecorderTests {
+
+    @Test
+    void profileQualificationFollowsCaptureDeclarationsNotEvictableRows() {
+        SqlTraceRecorder recorder = recorder(true, false, 1, 100);
+        assertThat(recorder.executionCaptureLimitation()).isNull();
+        recorder.registerCaptureSource("orm", SqlPayload.Provenance.PREPARATION);
+        assertThat(recorder.executionCaptureLimitation()).contains("preparation", "not execution evidence");
+        recorder.recordPreparation("select * from orders", "orm");
+        recorder.clear();
+        assertThat(recorder.recent()).isEmpty();
+        assertThat(recorder.executionCaptureLimitation()).contains("preparation", "execution timing");
+        recorder.registerCaptureSource(null, SqlPayload.Provenance.UNKNOWN);
+        assertThat(recorder.executionCaptureLimitation()).contains("unknown", "unverified");
+    }
+
+    @Test
+    void preparationIsRetainedButDoesNotManufactureExecutionsOrStatistics() {
+        SqlTraceRecorder recorder = recorder(true, false, 10, 100);
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        recorder.registerDataSource("db");
+        for (int i = 0; i < 6; i++) {
+            recorder.recordPreparation("select * from orders", "db");
+        }
+        recorder.recordNanos(
+                StatementType.PREPARED,
+                Category.SELECT,
+                "select * from orders",
+                List.of(),
+                0,
+                true,
+                null,
+                null,
+                0,
+                "c1",
+                "main");
+
+        assertThat(recorder.report(false).entries()).hasSize(7);
+        assertThat(recorder.entries(false)).hasSize(1);
+        assertThat(recorder.stats().totalQueries()).isEqualTo(1);
+        assertThat(recorder.topStatements()).singleElement().satisfies(group -> {
+            assertThat(group.executions()).isEqualTo(1);
+            assertThat(group.potentialNPlusOne()).isFalse();
+        });
+        assertThat(recorder.report(false).warnings())
+                .anyMatch(warning -> warning.contains("6 SQL capture(s) observed preparation only"));
+        assertThat(new SqlTraceInsightsService(recorder)
+                        .insights(List.of(), java.util.Set.of(), RouteTemplateResolver.empty())
+                        .notes())
+                .anyMatch(note -> note.contains("excluded from rankings"));
+        assertThat(published).hasSize(7);
+        assertThat(published.subList(0, 6))
+                .allSatisfy(event -> assertThat(((SqlPayload) event.payload()).provenance())
+                        .isEqualTo(SqlPayload.Provenance.PREPARATION));
+        assertThat(((SqlPayload) published.get(6).payload()).executed()).isTrue();
+    }
 
     private SqlTraceRecorder recorder(boolean enabled, boolean captureParameters, int maxEntries, long slowMillis) {
         return recorder(enabled, captureParameters, false, maxEntries, slowMillis);
@@ -30,6 +96,105 @@ class SqlTraceRecorderTests {
     private void record(SqlTraceRecorder recorder, Category category, String sql, int batchSize) {
         recorder.record(
                 StatementType.STATEMENT, category, sql, List.of(), 1, true, null, null, batchSize, "c1", "main");
+    }
+
+    @Test
+    void publishesEachRecordedStatementToTheJournalWithItsCorrelationButNoBindValues() {
+        SqlTraceRecorder recorder = new SqlTraceRecorder(true, true, true, false, 8, 100, 2000, 200, 5, 50);
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        CorrelationContext request =
+                CorrelationContext.forRequest("0123456789abcdef").withDataSource("orders");
+
+        try (BootUiCorrelation.Scope ignored = BootUiCorrelation.open(request)) {
+            recorder.record(
+                    StatementType.PREPARED,
+                    Category.SELECT,
+                    "select * from orders where id = ?",
+                    List.of("42"),
+                    150_000,
+                    false,
+                    "boom",
+                    null,
+                    0,
+                    "c1",
+                    "http-nio-8080-exec-1");
+        }
+        BootUiCorrelation.replace(CorrelationContext.NONE);
+        record(recorder, Category.SELECT, "select 1", 0);
+
+        assertThat(published).hasSize(2);
+        RuntimeEvent event = published.get(0);
+        assertThat(event.source()).isEqualTo(JournalSource.SQL);
+        assertThat(event.requestId()).isEqualTo("0123456789abcdef");
+        assertThat(event.durationNanos()).isEqualTo(150_000_000L);
+        assertThat(event.failedOrSlow()).isTrue();
+        assertThat(event.thread()).isEqualTo("http-nio-8080-exec-1");
+        SqlPayload payload = (SqlPayload) event.payload();
+        assertThat(payload)
+                .usingRecursiveComparison()
+                .ignoringFields("completedNanos")
+                .isEqualTo(new SqlPayload("select * from orders where id = ?", null, "orders", true));
+        assertThat(payload.completedNanos()).isPositive();
+        assertThat(published.get(1).requestId()).isNull();
+    }
+
+    @Test
+    void publishesTheRequestPhaseAndMonotonicCompletionOfEachStatement() {
+        SqlTraceRecorder recorder = new SqlTraceRecorder(true, true, true, false, 8, 100, 2000, 200, 5, 50);
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        RequestPhases phases = new RequestPhases();
+        recorder.setRequestPhases(phases);
+        phases.begin("0123456789abcdef");
+        long before = System.nanoTime();
+
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forRequest("0123456789abcdef"))) {
+            phases.mark("0123456789abcdef", RequestPhase.HANDLER);
+            record(recorder, Category.SELECT, "select * from orders", 0);
+            phases.mark("0123456789abcdef", RequestPhase.RESPONSE);
+            record(recorder, Category.SELECT, "select * from lines", 0);
+        }
+
+        SqlPayload handler = (SqlPayload) published.get(0).payload();
+        SqlPayload response = (SqlPayload) published.get(1).payload();
+        assertThat(handler.phase()).isEqualTo(RequestPhase.HANDLER);
+        assertThat(response.phase()).isEqualTo(RequestPhase.RESPONSE);
+        assertThat(handler.completedNanos()).isGreaterThanOrEqualTo(before);
+        assertThat(response.completedNanos()).isGreaterThanOrEqualTo(handler.completedNanos());
+    }
+
+    @Test
+    void stampsNoRequestPhaseOnAStatementOfAPropagatedTask() {
+        SqlTraceRecorder recorder = new SqlTraceRecorder(true, true, true, false, 8, 100, 2000, 200, 5, 50);
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        RequestPhases phases = new RequestPhases();
+        recorder.setRequestPhases(phases);
+        phases.begin("0123456789abcdef");
+        phases.mark("0123456789abcdef", RequestPhase.RESPONSE);
+
+        try (BootUiCorrelation.Scope ignored = BootUiCorrelation.open(
+                CorrelationContext.forRequest("0123456789abcdef").withExecutionId(ExecutionIds.nextAsync()))) {
+            record(recorder, Category.UPDATE, "update audit set seen = 1", 0);
+        }
+
+        assertThat(published).singleElement().satisfies(event -> {
+            assertThat(event.requestId()).isEqualTo("0123456789abcdef");
+            assertThat(((SqlPayload) event.payload()).phase()).isNull();
+        });
+    }
+
+    @Test
+    void publishesNothingWhatTheBufferDoesNotRecord() {
+        SqlTraceRecorder recorder = recorder(false, false, 10, 100);
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+
+        record(recorder, Category.SELECT, "select 1", 0);
+
+        assertThat(published).isEmpty();
     }
 
     @Test
@@ -511,6 +676,16 @@ class SqlTraceRecorderTests {
         recorder.clear();
         assertThat(recorder.recent()).isEmpty();
         assertThat(recorder.totalCaptured()).isEqualTo(1);
+
+        // totalCaptured is the lifetime count; the stats and entries cover the retained window, which clear empties.
+        SqlTraceReport report = recorder.report(false);
+        assertThat(report.totalCaptured()).isEqualTo(1);
+        assertThat(report.entries()).isEmpty();
+        assertThat(report.stats().totalQueries()).isZero();
+        assertThat(McpControlAcks.sqlTrace(McpControlAcks.CLEARED, report))
+                .containsEntry("action", "cleared")
+                .containsEntry("retained", 0)
+                .containsEntry("totalCaptured", 1L);
     }
 
     @Test
@@ -540,7 +715,7 @@ class SqlTraceRecorderTests {
     @Test
     void stampsTraceIdFromConfiguredProvider() {
         SqlTraceRecorder recorder = recorder(true, false, 10, 100);
-        recorder.setTraceIdProvider(() -> "trace-x");
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-x", null));
         record(recorder, Category.SELECT, "select 1", 0);
         assertThat(recorder.recent().get(0).traceId()).isEqualTo("trace-x");
     }
@@ -555,7 +730,7 @@ class SqlTraceRecorderTests {
     @Test
     void treatsBlankProviderTraceIdAsNone() {
         SqlTraceRecorder recorder = recorder(true, false, 10, 100);
-        recorder.setTraceIdProvider(() -> "   ");
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("   ", null));
         record(recorder, Category.SELECT, "select 1", 0);
         assertThat(recorder.recent().get(0).traceId()).isNull();
     }
@@ -563,10 +738,10 @@ class SqlTraceRecorderTests {
     @Test
     void nullProviderRestoresDefaultAndNeverThrows() {
         SqlTraceRecorder recorder = recorder(true, false, 10, 100);
-        recorder.setTraceIdProvider(() -> {
+        recorder.setCorrelationContextProvider(() -> {
             throw new IllegalStateException("tracer broke");
         });
-        recorder.setTraceIdProvider(null);
+        recorder.setCorrelationContextProvider(null);
         record(recorder, Category.SELECT, "select 1", 0);
         assertThat(recorder.recent().get(0).traceId()).isNull();
     }
@@ -574,7 +749,7 @@ class SqlTraceRecorderTests {
     @Test
     void guardsAgainstThrowingProvider() {
         SqlTraceRecorder recorder = recorder(true, false, 10, 100);
-        recorder.setTraceIdProvider(() -> {
+        recorder.setCorrelationContextProvider(() -> {
             throw new IllegalStateException("tracer broke");
         });
         record(recorder, Category.SELECT, "select 1", 0);
@@ -585,7 +760,7 @@ class SqlTraceRecorderTests {
     @Test
     void enrichesActiveSpanPerStatementAndFlagsNPlusOneForTheTrace() {
         SqlTraceRecorder recorder = recorder(true, false, 100, 100);
-        recorder.setTraceIdProvider(() -> "trace-1");
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-1", null));
         RecordingSpanEnricher enricher = new RecordingSpanEnricher();
         recorder.setSpanEnricher(enricher);
 
@@ -602,7 +777,7 @@ class SqlTraceRecorderTests {
     @Test
     void noOpEnricherSkipsPerTraceGrouping() {
         SqlTraceRecorder recorder = recorder(true, false, 100, 100);
-        recorder.setTraceIdProvider(() -> "trace-1");
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-1", null));
         // Default enricher is NO_OP (disabled): recording still works and nothing throws.
         record(recorder, Category.SELECT, "select 1", 0);
         assertThat(recorder.recent()).hasSize(1);
@@ -620,5 +795,51 @@ class SqlTraceRecorderTests {
         public void onSqlStatement(java.util.function.BooleanSupplier nPlusOneSuspected) {
             calls.add(nPlusOneSuspected != null && nPlusOneSuspected.getAsBoolean());
         }
+    }
+
+    @Test
+    void stampsTheRequestIdOfTheOpenScope() {
+        SqlTraceRecorder recorder = new SqlTraceRecorder(true, true, false, false, 10, 100, 2000, 200, 5);
+
+        try (io.github.jdubois.bootui.engine.correlation.BootUiCorrelation.Scope ignored =
+                io.github.jdubois.bootui.engine.correlation.BootUiCorrelation.open(
+                        io.github.jdubois.bootui.spi.CorrelationContext.forRequest("0123456789abcdef"))) {
+            recorder.record(
+                    StatementType.PREPARED,
+                    Category.SELECT,
+                    "select 1",
+                    List.of(),
+                    10,
+                    true,
+                    null,
+                    null,
+                    0,
+                    "c1",
+                    "t1");
+        }
+        recorder.record(
+                StatementType.PREPARED, Category.SELECT, "select 2", List.of(), 10, true, null, null, 0, "c1", "t1");
+
+        assertThat(recorder.recent())
+                .extracting(SqlTraceRecorder.CapturedStatement::requestId)
+                .containsExactly(null, "0123456789abcdef");
+    }
+
+    @Test
+    void usesTheInstalledCorrelationProviderAndSurvivesItsFailure() {
+        SqlTraceRecorder recorder = new SqlTraceRecorder(true, true, false, false, 10, 100, 2000, 200, 5);
+        recorder.setCorrelationContextProvider(
+                () -> io.github.jdubois.bootui.spi.CorrelationContext.forRequest("fedcba9876543210"));
+        recorder.record(
+                StatementType.PREPARED, Category.SELECT, "select 1", List.of(), 10, true, null, null, 0, "c1", "t1");
+        recorder.setCorrelationContextProvider(() -> {
+            throw new IllegalStateException("broken");
+        });
+        recorder.record(
+                StatementType.PREPARED, Category.SELECT, "select 2", List.of(), 10, true, null, null, 0, "c1", "t1");
+
+        assertThat(recorder.recent())
+                .extracting(SqlTraceRecorder.CapturedStatement::requestId)
+                .containsExactly(null, "fedcba9876543210");
     }
 }

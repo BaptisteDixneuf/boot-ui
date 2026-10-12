@@ -6,11 +6,32 @@ import io.github.jdubois.bootui.core.dto.SqlTraceGroupDto;
 import io.github.jdubois.bootui.core.dto.SqlTraceReport;
 import io.github.jdubois.bootui.core.dto.SqlTraceStatsDto;
 import io.github.jdubois.bootui.engine.activity.BootUiJdbcCaptureGuard;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.correlation.ExecutionIds;
+import io.github.jdubois.bootui.engine.correlation.RequestPhase;
+import io.github.jdubois.bootui.engine.correlation.RequestPhases;
+import io.github.jdubois.bootui.engine.correlation.ThreadKinds;
+import io.github.jdubois.bootui.engine.javaagent.AgentCodePaths;
+import io.github.jdubois.bootui.engine.javaagent.AgentRequestValues;
+import io.github.jdubois.bootui.engine.javaagent.RequestInputSinks;
+import io.github.jdubois.bootui.engine.journal.ApplicationFrames;
+import io.github.jdubois.bootui.engine.journal.ConnectionPayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.engine.journal.SqlCaptureScopes;
+import io.github.jdubois.bootui.engine.journal.SqlPayload;
+import io.github.jdubois.bootui.engine.journal.SqlPayload.Provenance;
 import io.github.jdubois.bootui.engine.retention.TieredCaptureBuffer;
-import io.github.jdubois.bootui.engine.support.StackFramePrefixes;
 import io.github.jdubois.bootui.engine.telemetry.SpanEnricher;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
 import io.github.jdubois.bootui.spi.IdleReclaimable;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
+import io.github.jdubois.bootui.spi.ThreadKind;
+import io.github.jdubois.bootui.spi.ThreadKindClassifier;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -21,6 +42,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
@@ -41,7 +63,7 @@ import java.util.stream.Stream;
  * beans were actually wrapped, so the panel can distinguish "no data source"
  * from "tracing disabled".</p>
  */
-public final class SqlTraceRecorder implements IdleReclaimable {
+public final class SqlTraceRecorder implements IdleReclaimable, RuntimeEventPublisher, MemoryOffloadable {
 
     static final int TOP_STATEMENTS_LIMIT = 20;
 
@@ -86,10 +108,219 @@ public final class SqlTraceRecorder implements IdleReclaimable {
             String thread,
             String traceId,
             List<String> parameters,
-            String callSite) {
+            String callSite,
+            String requestId,
+            String executionId,
+            String threadKind,
+            String requestPhase,
+            Provenance provenance) {
+        /** A captured JDBC execution, preserving the original constructor's contract. */
+        public CapturedStatement(
+                long id,
+                long timestamp,
+                String sql,
+                StatementType statementType,
+                Category category,
+                long durationMicros,
+                boolean success,
+                String errorMessage,
+                Long affectedRows,
+                int batchSize,
+                String connectionId,
+                String thread,
+                String traceId,
+                List<String> parameters,
+                String callSite,
+                String requestId,
+                String executionId,
+                String threadKind,
+                String requestPhase) {
+            this(
+                    id,
+                    timestamp,
+                    sql,
+                    statementType,
+                    category,
+                    durationMicros,
+                    success,
+                    errorMessage,
+                    affectedRows,
+                    batchSize,
+                    connectionId,
+                    thread,
+                    traceId,
+                    parameters,
+                    callSite,
+                    requestId,
+                    executionId,
+                    threadKind,
+                    requestPhase,
+                    Provenance.EXECUTION);
+        }
+
+        public boolean executed() {
+            return provenance == Provenance.EXECUTION;
+        }
+
+        /** Without BootUI's execution identity. */
+        public CapturedStatement(
+                long id,
+                long timestamp,
+                String sql,
+                StatementType statementType,
+                Category category,
+                long durationMicros,
+                boolean success,
+                String errorMessage,
+                Long affectedRows,
+                int batchSize,
+                String connectionId,
+                String thread,
+                String traceId,
+                List<String> parameters,
+                String callSite,
+                String requestId,
+                String executionId,
+                String threadKind) {
+            this(
+                    id,
+                    timestamp,
+                    sql,
+                    statementType,
+                    category,
+                    durationMicros,
+                    success,
+                    errorMessage,
+                    affectedRows,
+                    batchSize,
+                    connectionId,
+                    thread,
+                    traceId,
+                    parameters,
+                    callSite,
+                    requestId,
+                    executionId,
+                    threadKind,
+                    null);
+        }
+
+        /** Without the thread kind. */
+        public CapturedStatement(
+                long id,
+                long timestamp,
+                String sql,
+                StatementType statementType,
+                Category category,
+                long durationMicros,
+                boolean success,
+                String errorMessage,
+                Long affectedRows,
+                int batchSize,
+                String connectionId,
+                String thread,
+                String traceId,
+                List<String> parameters,
+                String callSite,
+                String requestId,
+                String executionId) {
+            this(
+                    id,
+                    timestamp,
+                    sql,
+                    statementType,
+                    category,
+                    durationMicros,
+                    success,
+                    errorMessage,
+                    affectedRows,
+                    batchSize,
+                    connectionId,
+                    thread,
+                    traceId,
+                    parameters,
+                    callSite,
+                    requestId,
+                    executionId,
+                    null);
+        }
+
+        /** Without BootUI's execution identity. */
+        public CapturedStatement(
+                long id,
+                long timestamp,
+                String sql,
+                StatementType statementType,
+                Category category,
+                long durationMicros,
+                boolean success,
+                String errorMessage,
+                Long affectedRows,
+                int batchSize,
+                String connectionId,
+                String thread,
+                String traceId,
+                List<String> parameters,
+                String callSite,
+                String requestId) {
+            this(
+                    id,
+                    timestamp,
+                    sql,
+                    statementType,
+                    category,
+                    durationMicros,
+                    success,
+                    errorMessage,
+                    affectedRows,
+                    batchSize,
+                    connectionId,
+                    thread,
+                    traceId,
+                    parameters,
+                    callSite,
+                    requestId,
+                    null);
+        }
 
         public CapturedStatement {
             parameters = parameters == null ? List.of() : List.copyOf(parameters);
+            provenance = provenance == null ? Provenance.UNKNOWN : provenance;
+        }
+
+        /** A captured execution without BootUI's request identity. */
+        public CapturedStatement(
+                long id,
+                long timestamp,
+                String sql,
+                StatementType statementType,
+                Category category,
+                long durationMicros,
+                boolean success,
+                String errorMessage,
+                Long affectedRows,
+                int batchSize,
+                String connectionId,
+                String thread,
+                String traceId,
+                List<String> parameters,
+                String callSite) {
+            this(
+                    id,
+                    timestamp,
+                    sql,
+                    statementType,
+                    category,
+                    durationMicros,
+                    success,
+                    errorMessage,
+                    affectedRows,
+                    batchSize,
+                    connectionId,
+                    thread,
+                    traceId,
+                    parameters,
+                    callSite,
+                    null);
         }
 
         /** The exact duration rounded to whole milliseconds. */
@@ -114,9 +345,13 @@ public final class SqlTraceRecorder implements IdleReclaimable {
     private final AtomicBoolean recording;
     private volatile boolean idleSuspended = false;
     private final Set<String> dataSourceNames = new ConcurrentSkipListSet<>();
+    private final SqlCaptureScopes sqlCaptureScopes = new SqlCaptureScopes();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
-    private volatile TraceIdProvider traceIdProvider = SqlTraceRecorder::mdcTraceId;
+    private final CorrelationSource correlation = new CorrelationSource();
+    private final ThreadKinds threadKinds = new ThreadKinds();
+    private volatile RequestPhases requestPhases;
     private volatile SpanEnricher spanEnricher = SpanEnricher.NO_OP;
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
 
     /** A recorder reserving the default share of its buffer for failed and slow executions. */
     public SqlTraceRecorder(
@@ -197,15 +432,59 @@ public final class SqlTraceRecorder implements IdleReclaimable {
     }
 
     /**
-     * Replaces the trace-id source used to stamp each captured statement. Defaults to the SLF4J MDC
-     * {@code traceId} key that Micrometer Tracing publishes on Spring, which works because Spring MVC
-     * serves a request start-to-finish on one thread. The Quarkus adapter installs an OpenTelemetry-backed
-     * provider instead, because its blocking SQL runs on a worker thread the MDC key never reaches but the
-     * OpenTelemetry context does. Passing {@code null} restores the default MDC lookup, so the Spring
-     * adapter (which never calls this) is unaffected.
+     * Replaces the source of the request id stamped on each captured statement ({@code docs/PLAN-v2.md} §5.1).
+     * Defaults to the thread's {@link BootUiCorrelation} scope. The Quarkus adapter installs a provider that also reads
+     * the request's Vert.x context, because blocking SQL runs on a worker thread. Passing {@code null} restores the
+     * default.
      */
-    public void setTraceIdProvider(TraceIdProvider traceIdProvider) {
-        this.traceIdProvider = traceIdProvider == null ? SqlTraceRecorder::mdcTraceId : traceIdProvider;
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
+    }
+
+    /**
+     * Replaces the classifier of the thread kind stamped on each capture ({@code docs/PLAN-v2.md} §5.1): each adapter
+     * installs one that knows its own threads. Defaults to classifying virtual threads only; {@code null} restores it.
+     */
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded statement right after
+     * the buffer does. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+        SqlCaptureScopes.Snapshot scope = sqlCaptureScopes.snapshot();
+        scope.executions().forEach(name -> this.journal.registerSqlCapture(name, Provenance.EXECUTION));
+        scope.preparations().forEach(name -> this.journal.registerSqlCapture(name, Provenance.PREPARATION));
+        if (scope.incomplete()) {
+            this.journal.registerSqlCapture(null, Provenance.UNKNOWN);
+        }
+    }
+
+    public void setThreadKindClassifier(ThreadKindClassifier classifier) {
+        threadKinds.set(classifier);
+    }
+
+    /**
+     * Installs the phase markers of recent requests ({@code docs/PLAN-v2.md} §5.1), so each statement records the phase
+     * of its request it ran in, such as {@code RESPONSE} for lazy loading during body serialization. {@code null}, the
+     * default, records no phase.
+     */
+    public void setRequestPhases(RequestPhases requestPhases) {
+        this.requestPhases = requestPhases;
+    }
+
+    private RequestPhase requestPhase(String requestId, String executionId) {
+        RequestPhases phases = requestPhases;
+        // A task the agent propagated runs beside its request, so the request's phase says nothing about it: stamping
+        // RESPONSE on its statements would report work after the response as lazy loading in the response.
+        if (phases == null || requestId == null || ExecutionIds.isAsync(executionId)) {
+            return null;
+        }
+        try {
+            return phases.phaseOf(requestId);
+        } catch (RuntimeException ex) {
+            return null;
+        }
     }
 
     /**
@@ -255,6 +534,16 @@ public final class SqlTraceRecorder implements IdleReclaimable {
         }
     }
 
+    /** Registers a successfully installed feeder, never a claim about SQL outside that feeder's scope. */
+    public void registerCaptureSource(String name, Provenance provenance) {
+        if (!enabled) {
+            return;
+        }
+        if (sqlCaptureScopes.register(name, provenance)) {
+            journal.registerSqlCapture(name, provenance);
+        }
+    }
+
     public List<String> dataSourceNames() {
         return List.copyOf(dataSourceNames);
     }
@@ -281,29 +570,298 @@ public final class SqlTraceRecorder implements IdleReclaimable {
             int batchSize,
             String connectionId,
             String thread) {
-        if (!enabled || idleSuspended || !recording.get() || BootUiJdbcCaptureGuard.isSuppressed()) {
-            return;
-        }
-        CapturedStatement entry = new CapturedStatement(
-                sequence.incrementAndGet(),
-                System.currentTimeMillis(),
-                truncate(sql, maxSqlLength),
-                statementType == null ? StatementType.STATEMENT : statementType,
-                category == null ? Category.OTHER : category,
-                Math.max(0, durationMicros),
+        recordNanos(
+                statementType,
+                category,
+                sql,
+                parameters,
+                Math.max(0, durationMicros) * 1_000,
                 success,
                 errorMessage,
                 affectedRows,
-                Math.max(0, batchSize),
+                batchSize,
+                connectionId,
+                thread);
+    }
+
+    /**
+     * Records one execution timed in nanoseconds, as the JDBC proxy times it: the panel keeps microseconds, and the
+     * runtime journal the nanoseconds ({@code docs/PLAN-v2.md} §5.2).
+     */
+    public void recordNanos(
+            StatementType statementType,
+            Category category,
+            String sql,
+            List<String> parameters,
+            long durationNanos,
+            boolean success,
+            String errorMessage,
+            Long affectedRows,
+            int batchSize,
+            String connectionId,
+            String thread) {
+        recordNanos(
+                statementType,
+                category,
+                sql,
+                parameters,
+                durationNanos,
+                success,
+                errorMessage,
+                affectedRows,
+                batchSize,
                 connectionId,
                 thread,
-                resolveTraceId(),
-                captureParameters ? List.copyOf(parameters == null ? List.of() : parameters) : List.of(),
-                captureCallSite ? currentCallSite() : null);
-        buffer.add(entry, isFailedOrSlow(entry.success(), isSlow(entry.durationMicros())));
-        totalCaptured.incrementAndGet();
-        notifyListeners();
-        enrichActiveSpan(entry.traceId());
+                null);
+    }
+
+    public void recordNanos(
+            StatementType statementType,
+            Category category,
+            String sql,
+            List<String> parameters,
+            long durationNanos,
+            boolean success,
+            String errorMessage,
+            Long affectedRows,
+            int batchSize,
+            String connectionId,
+            String thread,
+            String dataSource) {
+        capture(
+                statementType,
+                category,
+                sql,
+                parameters,
+                durationNanos,
+                success,
+                errorMessage,
+                affectedRows,
+                batchSize,
+                connectionId,
+                thread,
+                dataSource,
+                Provenance.EXECUTION);
+    }
+
+    /** Records only SQL inspection: no JDBC execution, outcome, or elapsed database time was observed. */
+    public void recordPreparation(String sql, String dataSource) {
+        registerCaptureSource(dataSource, Provenance.PREPARATION);
+        capture(
+                StatementType.PREPARED,
+                SqlTracingProxies.categoryOf(sql),
+                sql,
+                List.of(),
+                0,
+                true,
+                null,
+                null,
+                0,
+                null,
+                Thread.currentThread().getName(),
+                dataSource,
+                Provenance.PREPARATION);
+    }
+
+    private void capture(
+            StatementType statementType,
+            Category category,
+            String sql,
+            List<String> parameters,
+            long durationNanos,
+            boolean success,
+            String errorMessage,
+            Long affectedRows,
+            int batchSize,
+            String connectionId,
+            String thread,
+            String dataSource,
+            Provenance provenance) {
+        if (!enabled || BootUiJdbcCaptureGuard.isSuppressed()) {
+            return;
+        }
+        // Whether request input reached this statement's text, on the thread that issued it (docs/PLAN-v2.md §5.16,
+        // M5-6b): only while request-value matching is on; never a value or the text kept.
+        if (AgentRequestValues.enabled()) {
+            RequestInputSinks.sql(sql, correlation.current());
+        }
+        // A paused or idle-suspended panel skips its own buffer, listeners, and span enrichment, but the runtime
+        // journal keeps recording whenever it records SQL (docs/PLAN-v2.md §5.2).
+        boolean panel = capturesForPanel();
+        boolean toJournal = journal.records(JournalSource.SQL);
+        if (!panel && !toJournal) {
+            return;
+        }
+        CorrelationContext context = correlation.current();
+        ThreadKind threadKind = threadKinds.current();
+        long completedNanos = System.nanoTime();
+        long timestamp = System.currentTimeMillis();
+        RequestPhase phase = requestPhase(context.requestId(), context.executionId());
+        // The stack is walked only for what keeps it: the panel's call sites, or the journal's application frames.
+        ApplicationFrames frames =
+                ApplicationFrames.wanted(panel, captureCallSite, toJournal) ? ApplicationFrames.capture() : null;
+        // The issuing thread's innermost instrumented method, when the BootUI agent records code paths (§5.14).
+        long codePathStamp = toJournal ? AgentCodePaths.stamp() : 0L;
+        String truncatedSql = truncate(sql, maxSqlLength);
+        long nanos = Math.max(0, durationNanos);
+        long micros = nanos / 1_000;
+        String traceId = resolveTraceId();
+        boolean failedOrSlow = isFailedOrSlow(success, isSlow(micros));
+        if (panel) {
+            // The panel's call site is the one frame formatted on this thread; the journal formats its frames on its
+            // dispatcher (M4-18d).
+            String callSite = captureCallSite && frames != null ? frames.callSite() : null;
+            CapturedStatement entry = new CapturedStatement(
+                    sequence.incrementAndGet(),
+                    timestamp,
+                    truncatedSql,
+                    statementType == null ? StatementType.STATEMENT : statementType,
+                    category == null ? Category.OTHER : category,
+                    micros,
+                    success,
+                    errorMessage,
+                    affectedRows,
+                    Math.max(0, batchSize),
+                    connectionId,
+                    thread,
+                    traceId,
+                    captureParameters ? List.copyOf(parameters == null ? List.of() : parameters) : List.of(),
+                    callSite,
+                    context.requestId(),
+                    context.executionId(),
+                    threadKind.name(),
+                    phase == null ? null : phase.name(),
+                    provenance);
+            buffer.add(entry, failedOrSlow);
+        }
+        if (toJournal) {
+            publish(
+                    context,
+                    traceId,
+                    timestamp,
+                    nanos,
+                    thread,
+                    threadKind,
+                    failedOrSlow,
+                    truncatedSql,
+                    success,
+                    frames,
+                    phase,
+                    completedNanos,
+                    dataSource,
+                    codePathStamp,
+                    provenance);
+        }
+        if (panel) {
+            totalCaptured.incrementAndGet();
+            notifyListeners();
+            if (provenance == Provenance.EXECUTION) {
+                enrichActiveSpan(traceId);
+            }
+        }
+    }
+
+    /** Publishes a statement to the journal, stamped when it started; never throws. */
+    private void publish(
+            CorrelationContext context,
+            String traceId,
+            long completedEpochMillis,
+            long durationNanos,
+            String thread,
+            ThreadKind threadKind,
+            boolean failedOrSlow,
+            String sql,
+            boolean success,
+            ApplicationFrames frames,
+            RequestPhase phase,
+            long completedNanos,
+            String dataSource,
+            long codePathStamp,
+            Provenance provenance) {
+        try {
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.SQL,
+                    RuntimeEvent.startMillis(completedEpochMillis, durationNanos),
+                    durationNanos,
+                    context,
+                    traceId,
+                    thread,
+                    threadKind,
+                    failedOrSlow,
+                    new SqlPayload(
+                            sql,
+                            null,
+                            dataSource == null ? context.dataSource() : dataSource,
+                            !success,
+                            frames,
+                            phase,
+                            completedNanos,
+                            codePathStamp,
+                            provenance)));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the statement it observes.
+        }
+    }
+
+    /**
+     * Whether the SQL Trace panel captures statements now: capture is installed, recording is on, and the panel is not
+     * suspended while idle. The runtime journal may still record statements when this is {@code false}.
+     */
+    public boolean capturesForPanel() {
+        return enabled && !idleSuspended && recording.get();
+    }
+
+    /**
+     * Starts following a logical connection the application has just obtained ({@code docs/PLAN-v2.md} §5.2), or
+     * returns {@code null} when nothing is recorded now, so the proxy keeps no state for it.
+     *
+     * @param dataSource the data source's name, or {@code null}
+     * @param waitNanos how long obtaining the connection took
+     */
+    public ConnectionCheckout checkoutConnection(String dataSource, long waitNanos) {
+        // Logical connections only feed the journal, so the panel's pause and idle state do not gate them.
+        if (!enabled || BootUiJdbcCaptureGuard.isSuppressed() || !journal.records(JournalSource.CONNECTION)) {
+            return null;
+        }
+        return new ConnectionCheckout(
+                dataSource,
+                System.currentTimeMillis(),
+                System.nanoTime(),
+                Math.max(0, waitNanos),
+                correlation.current(),
+                Thread.currentThread().getName(),
+                threadKinds.current(),
+                new AtomicInteger(),
+                new AtomicBoolean());
+    }
+
+    /**
+     * Publishes a logical connection to the journal when the application releases it, with how long it waited for it
+     * and held it, and the statements that ran on it. A connection held for at least the slow-query threshold is kept
+     * with failed and slow events. A second release of the same connection is ignored.
+     */
+    public void releaseConnection(ConnectionCheckout checkout) {
+        if (checkout == null || !checkout.release()) {
+            return;
+        }
+        try {
+            long heldNanos = Math.max(0, System.nanoTime() - checkout.obtainedNanos());
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.CONNECTION,
+                    checkout.epochMillis(),
+                    heldNanos,
+                    checkout.context(),
+                    checkout.thread(),
+                    checkout.threadKind(),
+                    isSlow(heldNanos / 1_000),
+                    new ConnectionPayload(
+                            checkout.dataSource(),
+                            checkout.waitNanos(),
+                            checkout.statements().get(),
+                            checkout.obtainedNanos())));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the connection's release.
+        }
     }
 
     /**
@@ -324,6 +882,7 @@ public final class SqlTraceRecorder implements IdleReclaimable {
 
     private boolean suspectsNPlusOne(String traceId) {
         List<SqlTraceEntryDto> forTrace = recent().stream()
+                .filter(CapturedStatement::executed)
                 .filter(entry -> traceId.equals(entry.traceId()))
                 .map(entry -> toDto(entry, false))
                 .toList();
@@ -346,6 +905,24 @@ public final class SqlTraceRecorder implements IdleReclaimable {
     /** The buffer's retention counts: capacity, reserved share, retained and reserved executions, and evictions. */
     public CaptureRetentionDto retention() {
         return buffer.snapshot().retention(slowQueryThresholdMillis);
+    }
+
+    @Override
+    public String offloadId() {
+        return "sql-trace";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "SQL Trace statements";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recent().size();
+        clear();
+        return retained;
     }
 
     public void clear() {
@@ -402,6 +979,9 @@ public final class SqlTraceRecorder implements IdleReclaimable {
         long deletes = 0;
         long others = 0;
         for (CapturedStatement entry : snapshot.newestFirst()) {
+            if (!entry.executed()) {
+                continue;
+            }
             total++;
             totalDurationMicros += entry.durationMicros();
             maxDurationMicros = Math.max(maxDurationMicros, entry.durationMicros());
@@ -452,6 +1032,9 @@ public final class SqlTraceRecorder implements IdleReclaimable {
     private List<SqlTraceGroupDto> topStatements(TieredCaptureBuffer.Snapshot<CapturedStatement> snapshot) {
         Map<String, Aggregate> byStatement = new LinkedHashMap<>();
         for (CapturedStatement entry : snapshot.newestFirst()) {
+            if (!entry.executed()) {
+                continue;
+            }
             String sql = entry.sql() == null ? "" : entry.sql();
             Aggregate aggregate = byStatement.computeIfAbsent(sql, key -> new Aggregate(key, entry.category()));
             aggregate.executions++;
@@ -487,7 +1070,7 @@ public final class SqlTraceRecorder implements IdleReclaimable {
      * unavailable case (no data source / tracing off); this method covers the available, wrapped case.
      */
     public SqlTraceReport report(boolean exposeParameters) {
-        // One snapshot feeds every section, so the entries, statistics, and retention counts always reconcile.
+        // Preparation rows stay visible; execution statistics exclude them.
         TieredCaptureBuffer.Snapshot<CapturedStatement> snapshot = buffer.snapshot();
         return new SqlTraceReport(
                 true,
@@ -514,11 +1097,43 @@ public final class SqlTraceRecorder implements IdleReclaimable {
      * aggregations it will not read.
      */
     public List<SqlTraceEntryDto> entries(boolean exposeParameters) {
-        return recent().stream().map(entry -> toDto(entry, exposeParameters)).toList();
+        return recent().stream()
+                .filter(CapturedStatement::executed)
+                .map(entry -> toDto(entry, exposeParameters))
+                .toList();
+    }
+
+    /** Capture declarations survive buffer eviction; an empty execution list cannot certify ORM execution timing. */
+    public String executionCaptureLimitation() {
+        SqlCaptureScopes.Snapshot scope = sqlCaptureScopes.snapshot();
+        String preparation = scope.preparations().isEmpty()
+                ? ""
+                : "SQL preparation is not execution evidence; execution timing for inspected ORM statements is"
+                        + " unavailable. Only confirmed JDBC executions are included.";
+        String unknown = !scope.incomplete()
+                ? ""
+                : "SQL capture provenance or scope is unknown; execution timing for unverified statements is unavailable.";
+        return preparation.isEmpty() && unknown.isEmpty()
+                ? null
+                : preparation.isEmpty() ? unknown : unknown.isEmpty() ? preparation : preparation + " " + unknown;
     }
 
     private List<String> warnings(boolean exposeParameters, TieredCaptureBuffer.Snapshot<CapturedStatement> snapshot) {
         List<String> warnings = new ArrayList<>();
+        long preparations = snapshot.newestFirst().stream()
+                .filter(entry -> entry.provenance() == Provenance.PREPARATION)
+                .count();
+        long unknown = snapshot.newestFirst().stream()
+                .filter(entry -> entry.provenance() == Provenance.UNKNOWN)
+                .count();
+        if (preparations > 0) {
+            warnings.add(preparations + " SQL capture(s) observed preparation only, not execution. These rows have no"
+                    + " measured duration or outcome and are excluded from execution statistics and rankings.");
+        }
+        if (unknown > 0) {
+            warnings.add(unknown + " SQL capture(s) have unknown execution provenance and are excluded from execution"
+                    + " statistics and rankings; neither execution nor preparation is established.");
+        }
         if (!isRecording()) {
             warnings.add("Recording is paused. Resume it to capture new queries.");
         }
@@ -559,7 +1174,11 @@ public final class SqlTraceRecorder implements IdleReclaimable {
                 isSlow(entry.durationMicros()),
                 exposeParameters ? entry.parameters() : List.of(),
                 entry.traceId(),
-                entry.callSite());
+                entry.callSite(),
+                entry.requestId(),
+                entry.executionId(),
+                entry.threadKind(),
+                entry.requestPhase());
     }
 
     private static String truncate(String value, int max) {
@@ -575,27 +1194,12 @@ public final class SqlTraceRecorder implements IdleReclaimable {
 
     /**
      * The trace id to stamp on the next captured statement, taken from the configured
-     * {@link TraceIdProvider} and fully guarded so SQL execution is never disrupted by a missing or
+     * correlation source and fully guarded so SQL execution is never disrupted by a missing or
      * misbehaving provider. Returns {@code null} (no correlation) when blank or on any failure.
      */
     private String resolveTraceId() {
         try {
-            String traceId = traceIdProvider.currentTraceId();
-            return traceId == null || traceId.isBlank() ? null : traceId;
-        } catch (RuntimeException ex) {
-            return null;
-        }
-    }
-
-    /**
-     * Default trace-id source: the SLF4J MDC where Micrometer Tracing publishes it (the {@code traceId}
-     * correlation key). Returns {@code null} when no tracer is active or the key is absent, in which case
-     * downstream correlation falls back to its time-window heuristic. The lookup is fully guarded so SQL
-     * execution is never disrupted by a missing or misbehaving MDC.
-     */
-    private static String mdcTraceId() {
-        try {
-            String traceId = org.slf4j.MDC.get("traceId");
+            String traceId = correlation.traceId();
             return traceId == null || traceId.isBlank() ? null : traceId;
         } catch (RuntimeException ex) {
             return null;
@@ -605,27 +1209,6 @@ public final class SqlTraceRecorder implements IdleReclaimable {
     /** Bound on how many stack frames are inspected before giving up on finding an application frame. */
     private static final int MAX_CALL_SITE_FRAMES = 128;
 
-    private static final StackWalker STACK_WALKER = StackWalker.getInstance();
-
-    /**
-     * Best-effort location of the first application stack frame above the JDBC call — i.e. the first
-     * frame that isn't the JDK, a JDBC driver/connection pool, Hibernate, or BootUI's own
-     * instrumentation (see {@link StackFramePrefixes}) — formatted the same way as
-     * {@link io.github.jdubois.bootui.engine.exceptions.ExceptionStore}'s exception location:
-     * {@code ClassName.methodName(File.java:42)}. Walks at most {@link #MAX_CALL_SITE_FRAMES} frames of
-     * the current thread's stack, short-circuiting at the first match rather than materializing the
-     * whole stack, since this runs on every captured statement rather than only on exceptions. Fully
-     * guarded so a stack-walking failure can never disrupt SQL execution; returns {@code null} when no
-     * application frame is found within the bound, or on any failure.
-     */
-    private static String currentCallSite() {
-        try {
-            return STACK_WALKER.walk(SqlTraceRecorder::selectCallSite);
-        } catch (RuntimeException ex) {
-            return null;
-        }
-    }
-
     /**
      * Pure frame-selection logic factored out of {@link #currentCallSite()} so it can be unit-tested with
      * a synthetic frame stream, without depending on the ambient call stack of whatever happens to invoke
@@ -633,19 +1216,8 @@ public final class SqlTraceRecorder implements IdleReclaimable {
      * frame belongs to BootUI itself, the JDK, JUnit, or the build tool). Package-private for tests.
      */
     static String selectCallSite(Stream<StackWalker.StackFrame> frames) {
-        return frames.limit(MAX_CALL_SITE_FRAMES)
-                .filter(frame -> !StackFramePrefixes.isFrameworkClass(frame.getClassName()))
-                .findFirst()
-                .map(SqlTraceRecorder::formatFrame)
-                .orElse(null);
-    }
-
-    private static String formatFrame(StackWalker.StackFrame frame) {
-        String file = frame.getFileName();
-        String position = file == null
-                ? "Unknown Source"
-                : (frame.getLineNumber() >= 0 ? file + ":" + frame.getLineNumber() : file);
-        return frame.getClassName() + "." + frame.getMethodName() + "(" + position + ")";
+        ApplicationFrames selected = ApplicationFrames.select(frames);
+        return selected == null ? null : selected.callSite();
     }
 
     private static final class Aggregate {

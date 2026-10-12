@@ -3,10 +3,23 @@ package io.github.jdubois.bootui.engine.web;
 /**
  * How a child signal was tied to the execution a profile anchors on, strongest first.
  *
- * <p>{@link #TRACE_ID} and {@link #SERVING_THREAD} are exact under the unique-candidate rule;
- * {@link #TIME_WINDOW} is a labelled heuristic, so a profile that used it is marked approximate.</p>
+ * <p>{@link #REQUEST_ID} and {@link #PROPAGATED} are exact by construction. {@link #TRACE_ID} and {@link #SERVING_THREAD} are exact under the
+ * unique-candidate rule; {@link #TIME_WINDOW} is a labelled heuristic, so a profile that used it is marked
+ * approximate.</p>
  */
 public enum CorrelationTier {
+
+    /**
+     * The child carries the BootUI request id the anchor carries ({@code docs/PLAN-v2.md} §5.1), stamped when the
+     * child was recorded, with or without tracing.
+     */
+    REQUEST_ID,
+
+    /**
+     * The child carries the anchor's BootUI request id and ran in a child execution ({@code async-…}) that the BootUI
+     * agent propagated through a JDK executor ({@code docs/PLAN-v2.md} M5-2), within its handoff deadline.
+     */
+    PROPAGATED,
 
     /** The child carries a distributed-trace id that exactly one anchor of any type carries. */
     TRACE_ID,

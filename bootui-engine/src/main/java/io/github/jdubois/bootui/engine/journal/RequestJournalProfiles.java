@@ -1,0 +1,659 @@
+package io.github.jdubois.bootui.engine.journal;
+
+import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
+import io.github.jdubois.bootui.core.dto.RequestGcPauseDto;
+import io.github.jdubois.bootui.core.dto.RequestHandoffDto;
+import io.github.jdubois.bootui.core.dto.RequestJournalProfileDto;
+import io.github.jdubois.bootui.core.dto.RequestOrmDto;
+import io.github.jdubois.bootui.core.dto.RequestResourcesDto;
+import io.github.jdubois.bootui.core.dto.RequestTimelineItemDto;
+import io.github.jdubois.bootui.core.dto.RouteComparisonDto;
+import io.github.jdubois.bootui.core.dto.TouchedResourcesDto;
+import io.github.jdubois.bootui.engine.correlation.ExecutionIds;
+import io.github.jdubois.bootui.engine.correlation.HandoffWindow;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates.RouteStats;
+import io.github.jdubois.bootui.engine.resources.GcPauseRange;
+import io.github.jdubois.bootui.engine.resources.ResourceUsage;
+import io.github.jdubois.bootui.engine.sqltrace.RouteLabel;
+import io.github.jdubois.bootui.engine.sqltrace.RouteTemplateResolver;
+import io.github.jdubois.bootui.engine.sqltrace.SqlShapes;
+import io.github.jdubois.bootui.spi.ExposurePolicy;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+/**
+ * One request as the runtime journal recorded it ({@code docs/PLAN-v2.md} §5.3, §5.11), shared by every adapter: its
+ * work on one timeline, the collections that completed while it ran, its measured resources, how it compares with its
+ * route, and what it touched.
+ *
+ * <p>Every child belongs to the request by its request id, and an AI call, which carries none, by the request's trace
+ * id when no other retained request shares it. The timeline places each event at its start, which every source stamps
+ * as the event's time ({@link RuntimeEvent}). Rows of a disabled panel are left out, as Live Activity leaves them out.
+ * </p>
+ */
+public final class RequestJournalProfiles {
+
+    /** The requests a route needs before the comparison says where one of them stands. */
+    public static final int MINIMUM_ROUTE_REQUESTS = 5;
+
+    /** The most collections joined to one request. */
+    public static final int MAX_GC_PAUSES = 64;
+
+    /** The most entries each list of touched resources keeps. */
+    public static final int MAX_TOUCHED = 50;
+
+    static final String DISABLED = JournalActivityReports.DISABLED;
+
+    /** Why the journal has no profile of {@code requestId}: it records no such request or execution. */
+    static String notRetainedReason(String requestId) {
+        return "The runtime journal does not retain a visible completed request or execution " + requestId
+                + " (it may have been evicted or its source panel is disabled).";
+    }
+
+    /**
+     * Whether {@code profile} says the enabled journal records no request or execution {@code requestId}, as opposed
+     * to the journal being off or the request's panel hiding it.
+     */
+    public static boolean notRetained(RequestJournalProfileDto profile, String requestId) {
+        return profile != null
+                && !profile.available()
+                && notRetainedReason(requestId).equals(profile.unavailableReason());
+    }
+
+    private final RuntimeJournal journal;
+    private final JournalAggregates aggregates;
+    private final JournalActivityFeed feed;
+    private final Supplier<RouteTemplateResolver> declaredRoutes;
+    private final Predicate<String> panelEnabled;
+    private volatile long maxHandoffMillis = DEFAULT_MAX_HANDOFF_MILLIS;
+
+    /** The default {@code bootui.agent.executors.max-handoff}. */
+    public static final long DEFAULT_MAX_HANDOFF_MILLIS = HandoffWindow.DEFAULT_MAX_HANDOFF_MILLIS;
+
+    /**
+     * @param journal the journal, or {@code null} when the adapter created none
+     * @param aggregates its aggregates, or {@code null}
+     * @param panelEnabled whether a panel, by its id, is enabled; {@code null} enables every panel
+     */
+    public RequestJournalProfiles(
+            RuntimeJournal journal,
+            JournalAggregates aggregates,
+            long requestSlowThresholdMs,
+            int nPlusOneThreshold,
+            Predicate<String> panelEnabled) {
+        this(journal, aggregates, requestSlowThresholdMs, nPlusOneThreshold, panelEnabled, null);
+    }
+
+    /**
+     * Profiles whose timeline rows and touched log templates show text as the live {@code exposure} policy allows
+     * when each profile is read ({@code PLAN-v2} §8).
+     *
+     * @param exposure the live exposure policy; {@code null} renders as {@link JournalTextExposure#masked()}
+     */
+    public RequestJournalProfiles(
+            RuntimeJournal journal,
+            JournalAggregates aggregates,
+            long requestSlowThresholdMs,
+            int nPlusOneThreshold,
+            Predicate<String> panelEnabled,
+            ExposurePolicy exposure) {
+        this.journal = journal;
+        this.aggregates = aggregates;
+        this.declaredRoutes = aggregates == null ? RouteTemplateResolver::empty : aggregates.declaredRoutes();
+        this.feed = new JournalActivityFeed(requestSlowThresholdMs, nPlusOneThreshold, declaredRoutes, exposure);
+        this.panelEnabled = panelEnabled == null ? panel -> true : panelEnabled;
+    }
+
+    /**
+     * Sets {@code bootui.agent.executors.max-handoff} ({@link HandoffWindow}): a handoff starting later than this after
+     * its request ended is only counted, and work a handoff recorded later than this after it started is left out.
+     */
+    public RequestJournalProfiles maxHandoff(java.time.Duration maxHandoff) {
+        this.maxHandoffMillis = HandoffWindow.millis(maxHandoff);
+        return this;
+    }
+
+    /** The profile of {@code requestId}, or why the journal cannot give it. */
+    public RequestJournalProfileDto profile(String requestId) {
+        if (journal == null || !journal.settings().enabled()) {
+            return RequestJournalProfileDto.unavailable(requestId, DISABLED);
+        }
+        if (requestId == null || requestId.isBlank()) {
+            return RequestJournalProfileDto.unavailable(requestId, "No request id was given.");
+        }
+        List<JournalEntry> all = journal.entries();
+        JournalEntry request = null;
+        List<JournalEntry> children = new ArrayList<>();
+        Set<Long> selected = new LinkedHashSet<>();
+        List<JournalEntry> aiCalls = new ArrayList<>();
+        Map<String, JournalEntry> collections = new HashMap<>();
+        Set<String> executionHandoffs = new LinkedHashSet<>();
+        AiCallOwners aiCallOwners = new AiCallOwners(journal::evictedARequestOf);
+        for (JournalEntry entry : all) {
+            RuntimeEvent event = entry.event();
+            aiCallOwners.learn(event);
+            if (event.requestId() == null
+                    && event.payload() instanceof AsyncHandoffPayload handoff
+                    && requestId.equals(handoff.parentExecutionId())
+                    && visible(event)) {
+                executionHandoffs.add(event.executionId());
+                if (selected.add(entry.sequence())) {
+                    children.add(entry);
+                }
+            }
+            if (event.payload() instanceof GcPayload gc) {
+                collections.put(gc.collector() + '#' + gc.gcId(), entry);
+            } else if (requestId.equals(event.requestId())) {
+                if (event.source() == JournalSource.HTTP) {
+                    request = entry;
+                } else if (visible(event)) {
+                    if (selected.add(entry.sequence())) {
+                        children.add(entry);
+                    }
+                }
+            } else if (event.requestId() == null && requestId.equals(event.executionId())) {
+                if (event.payload() instanceof ScheduledPayload
+                        || event.payload() instanceof MessagingPayload message && !message.sent()
+                        || event.payload() instanceof WebSocketPayload webSocket && webSocket.opensExecution()) {
+                    request = entry;
+                } else if (visible(event)) {
+                    if (selected.add(entry.sequence())) {
+                        children.add(entry);
+                    }
+                }
+            } else if (AiCallOwners.linksByTrace(event) && visible(event)) {
+                aiCalls.add(entry);
+            }
+        }
+        for (JournalEntry entry : all) {
+            RuntimeEvent event = entry.event();
+            if (event.requestId() == null
+                    && executionHandoffs.contains(event.executionId())
+                    && !requestId.equals(event.executionId())
+                    && !(event.payload() instanceof AsyncHandoffPayload)
+                    && visible(event)
+                    && selected.add(entry.sequence())) {
+                children.add(entry);
+            }
+        }
+        // An AI call carries only its span's trace id, so it joins the request with that trace id whose time span
+        // contains its start, unless another such request shares the trace and which one made the call is unknown.
+        for (JournalEntry call : aiCalls) {
+            if (requestId.equals(aiCallOwners.ownerOf(call.event())) && selected.add(call.sequence())) {
+                children.add(call);
+            }
+        }
+        if (request == null) {
+            return RequestJournalProfileDto.unavailable(requestId, notRetainedReason(requestId));
+        }
+        // The opening event names the unit's route, status, timing, and resources: the evidence of the panel owning
+        // it, which every other surface withholds while that panel is off (docs/PLAN-v2.md §8).
+        if (!visible(request.event())) {
+            return RequestJournalProfileDto.unavailable(
+                    requestId,
+                    "The " + JournalActivityReports.panelOf(request.event()) + " panel is disabled or unavailable, so "
+                            + requestId + " is not shown.");
+        }
+        RuntimeEvent http = request.event();
+        HttpPayload payload = http.payload() instanceof HttpPayload found ? found : null;
+        long start = http.epochMillis();
+        long endMillis = start + Math.max(0, http.durationNanos()) / 1_000_000L;
+        long maxHandoff = maxHandoffMillis;
+        // A handoff starting past max-handoff after the request ended is only counted, and its work, like any work a
+        // handoff recorded past max-handoff after it started, belongs to no request (M5-2): neither is drawn.
+        HandoffWindow.Starts starts = new HandoffWindow.Starts();
+        for (JournalEntry child : children) {
+            RuntimeEvent event = child.event();
+            if (event.payload() instanceof AsyncHandoffPayload) {
+                starts.handoff(event.executionId(), event.epochMillis());
+            } else {
+                starts.recorded(event.executionId(), event.epochMillis());
+            }
+        }
+        int late = 0;
+        for (Iterator<JournalEntry> it = children.iterator(); it.hasNext(); ) {
+            RuntimeEvent event = it.next().event();
+            if (!ExecutionIds.isAsync(event.executionId())) {
+                continue;
+            }
+            if (event.payload() instanceof AsyncHandoffPayload) {
+                if (!HandoffWindow.attaches(endMillis, event.epochMillis(), maxHandoff)) {
+                    late++;
+                    it.remove();
+                }
+            } else if (!starts.attributed(event.executionId(), event.epochMillis(), endMillis, maxHandoff)) {
+                it.remove();
+            }
+        }
+        RouteLabel label = payload == null
+                ? null
+                : RouteLabel.of(
+                        payload.method(), payload.path(), payload.routeTemplate(), payload.operation(), resolver());
+        List<String> notes = new ArrayList<>();
+        if (children.stream()
+                .anyMatch(entry -> entry.event().payload() instanceof AsyncHandoffPayload handoff
+                        && java.util.Objects.equals(handoff.executionId(), handoff.parentExecutionId()))) {
+            notes.add("These handoffs share their parent execution id; their SQL, REST client, and messaging counts"
+                    + " cannot be attributed to individual tasks.");
+        }
+        if (children.stream().anyMatch(entry -> entry.event().payload() instanceof SqlPayload sql && !sql.executed())) {
+            notes.add("Unverified SQL captures do not establish execution, database time, or touched tables.");
+        }
+        List<RequestHandoffDto> handoffs =
+                handoffs(children, start, Math.max(0, http.durationNanos()), payload != null);
+
+        List<JournalEntry> rendered = new ArrayList<>(children);
+        rendered.add(request);
+        Map<String, ActivityEntryDto> rows = new HashMap<>();
+        JournalTextExposure text = feed.exposure();
+        for (ActivityEntryDto row : feed.render(
+                        rendered,
+                        journal::eventId,
+                        journal.run().id(),
+                        JournalActivityFeed.Filter.NONE,
+                        0,
+                        JournalRowDetails.NONE,
+                        traceId -> false,
+                        List.of(),
+                        text)
+                .entries()) {
+            rows.put(row.id(), row);
+        }
+        List<Timed> timed = new ArrayList<>();
+        for (JournalEntry child : children) {
+            RequestTimelineItemDto item = item(child, rows.get(journal.eventId(child)), start);
+            if (item != null) {
+                timed.add(new Timed(item, child.sequence()));
+            }
+        }
+        for (JournalEntry child : children) {
+            for (RequestTimelineItemDto flush : flushes(child.event(), start)) {
+                timed.add(new Timed(flush, child.sequence()));
+            }
+        }
+        timed.sort(
+                Comparator.comparingLong((Timed t) -> t.item().offsetMillis()).thenComparingLong(Timed::sequence));
+
+        ResourceUsage usage = payload == null ? null : payload.resources();
+        if (payload == null) {
+            notes.add("CPU, allocation, and GC pauses are not measured for this execution.");
+        } else if (usage == null) {
+            notes.add("CPU time, memory, and GC pauses are not measured: the runtime journal does not record the"
+                    + " resources source (bootui.runtime-journal.sources).");
+        } else if (usage.gcPauseRangesTruncated()) {
+            notes.add("More collections completed during this request than it keeps, so its GC pause count is a"
+                    + " floor.");
+        }
+        JournalStatus status = journal.status();
+        if (status.oldestRetainedEpochMillis() != null
+                && status.oldestRetainedEpochMillis() > start
+                && status.evictedByCount() + status.evictedByBytes() > 0) {
+            notes.add("The journal has evicted events from before this request completed, so some of its work may be"
+                    + " missing from the timeline.");
+        }
+
+        return new RequestJournalProfileDto(
+                true,
+                null,
+                requestId,
+                label == null ? executionLabel(http) : label.id(),
+                start,
+                Math.max(0, http.durationNanos()) / 1_000,
+                payload == null ? null : payload.status(),
+                resources(usage),
+                timed.stream().map(Timed::item).toList(),
+                gcPauses(usage, collections, start),
+                label == null ? null : routeComparison(label.id(), Math.max(0, http.durationNanos()) / 1_000),
+                touched(children, text),
+                notes,
+                orm(children),
+                handoffs,
+                late == 0 ? null : late);
+    }
+
+    private static String executionLabel(RuntimeEvent event) {
+        if (event.payload() instanceof ScheduledPayload scheduled) {
+            return "Scheduled: " + (scheduled.task() == null ? "task" : scheduled.task());
+        }
+        if (event.payload() instanceof WebSocketPayload webSocket) {
+            return "WebSocket: "
+                    + (webSocket.destination() != null
+                            ? webSocket.destination()
+                            : webSocket.endpoint() == null ? "message" : webSocket.endpoint());
+        }
+        MessagingPayload message = (MessagingPayload) event.payload();
+        return "Message: " + (message.destination() == null ? "consumer" : message.destination());
+    }
+
+    /**
+     * The request's handoffs (M5-2), each with what was recorded under its execution id, from children already limited
+     * to the handoff window.
+     */
+    private static List<RequestHandoffDto> handoffs(
+            List<JournalEntry> children, long requestStart, long requestDurationNanos, boolean httpRequest) {
+        Map<String, int[]> work = new HashMap<>();
+        Map<String, Long> lastWorkEnds = new HashMap<>();
+        List<RuntimeEvent> handoffEvents = new ArrayList<>();
+        for (JournalEntry child : children) {
+            RuntimeEvent event = child.event();
+            if (event.payload() instanceof AsyncHandoffPayload) {
+                handoffEvents.add(event);
+            } else if (ExecutionIds.isAsync(event.executionId())) {
+                int[] counts = work.computeIfAbsent(event.executionId(), id -> new int[3]);
+                if (event.payload() instanceof SqlPayload sql && sql.executed()) {
+                    counts[0]++;
+                } else if (event.payload() instanceof RestClientPayload) {
+                    counts[1]++;
+                } else if (event.payload() instanceof MessagingPayload) {
+                    counts[2]++;
+                }
+                JournalActivityFeed.recordWorkEnd(lastWorkEnds, event);
+            }
+        }
+        handoffEvents.sort(Comparator.comparingLong(RuntimeEvent::epochMillis));
+        List<RequestHandoffDto> attached = new ArrayList<>();
+        for (RuntimeEvent event : handoffEvents) {
+            AsyncHandoffPayload handoff = (AsyncHandoffPayload) event.payload();
+            long durationNanos = Math.max(0, event.durationNanos());
+            long lastWorkEnd = JournalActivityFeed.lastWorkEnd(lastWorkEnds, handoff);
+            Boolean worked = handoff.workedAfterResponse(lastWorkEnd);
+            boolean afterResponse;
+            Long afterResponseMicros;
+            if (!httpRequest) {
+                afterResponse = false;
+                afterResponseMicros = null;
+            } else if (worked != null) {
+                afterResponse = worked;
+                afterResponseMicros = handoff.workedAfterResponseMicros(lastWorkEnd);
+            } else {
+                long endMicros = event.epochMillis() * 1_000L + durationNanos / 1_000L;
+                long requestEndMicros = requestStart * 1_000L + requestDurationNanos / 1_000L;
+                afterResponse = endMicros > requestEndMicros;
+                afterResponseMicros =
+                        afterResponse ? endMicros - Math.max(event.epochMillis() * 1_000L, requestEndMicros) : 0L;
+            }
+            int[] counts = work.getOrDefault(handoff.executionId(), new int[3]);
+            attached.add(new RequestHandoffDto(
+                    handoff.executionId(),
+                    handoff.parentExecutionId(),
+                    event.thread(),
+                    (event.epochMillis() - requestStart) * 1_000L,
+                    durationNanos / 1_000L,
+                    Math.max(0, handoff.queuedNanos()) / 1_000L,
+                    handoff.taskClass(),
+                    handoff.hook(),
+                    handoff.failed(),
+                    handoff.exceptionClass(),
+                    afterResponse,
+                    afterResponseMicros,
+                    handoff.capped(),
+                    counts[0],
+                    counts[1],
+                    counts[2],
+                    handoff.allocatedBytes()));
+        }
+        return attached;
+    }
+
+    /**
+     * Each flush a Hibernate session kept on its timeline (M4-9), placed from the session's start: auto-flushes that
+     * wrote before a query, and full flushes, timed without the statements they executed.
+     */
+    private static List<RequestTimelineItemDto> flushes(RuntimeEvent event, long requestStart) {
+        if (!(event.payload() instanceof OrmPayload orm) || orm.flushTimeline().isEmpty()) {
+            return List.of();
+        }
+        List<RequestTimelineItemDto> items = new ArrayList<>();
+        for (OrmPayload.Flush flush : orm.flushTimeline()) {
+            items.add(new RequestTimelineItemDto(
+                    event.source().propertyName(),
+                    flush.auto() ? "Auto-flush before a query" : "Flush",
+                    flush.entities() + (flush.entities() == 1 ? " entity" : " entities") + " in context",
+                    event.epochMillis() + flush.offsetNanos() / 1_000_000 - requestStart,
+                    flush.durationNanos() / 1_000,
+                    flush.auto() ? JournalActivityFeed.SEVERITY_WARN : JournalActivityFeed.SEVERITY_OK,
+                    event.thread(),
+                    event.threadKind() == null ? null : event.threadKind().name()));
+        }
+        return items;
+    }
+
+    /** The request's Hibernate sessions, summed, or {@code null} when it recorded none (M4-9). */
+    private static RequestOrmDto orm(List<JournalEntry> children) {
+        int sessions = 0;
+        int statements = 0;
+        long statementNanos = 0;
+        int acquisitions = 0;
+        int flushes = 0;
+        int autoFlushes = 0;
+        long flushNanos = 0;
+        long autoFlushNanos = 0;
+        int dirty = 0;
+        int entities = -1;
+        int hits = 0;
+        int misses = 0;
+        int puts = 0;
+        for (JournalEntry entry : children) {
+            if (entry.event().payload() instanceof OrmPayload orm) {
+                sessions++;
+                statements += orm.statements();
+                statementNanos += Math.max(0, orm.statementNanos());
+                acquisitions += orm.connectionAcquisitions();
+                flushes += orm.flushes();
+                autoFlushes += orm.partialFlushes();
+                flushNanos += Math.max(0, orm.flushNanos());
+                autoFlushNanos += Math.max(0, orm.partialFlushNanos());
+                dirty += orm.dirtyEntities();
+                entities = Math.max(entities, orm.entitiesInContext());
+                hits += orm.l2Hits();
+                misses += orm.l2Misses();
+                puts += orm.l2Puts();
+            }
+        }
+        if (sessions == 0) {
+            return null;
+        }
+        return new RequestOrmDto(
+                sessions,
+                statements,
+                statementNanos / 1_000,
+                acquisitions,
+                flushes,
+                autoFlushes,
+                flushNanos / 1_000,
+                autoFlushNanos / 1_000,
+                dirty,
+                entities,
+                hits,
+                misses,
+                puts);
+    }
+
+    private RequestTimelineItemDto item(JournalEntry entry, ActivityEntryDto row, long requestStart) {
+        RuntimeEvent event = entry.event();
+        Long durationMicros = event.durationNanos() < 0 ? null : event.durationNanos() / 1_000;
+        if (event.payload() instanceof SqlPayload sql && !sql.executed()) {
+            durationMicros = null;
+        }
+        // Every source stamps when its work started (RuntimeEvent), so the offset needs no per-source correction.
+        long startMillis = event.epochMillis();
+        String threadKind =
+                event.threadKind() == null ? null : event.threadKind().name();
+        if (event.payload() instanceof ConnectionPayload connection) {
+            return new RequestTimelineItemDto(
+                    event.source().propertyName(),
+                    "Connection held" + (connection.dataSource() == null ? "" : " from " + connection.dataSource()),
+                    "waited " + connection.waitNanos() / 1_000 + " µs, " + connection.statements()
+                            + (connection.statements() == 1 ? " statement" : " statements"),
+                    startMillis - requestStart,
+                    durationMicros,
+                    JournalActivityFeed.SEVERITY_OK,
+                    event.thread(),
+                    threadKind);
+        }
+        if (row == null) {
+            return null;
+        }
+        return new RequestTimelineItemDto(
+                event.source().propertyName(),
+                row.summary(),
+                row.detail(),
+                startMillis - requestStart,
+                durationMicros,
+                row.severity(),
+                event.thread(),
+                threadKind);
+    }
+
+    private static RequestResourcesDto resources(ResourceUsage usage) {
+        if (usage == null) {
+            return null;
+        }
+        return new RequestResourcesDto(
+                usage.availability().name(),
+                usage.unmeasuredReason() == null
+                        ? null
+                        : usage.unmeasuredReason().name(),
+                usage.cpuNanos(),
+                usage.allocatedBytes(),
+                usage.segments(),
+                usage.unmeasuredSegments(),
+                usage.gcPauses(),
+                usage.gcPauseRangesTruncated());
+    }
+
+    private static List<RequestGcPauseDto> gcPauses(
+            ResourceUsage usage, Map<String, JournalEntry> collections, long requestStart) {
+        List<RequestGcPauseDto> pauses = new ArrayList<>();
+        if (usage == null) {
+            return pauses;
+        }
+        for (GcPauseRange range : usage.gcPauseRanges()) {
+            for (long id = range.afterId() + 1; id <= range.lastId() && pauses.size() < MAX_GC_PAUSES; id++) {
+                JournalEntry entry = collections.get(range.collector() + '#' + id);
+                if (entry == null) {
+                    pauses.add(new RequestGcPauseDto(range.collector(), id, false, null, null, null));
+                } else {
+                    RuntimeEvent event = entry.event();
+                    GcPayload gc = (GcPayload) event.payload();
+                    pauses.add(new RequestGcPauseDto(
+                            range.collector(),
+                            id,
+                            true,
+                            event.epochMillis() - requestStart,
+                            Math.max(0, event.durationNanos()) / 1_000_000,
+                            gc.cause()));
+                }
+            }
+        }
+        return pauses;
+    }
+
+    private RouteComparisonDto routeComparison(String route, long durationMicros) {
+        if (aggregates == null || route == null) {
+            return null;
+        }
+        for (RouteStats stats : aggregates.snapshot().routes()) {
+            if (!stats.route().equals(route)) {
+                continue;
+            }
+            Long p50 = stats.latency().percentileMicros(50);
+            Long p95 = stats.latency().percentileMicros(95);
+            String standing = null;
+            if (stats.requests() >= MINIMUM_ROUTE_REQUESTS && p50 != null && p95 != null) {
+                standing = durationMicros > p95 ? "ABOVE_P95" : durationMicros > p50 ? "ABOVE_P50" : "AT_OR_BELOW_P50";
+            }
+            return new RouteComparisonDto(
+                    route, stats.requests(), p50, p95, durationMicros, standing, MINIMUM_ROUTE_REQUESTS);
+        }
+        return null;
+    }
+
+    private static TouchedResourcesDto touched(List<JournalEntry> children, JournalTextExposure text) {
+        Set<String> tables = new LinkedHashSet<>();
+        Set<String> dataSources = new LinkedHashSet<>();
+        Set<String> transactions = new LinkedHashSet<>();
+        Set<String> caches = new LinkedHashSet<>();
+        Set<String> messages = new LinkedHashSet<>();
+        Set<String> restCalls = new LinkedHashSet<>();
+        Set<String> logTemplates = new LinkedHashSet<>();
+        Set<String> models = new LinkedHashSet<>();
+        for (JournalEntry entry : children) {
+            RuntimeEventPayload payload = entry.event().payload();
+            if (payload instanceof SqlPayload sql && sql.executed()) {
+                for (String table : SqlShapes.tables(sql.sql())) {
+                    add(tables, table);
+                }
+                add(dataSources, sql.dataSource());
+            } else if (payload instanceof ConnectionPayload connection) {
+                add(dataSources, connection.dataSource());
+            } else if (payload instanceof TransactionPayload transaction) {
+                add(
+                        transactions,
+                        transaction.method() == null
+                                ? null
+                                : transaction.method()
+                                        + (transaction.rolledBack() ? " (rolled back)" : " (committed)"));
+            } else if (payload instanceof CachePayload cache) {
+                add(caches, cache.cacheName() == null ? null : cache.cacheName() + " (" + cache.operation() + ")");
+            } else if (payload instanceof MessagingPayload message && message.sent()) {
+                add(
+                        messages,
+                        message.destination() == null ? null : message.destination() + " (" + message.broker() + ")");
+            } else if (payload instanceof RestClientPayload rest) {
+                add(restCalls, rest.authority());
+            } else if (payload instanceof LogPayload log) {
+                add(logTemplates, text.message(log.template()));
+            } else if (payload instanceof AiPayload ai) {
+                add(
+                        models,
+                        ai.model() == null || ai.model().isBlank()
+                                ? null
+                                : ai.model() + (ai.provider() == null ? "" : " (" + ai.provider() + ")"));
+            }
+        }
+        return new TouchedResourcesDto(
+                List.copyOf(tables),
+                List.copyOf(dataSources),
+                List.copyOf(transactions),
+                List.copyOf(caches),
+                List.copyOf(messages),
+                List.copyOf(restCalls),
+                List.copyOf(logTemplates),
+                List.copyOf(models));
+    }
+
+    private static void add(Set<String> values, String value) {
+        if (value != null && !value.isBlank() && values.size() < MAX_TOUCHED) {
+            values.add(value);
+        }
+    }
+
+    private boolean visible(RuntimeEvent event) {
+        String panel = JournalActivityReports.panelOf(event);
+        try {
+            return panel == null || panelEnabled.test(panel);
+        } catch (RuntimeException ex) {
+            return false;
+        }
+    }
+
+    private RouteTemplateResolver resolver() {
+        try {
+            RouteTemplateResolver resolver = declaredRoutes.get();
+            return resolver == null ? RouteTemplateResolver.empty() : resolver;
+        } catch (RuntimeException ex) {
+            return RouteTemplateResolver.empty();
+        }
+    }
+
+    private record Timed(RequestTimelineItemDto item, long sequence) {}
+}

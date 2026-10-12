@@ -12,13 +12,20 @@ The list shows the most recent traces with their service name, the HTTP path eac
 span count. When a trace has no path attribute, the root span name is used instead. Opening a trace renders a waterfall
 of its spans, so you can see latency contributions, errors, and parent and child relationships across services.
 
+Trace summaries and span details, including the spans in request profiles, follow the live value-exposure rules
+described below. AI chat details also follow `bootui.expose-values`: `MASKED` applies secret-key and free-text masking,
+including nested attributes and events; `METADATA_ONLY` omits their attributes and events; `FULL` shows captured values.
+Changing the policy affects the next read, not what is retained in memory.
+
 On Spring Boot, BootUI also runs an embedded OTLP/HTTP receiver at `/bootui/api/otlp/v1/traces`, so cooperating local
 services can export spans into the same in-memory store. On Quarkus, spans are captured in-process through an
 OpenTelemetry `SpanProcessor` registered only when the application depends on `quarkus-opentelemetry`, and there is no
 embedded receiver. The empty state points at whichever model applies.
 
-Trace data resets on application restart and through the panel's clear action. When `bootui.telemetry.enabled=false`,
+Trace data resets on application restart and through the panel's clear action, which keeps no lifetime count. When `bootui.telemetry.enabled=false`,
 the sidebar dims the panel and the view shows a disabled state, so an empty list never reads as "no traces yet".
+After a confirmed clear, a fresh read runs once any outstanding poll finishes, even with auto-refresh off. A response
+started before the clear cannot restore old traces; newly captured traces in the post-clear read remain visible.
 
 ### Trace value exposure
 
@@ -120,10 +127,16 @@ withheld its message.
 The Exceptions panel captures exceptions thrown by the running application and groups repeated failures into one entry
 with an occurrence count.
 
+Exception groups per route, from the runtime journal, are in [Runtime Insights](overview.md#runtime-insights)
+(`exception-hotspots`), which does not list them by default; this panel links to them, and the link opens Runtime Insights with
+every row shown.
+
 Grouping uses a stable fingerprint derived from the exception type and the top stack frames, so a recurring error
 collapses into a single row. That row shows the type, the latest message, first and last seen times, the originating
 location, and a total count. Opening a group shows the representative stack trace with application frames highlighted, the full cause chain
 with `… N more` common-frame folding, and the most recent occurrences with their thread, source, and request context.
+Each occurrence also carries the `requestId` of the request that threw it, when BootUI saw one, so the profiler can
+attribute it exactly with or without tracing.
 
 The list updates over Server-Sent Events: the browser subscribes to `/bootui/api/exceptions/stream` and re-fetches
 whenever an exception is captured or the store is cleared. You can filter by text, by capture source, or to
@@ -132,17 +145,19 @@ application-originated exceptions only.
 On Spring MVC, BootUI records from two complementary sources: a non-intrusive `HandlerExceptionResolver` that observes
 exceptions escaping web request handlers, capturing the request method, path, and handler; and a logback appender that
 picks up anything logged with a throwable from scheduled tasks, async work, or `log.error("…", ex)`. A failure that is
-both handled and logged is de-duplicated by throwable identity.
+both handled and logged is de-duplicated by throwable identity. Distinct exception instances count as separate
+occurrences even when their `equals()` methods report them equal; observing the same instance or its cause twice does
+not add another occurrence.
 
 ### Triage status
 
 Each group carries a Sentry-style triage status, shown as a badge and changed inline with a button group:
 
-| Status | Meaning | On a new occurrence |
-| ------ | ------- | ------------------- |
-| **Open** | Default for every new group | Keeps accumulating |
+| Status           | Meaning                        | On a new occurrence                        |
+| ---------------- | ------------------------------ | ------------------------------------------ |
+| **Open**         | Default for every new group    | Keeps accumulating                         |
 | **Acknowledged** | Seen, still being investigated | Keeps accumulating; never auto-transitions |
-| **Resolved** | Believed fixed | Regresses: auto-reopens to **Open** |
+| **Resolved**     | Believed fixed                 | Regresses: auto-reopens to **Open**        |
 
 When a **Resolved** group throws again, BootUI treats it as a regression. The group reopens to **Open** and a lifetime
 "Reopened ×N" counter appears next to the badge, so a failure you thought was fixed is immediately visible. Only a
@@ -151,6 +166,45 @@ When a **Resolved** group throws again, BootUI treats it as a regression. The gr
 A status filter narrows the list alongside the text and source filters. Changing a status calls
 `POST /bootui/api/exceptions/{id}/status` with `{"status": "..."}`, validated against the three values: anything else
 returns `400`, and an unknown group returns `404`.
+An older refresh cannot overwrite an accepted status change. If a refresh was already in flight, one fresh read
+follows it even with auto-refresh off; a failed follow-up keeps the accepted status visible alongside the read error.
+
+### Caught in application code
+
+With the BootUI agent's opt-in [`caught-exceptions` sensor](java-agent.md#the-caught-exceptions-sensor), the panel adds a
+**Caught in application code** section (`GET /bootui/api/exceptions/caught`, and `caughtInCode` in the panel's report
+and MCP `get_exceptions`). It groups the exceptions application handlers caught by route, handler, and caught class,
+and counts each occurrence under one outcome:
+
+| Outcome                                          | What BootUI saw                                                                                                             |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| **Rethrown**                                     | The exception left the method by a throw, as is or as a cause, or was caught again                                          |
+| **Replaced**                                     | The handler's straight-line code throws another exception without it                                                        |
+| **Reported**                                     | The exception, or a wrapper of it, reached the framework's error handling                                                   |
+| **Logged**                                       | It was logged at `WARN` or above, or a `WARN` was logged on the catching thread right after, before it caught anything else |
+| **Handed on**                                    | The handler passed it on as an error value: a failed future, an error signal, a deferred error result                       |
+| **Re-interrupted**                               | The handler restored the thread's interrupt                                                                                 |
+| **Retried**                                      | A later attempt at the same handler in the same request was rethrown, reported, or logged                                   |
+| **Not seen rethrown or logged at WARN or above** | None of these, while the evidence was complete                                                                              |
+| **Unknown**                                      | The evidence was incomplete; the row names the most frequent reason                                                         |
+| **Settling**                                     | Its request ended less than five seconds ago, or work it handed over still runs                                             |
+
+A row is a finding when occurrences not seen rethrown or logged came from at least three requests, or from one for an
+SQL, I/O, or data-access exception. A finding states a fact, never a verdict: BootUI never calls an exception
+swallowed. An occurrence is judged only when every piece of evidence is complete: it was caught under an HTTP request,
+whose event is retained, that started after the last **Clear recording**, that lost no record in the journal or the
+agent, that did not go asynchronous or get cancelled, and none of whose work ran after the response; the agent's
+`executors` sensor records handoffs; the handler's method has the agent's exit handler, or the handler never reads
+what it caught; the exception wraps no other (`ExecutionException`, `CompletionException`); and BootUI's appender
+(Logback) or handler (the JBoss LogManager) sees every `WARN` log, with no logger that keeps its events from the root
+logger. Otherwise the occurrence is unknown, with the first missing piece as its reason. Matching uses the identity
+hashes of the logged or reported throwable and its causes, never the exception itself. With HTTP Exchanges hidden, rows
+name no route or request; with Log Tail hidden, logs are not consulted and nothing is known not logged.
+
+Known limits: a task queued for longer than the five-second settle window before it starts is not yet followed, so
+what it rethrows or logs later is seen only then; an exception the panel's capture ignores or deduplicates carries no
+identity of its own; and on Spring, `java.util.logging` must be bridged to Logback, as Spring Boot does, or every
+occurrence stays unknown.
 
 ### Exposure and bounds
 
@@ -161,13 +215,14 @@ are they shown verbatim. Request paths are captured without their query string, 
 only class, method, file, and line information.
 
 The in-memory store resets on restart and through the panel's clear action, which honors the panel's read-only setting.
+The occurrence total counts the retained groups, so a clear resets it too; the panel keeps no lifetime count.
 It is bounded by three properties:
 
-| Property | Default | Bounds |
-| -------- | ------- | ------ |
-| `bootui.exceptions.max-groups` | `100` | Groups retained, evicting the least recently seen |
-| `bootui.exceptions.max-occurrences-per-group` | `25` | Occurrences kept per group |
-| `bootui.exceptions.max-stack-frames` | `50` | Frames kept per stack trace |
+| Property                                      | Default | Bounds                                            |
+| --------------------------------------------- | ------- | ------------------------------------------------- |
+| `bootui.exceptions.max-groups`                | `100`   | Groups retained, evicting the least recently seen |
+| `bootui.exceptions.max-occurrences-per-group` | `25`    | Occurrences kept per group                        |
+| `bootui.exceptions.max-stack-frames`          | `50`    | Frames kept per stack trace                       |
 
 Triage and regression detection are engine-level, so they behave identically on all three stacks. Only the capture
 sources differ.
@@ -230,10 +285,10 @@ A burst of successful requests would otherwise evict the one failure you came to
 capture buffer — HTTP Exchanges on all three stacks, [SQL Trace](database.md#sql-trace), and
 [REST Client](services.md#rest-client) — therefore reserves a share of its capacity for failed and slow records:
 
-| Buffer         | Reserved for                                                                              | Slow threshold                                        |
-| -------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| HTTP Exchanges | `5xx` responses and requests at or above the slow threshold                               | `bootui.activity.request-slow-threshold-ms` (`1000`)   |
-| SQL Trace      | Failed statements and statements at or above the slow threshold                           | `bootui.sql-trace.slow-query-threshold-millis` (`100`) |
+| Buffer         | Reserved for                                                                               | Slow threshold                                                 |
+| -------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| HTTP Exchanges | `5xx` responses and requests at or above the slow threshold                                | `bootui.activity.request-slow-threshold-ms` (`1000`)           |
+| SQL Trace      | Failed statements and statements at or above the slow threshold                            | `bootui.sql-trace.slow-query-threshold-millis` (`100`)         |
 | REST Client    | Calls that failed, received a `4xx` or `5xx` response, or took at least the slow threshold | `bootui.rest-client-trace.slow-call-threshold-millis` (`1000`) |
 
 Routine records are evicted first. The reserved share evicts its own oldest record only once it is full, so under a
@@ -265,8 +320,15 @@ evicted first, and BootUI's own requests are hidden at read time instead. In bot
 managed by the application.
 
 Every exchange carries the route it belongs to, shown under its path when the two differ, and a **Profile** link that
-opens the request's profile in [Live Activity](overview.md#the-per-request-profiler). Stacks that correlate a profile
-by trace id alone explain in the profile when a request carried none.
+opens the request's profile in [Live Activity](overview.md#the-per-request-profiler). WebFlux and Quarkus require an
+exact request id or an unambiguous trace id for a buffer-backed profile and explain when neither is available.
+
+Every exchange also carries BootUI's own `requestId`, generated when the request starts, whether or not OpenTelemetry
+is present. On Spring MVC it covers the servlet thread and any asynchronous redispatch of the same request. On Spring
+WebFlux it travels in the Reactor context to every scheduler the request hops to, including error rendering. On
+Quarkus it follows the request from the Vert.x event loop to the worker or virtual thread that continues it. It is the
+exchange's `id`, so identical requests that overlap never share an id, and the search field matches it. An exchange
+recorded without one, for example by an application-provided repository, keeps a hash of the exchange as its id.
 
 ### Route rankings
 
@@ -278,10 +340,10 @@ errors. **Exchanges** filters the list below to exactly that route's exchanges, 
 A route is resolved exactly as [SQL Trace](database.md#rankings) attributes database time, and each row says which of
 three sources it came from:
 
-| Source        | Meaning                                                                                         |
-| ------------- | ----------------------------------------------------------------------------------------------- |
-| `template`    | The handler pattern Spring MVC or Spring WebFlux matched, such as `/api/orders/{id}`.            |
-| `declared`    | The single best route the application declares in its mappings. Ties resolve to no template.    |
+| Source        | Meaning                                                                                        |
+| ------------- | ---------------------------------------------------------------------------------------------- |
+| `template`    | The handler pattern Spring MVC or Spring WebFlux matched, such as `/api/orders/{id}`.          |
+| `declared`    | The single best route the application declares in its mappings. Ties resolve to no template.   |
 | `masked path` | No template matched, so every path segment that reads like a value is replaced with `{value}`. |
 
 A template is shown the same way whichever source produced it, so `{id:[0-9]+}` reads `{id}` and a route never splits
@@ -290,8 +352,13 @@ handlers on the same method and path that differ only in their variable patterns
 `{id:[a-z]+}`, therefore share one row: a pattern is never shown. Quarkus has no runtime route template, so its routes come from the declared JAX-RS mappings, matched under
 `quarkus.http.root-path` and `quarkus.rest.path`; a prefix contributed only by `@ApplicationPath` is not known at
 runtime, so those routes fall back to masked paths. Spring
-WebFlux records the matched handler pattern with the OpenTelemetry integration, which the reactive starter includes;
+WebFlux records the matched handler pattern with the OpenTelemetry integration, which the BootUI starter includes;
 without it, WebFlux routes fall back to masked paths, and the panel says so. Query strings are never part of a route.
+
+With Spring for GraphQL, every operation is posted to one endpoint, so BootUI adds the operation graphql-java parsed to
+the route, such as `/graphql (query ProductList)`, and each operation is ranked and filtered on its own. Only the
+operation's type and name are kept, never its variables or selection. It needs Spring Boot's observation support,
+which Actuator brings.
 
 A masked path also masks every segment that a matching declared route marks as a parameter, even when two declarations
 match equally well. Only a path that no declaration matches at all keeps segments that read like route words, so a
@@ -326,7 +393,7 @@ it.
 
 ### Copy as cURL
 
-Row details offer **Copy as cURL**, which turns the retained metadata into a command *template*. It is not a
+Row details offer **Copy as cURL**, which turns the retained metadata into a command _template_. It is not a
 byte-for-byte replay, and the action shows every difference before you copy.
 
 ::: details What the command changes, and why
@@ -369,12 +436,12 @@ host, and as a state-changing action it is gated by the same localhost-only safe
 Probe input is bounded. The method, path, request body, header count, and header name and value sizes each have a
 ceiling, measured in UTF-8 bytes and checked before anything is sent:
 
-| Input | Ceiling |
-| ----- | ------- |
-| Request body | 64 KiB |
-| Path | 2 KiB |
-| Headers | 50 entries, 256 bytes per name, 8 KiB per value, 32 KiB combined |
-| Method | 32 bytes |
+| Input        | Ceiling                                                          |
+| ------------ | ---------------------------------------------------------------- |
+| Request body | 64 KiB                                                           |
+| Path         | 2 KiB                                                            |
+| Headers      | 50 entries, 256 bytes per name, 8 KiB per value, 32 KiB combined |
+| Method       | 32 bytes                                                         |
 
 Exceeding a ceiling is invalid input, so it is rejected with the canonical `400` and `{"error": ...}` body on all three
 stacks, and the panel shows that message instead of a result. A probe that runs and fails, through a refused connection
@@ -385,3 +452,33 @@ Quarkus has no config key that always equals the bound port, so the adapter sele
 `quarkus.http.port` by launch mode. A random `=0` port still resolves, because Quarkus rewrites the property to the
 actual port once the server is up.
 :::
+
+## Diagnostic control outcomes
+
+Logger level changes, configuration override removal, Hibernate runtime activation, and SQL, transaction, REST client,
+and WebSocket capture controls report the backend's accepted outcome, not merely the requested change. A policy
+refusal shows its specific reason; unavailable or unchanged capture reports never appear as successful activation.
+Logger resets retain inherited effective levels. Removing an already absent configuration override is still a valid
+removal, and the property falls back to its underlying value after the next read. Configuration writes remain
+Spring-only; this does not add override support to Quarkus.
+
+These controls require their documented JSON response. An empty, malformed, or unrecognized reply, or a lost
+connection during the action, reports an **unknown outcome**, keeps the last accepted state, and re-reads once without
+retrying the mutation. If that read fails, the accepted data stays visible alongside the read failure.
+
+A refresh started before an accepted Hibernate activation or capture action cannot overwrite its result. When a
+refresh is already outstanding, one fresh read follows it even with auto-refresh off; otherwise the returned report
+updates the panel immediately. Ordinary refresh behavior and each stack's capability limitations are unchanged.
+
+**Profile resources** uses the same accepted-outcome rule: an older poll cannot replace an accepted start or stop,
+and leaving the panel stops its polling and countdown. An unknown acknowledgement re-reads the profile once without
+starting or stopping another recording. Empty route rows mean no request samples were attributed to listed routes,
+not that no request ran. When HTTP Exchanges policy withholds the rows, the profile keeps its positive request and
+sample totals and shows the backend's limitation instead. At most 20 routes are listed; `routesOmitted` counts further
+routes, and the report's limitations describe sampling and attribution bounds.
+
+**Flyway and Liquibase** require their native action-result JSON before reporting success. A failed action can still
+have committed earlier migrations or change sets, so an HTTP 5xx, lost response, or unknown acknowledgement triggers
+one history read without retrying the mutation. The action failure stays visible; if that read fails too, the last
+accepted history remains alongside the read failure. A known HTTP 4xx refusal or a cancelled confirmation does not
+trigger that follow-up read.

@@ -1,0 +1,156 @@
+package io.github.jdubois.bootui.engine.journal;
+
+import io.github.jdubois.bootui.engine.correlation.RequestPhase;
+import io.github.jdubois.bootui.engine.sqltrace.SqlShapes;
+import java.util.Objects;
+
+/**
+ * A SQL statement's payload: its text as SQL Trace retained it, never its bind values, the application call site and
+ * up to four application frames above it, the datasource, and whether it failed. The journal aggregates statements by
+ * their literal-free fingerprint, computed on its dispatcher thread.
+ *
+ * @param callSite the application call site, or {@code null} to read it from {@code frames}, which a recorder passes
+ *     so the frames are formatted on the journal's dispatcher rather than the application thread (M4-18d)
+ * @param phase the part of its request it ran in, or {@code null} when unknown or outside a request
+ * @param completedNanos the {@link System#nanoTime()} when it completed, or {@code -1} when unknown, which places it
+ *     inside or outside a transaction of its thread below the millisecond ({@code docs/PLAN-v2.md} §5.5)
+ * @param codePathStamp the BootUI agent's code-paths stamp of the instrumented method open on the issuing thread when the
+ *     statement was recorded ({@code docs/PLAN-v2.md} §5.14, M5-4c), which names the request-tree node that issued it, or {@code 0}
+ *     when unknown: without the agent, or when the recorder ran on another thread
+ * @param provenance whether the feeder observed execution or only preparation, never inferred from duration or JDBC type
+ */
+public record SqlPayload(
+        String sql,
+        String callSite,
+        String dataSource,
+        boolean failed,
+        ApplicationFrames frames,
+        RequestPhase phase,
+        long completedNanos,
+        long codePathStamp,
+        Provenance provenance)
+        implements RuntimeEventPayload {
+
+    public enum Provenance {
+        EXECUTION,
+        PREPARATION,
+        UNKNOWN
+    }
+
+    public SqlPayload {
+        provenance = provenance == null ? Provenance.UNKNOWN : provenance;
+    }
+
+    /** Whether the feeder observed a JDBC execution, including one timed as zero nanoseconds. */
+    public boolean executed() {
+        return provenance == Provenance.EXECUTION;
+    }
+
+    /** The call site given, or else the innermost of {@link #frames()}; {@code null} when neither is known. */
+    @Override
+    public String callSite() {
+        return callSite != null || frames == null ? callSite : frames.callSite();
+    }
+
+    /** Equal when every component is, its call site as {@link #callSite()} reads it. */
+    @Override
+    public boolean equals(Object other) {
+        return this == other
+                || other instanceof SqlPayload that
+                        && failed == that.failed
+                        && completedNanos == that.completedNanos
+                        && codePathStamp == that.codePathStamp
+                        && Objects.equals(sql, that.sql)
+                        && Objects.equals(callSite(), that.callSite())
+                        && Objects.equals(dataSource, that.dataSource)
+                        && Objects.equals(frames, that.frames)
+                        && phase == that.phase
+                        && provenance == that.provenance;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+                sql, callSite(), dataSource, failed, frames, phase, completedNanos, codePathStamp, provenance);
+    }
+
+    @Override
+    public String toString() {
+        return "SqlPayload[sql=" + sql + ", callSite=" + callSite() + ", dataSource=" + dataSource + ", failed="
+                + failed
+                + ", frames=" + frames + ", phase=" + phase + ", completedNanos=" + completedNanos + ", codePathStamp="
+                + codePathStamp + ", provenance=" + provenance + "]";
+    }
+
+    /** A JDBC execution, preserving the original constructor's contract. */
+    public SqlPayload(
+            String sql,
+            String callSite,
+            String dataSource,
+            boolean failed,
+            ApplicationFrames frames,
+            RequestPhase phase,
+            long completedNanos,
+            long codePathStamp) {
+        this(sql, callSite, dataSource, failed, frames, phase, completedNanos, codePathStamp, Provenance.EXECUTION);
+    }
+
+    /** A statement without a code-paths stamp. */
+    public SqlPayload(
+            String sql,
+            String callSite,
+            String dataSource,
+            boolean failed,
+            ApplicationFrames frames,
+            RequestPhase phase,
+            long completedNanos) {
+        this(sql, callSite, dataSource, failed, frames, phase, completedNanos, 0L);
+    }
+
+    /** A statement without its request phase or monotonic completion. */
+    public SqlPayload(String sql, String callSite, String dataSource, boolean failed, ApplicationFrames frames) {
+        this(sql, callSite, dataSource, failed, frames, null, -1);
+    }
+
+    /** A statement without application frames. */
+    public SqlPayload(String sql, String callSite, String dataSource, boolean failed) {
+        this(sql, callSite, dataSource, failed, null);
+    }
+
+    /**
+     * This statement with its SQL, call site, data source, and frames replaced by the run's shared copies, so a
+     * statement run many times is stored once ({@code docs/PLAN-v2.md} §5.2). Its SQL is shared only when it has no
+     * literal at all ({@link SqlShapes#shareable}), since a literal may be a concatenated value, an {@code INSERT}'s
+     * values, or a seed script's data, which would fill the dictionary with one-off strings; a statement with a literal
+     * keeps, and is counted for, its own copy.
+     */
+    @Override
+    public RuntimeEventPayload interned(JournalDictionary dictionary) {
+        return new SqlPayload(
+                SqlShapes.shareable(sql) ? dictionary.shared(sql) : sql,
+                dictionary.shared(callSite()),
+                dictionary.shared(dataSource),
+                failed,
+                ApplicationFrames.interned(frames, dictionary),
+                phase,
+                completedNanos,
+                codePathStamp,
+                provenance);
+    }
+
+    /** Its fixed part and its strings, each counted as the payload's own. */
+    @Override
+    public int estimatedBytes() {
+        return estimatedBytes(null);
+    }
+
+    /** Its fixed part, with each string {@code dictionary} shares counted as a reference. */
+    @Override
+    public int estimatedBytes(JournalDictionary dictionary) {
+        return 48
+                + JournalDictionary.retained(dictionary, sql)
+                + JournalDictionary.retained(dictionary, callSite())
+                + JournalDictionary.retained(dictionary, dataSource)
+                + (frames == null ? 0 : frames.estimatedBytes());
+    }
+}

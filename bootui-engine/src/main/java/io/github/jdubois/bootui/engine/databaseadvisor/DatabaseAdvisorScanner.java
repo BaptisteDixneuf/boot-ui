@@ -60,8 +60,11 @@ public final class DatabaseAdvisorScanner {
     private final Clock clock;
     private final DatabaseAdvisorLimits limits;
     private final SingleFlightAction singleFlight = new SingleFlightAction();
-    private final AdvisorScanState<DatabaseAdvisorReport> state =
-            new AdvisorScanState<>(DatabaseAdvisorReport::withViolationDetails);
+    private final AdvisorScanState<DatabaseAdvisorReport> state = new AdvisorScanState<>(
+            DatabaseAdvisorReport::withViolationDetails,
+            () -> AdvisorScanState.ruleIds(
+                    DatabaseAdvisorRuleRegistry.activeRules(),
+                    rule -> rule.definition().id()));
 
     public static DatabaseAdvisorScanner using(
             Supplier<List<NamedDataSource>> dataSourceSupplier,
@@ -144,7 +147,8 @@ public final class DatabaseAdvisorScanner {
     public DatabaseAdvisorReport initialReport() {
         return new ReportBuilder()
                 .status("NOT_SCANNED")
-                .message("Database Advisor has not run yet. Click Run Database checks to inspect the physical schema.")
+                .message("Database Advisor has not run yet. Run Database checks in the panel, or call"
+                        + " database_advisor_scan (bootui db scan), to inspect the physical schema.")
                 .build();
     }
 

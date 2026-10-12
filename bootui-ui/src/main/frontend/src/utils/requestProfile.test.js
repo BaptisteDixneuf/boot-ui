@@ -3,6 +3,7 @@ import {describe, expect, it} from 'vitest'
 import {
   cacheAccessSummary,
   childTierLabel,
+  securityEventExact,
   profileSections,
   restCallSummary,
   tierLabel,
@@ -11,6 +12,15 @@ import {
 } from './requestProfile.js'
 
 describe('requestProfile helpers', () => {
+  it('labels the request-id tier and treats a request-id security match as exact', () => {
+    expect(tierLabel('REQUEST_ID')).toBe('request id')
+    const section = {childTiers: ['REQUEST_ID', 'TIME_WINDOW']}
+    expect(securityEventExact(section, {threadMatched: false}, 0)).toBe(true)
+    expect(securityEventExact(section, {threadMatched: false}, 1)).toBe(false)
+    expect(securityEventExact(section, {threadMatched: true}, 1)).toBe(true)
+    expect(securityEventExact(undefined, {threadMatched: false}, 0)).toBe(false)
+  })
+
   it('labels every correlation tier and ignores unknown ones', () => {
     expect(tierLabel('TRACE_ID')).toBe('trace id')
     expect(tierLabel('SERVING_THREAD')).toBe('serving thread')
@@ -76,7 +86,47 @@ describe('requestProfile helpers', () => {
     ).toBe('Time window correlation is unavailable on this adapter.')
   })
 
+  it('explains the propagated tier with the BootUI agent, apart from the adapter limits', () => {
+    expect(
+      unavailableTiersText({
+        correlationTiers: [
+          {tier: 'REQUEST_ID', available: true, unavailableReason: null},
+          {
+            tier: 'PROPAGATED',
+            available: false,
+            unavailableReason: "Requires the BootUI agent's executors sensor: the sensor is failed."
+          },
+          {tier: 'SERVING_THREAD', available: false, unavailableReason: 'Event loop.'},
+          {tier: 'TIME_WINDOW', available: false, unavailableReason: 'Event loop.'}
+        ]
+      })
+    ).toBe(
+      "Propagated correlation requires the BootUI agent's executors sensor: the sensor is failed." +
+        ' Serving thread and time window correlation are unavailable on this adapter: Event loop.'
+    )
+  })
+
   it('summarizes REST client calls and cache accesses from the masked payload only', () => {
+    expect(
+      restCallSummary({
+        method: 'GET',
+        host: 'localhost',
+        uri: 'http://localhost:8082/api/secure/products?token=******',
+        path: '/api/secure/products',
+        success: true,
+        status: 200
+      })
+    ).toBe('GET localhost:8082/api/secure/products → 200')
+    expect(
+      restCallSummary({
+        method: 'GET',
+        host: 'api.example',
+        uri: 'https://api.example/items',
+        path: '/items',
+        success: true,
+        status: 200
+      })
+    ).toBe('GET api.example/items → 200')
     expect(restCallSummary({method: 'GET', host: 'api.example', path: '/items', success: true, status: 200})).toBe(
       'GET api.example/items → 200'
     )

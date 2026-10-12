@@ -1,0 +1,1319 @@
+package io.github.jdubois.bootui.autoconfigure.activity;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.exceptions.ExceptionsController;
+import io.github.jdubois.bootui.autoconfigure.mail.EmailController;
+import io.github.jdubois.bootui.autoconfigure.restclienttrace.RestClientTraceController;
+import io.github.jdubois.bootui.autoconfigure.sqltrace.SqlTraceController;
+import io.github.jdubois.bootui.autoconfigure.web.HealthController;
+import io.github.jdubois.bootui.autoconfigure.web.HttpExchangesController;
+import io.github.jdubois.bootui.autoconfigure.web.SecurityLogsController;
+import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
+import io.github.jdubois.bootui.core.dto.ActivityKpiDto;
+import io.github.jdubois.bootui.core.dto.EmailMessageDto;
+import io.github.jdubois.bootui.core.dto.EmailsReport;
+import io.github.jdubois.bootui.core.dto.ExceptionGroupDto;
+import io.github.jdubois.bootui.core.dto.ExceptionsReport;
+import io.github.jdubois.bootui.core.dto.HealthNodeDto;
+import io.github.jdubois.bootui.core.dto.HttpExchangeDto;
+import io.github.jdubois.bootui.core.dto.HttpExchangesReport;
+import io.github.jdubois.bootui.core.dto.LiveActivityReport;
+import io.github.jdubois.bootui.core.dto.RestClientTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.RestClientTraceReport;
+import io.github.jdubois.bootui.core.dto.SecurityLogEventDto;
+import io.github.jdubois.bootui.core.dto.SecurityLogsReport;
+import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.SqlTraceReport;
+import io.github.jdubois.bootui.engine.cache.CacheActivityEvent;
+import io.github.jdubois.bootui.engine.cache.CacheActivityOperation;
+import io.github.jdubois.bootui.engine.cache.CacheActivityRecorder;
+import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceActivityEntries;
+import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder;
+import io.github.jdubois.bootui.engine.jms.JmsActivityEntries;
+import io.github.jdubois.bootui.engine.jms.JmsActivityRecorder;
+import io.github.jdubois.bootui.engine.journal.JournalRowDetails;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityEntries;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.CapturedMessage;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
+import io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder;
+import io.github.jdubois.bootui.engine.restclienttrace.RestClientAuthority;
+import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
+import io.github.jdubois.bootui.engine.sqltrace.SqlTraceGrouping;
+import io.github.jdubois.bootui.engine.support.BlankStrings;
+import io.github.jdubois.bootui.engine.support.Percentiles;
+import io.github.jdubois.bootui.engine.web.RequestLatencyKpis;
+import io.github.jdubois.bootui.engine.web.RequestSlowThreshold;
+import io.github.jdubois.bootui.engine.web.SecurityActivityIds;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryUsage;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import org.springframework.beans.factory.ObjectProvider;
+
+/**
+ * Assembles the Live Activity merged stream and KPI summary by reusing BootUI's existing signal
+ * controllers. Each source is consumed through its own controller so masking, self-filtering and
+ * buffer bounds are inherited unchanged; this service never re-reads raw buffers directly.
+ */
+public class LiveActivityService {
+
+    /** Maximum characters of a SQL statement shown inline in a stream summary. */
+    private static final int SQL_SUMMARY_LENGTH = 120;
+
+    static final String TYPE_REQUEST = "REQUEST";
+    static final String TYPE_SQL = "SQL";
+    static final String TYPE_REST_CLIENT = "REST_CLIENT";
+    static final String TYPE_EXCEPTION = "EXCEPTION";
+    static final String TYPE_SECURITY = "SECURITY";
+    static final String TYPE_MAIL = "MAIL";
+    static final String TYPE_CACHE = "CACHE";
+    static final String TYPE_SCHEDULED = "SCHEDULED";
+
+    static final String SEVERITY_OK = "OK";
+    static final String SEVERITY_SLOW = "SLOW";
+    static final String SEVERITY_WARN = "WARN";
+    static final String SEVERITY_ERROR = "ERROR";
+
+    private final ObjectProvider<HttpExchangesController> httpExchanges;
+    private final ObjectProvider<SqlTraceController> sqlTrace;
+    private final ObjectProvider<RestClientTraceController> restClientTrace;
+    private final ObjectProvider<ExceptionsController> exceptions;
+    private final ObjectProvider<SecurityLogsController> securityLogs;
+    private final ObjectProvider<HealthController> health;
+    private final ObjectProvider<EmailController> email;
+    private final ObjectProvider<RequestCorrelationRegistry> requestCorrelations;
+    private final ObjectProvider<SecurityEventCorrelationRegistry> securityCorrelations;
+    private final ObjectProvider<CacheActivityRecorder> cacheActivity;
+    private final ObjectProvider<ScheduledTaskRunStore> scheduledTaskRuns;
+    private final ObjectProvider<KafkaActivityRecorder> kafka;
+    private final ObjectProvider<JmsActivityRecorder> jms;
+    private final ObjectProvider<RabbitActivityRecorder> rabbit;
+    private final ObjectProvider<FaultToleranceEventRecorder> faultTolerance;
+    private final BootUiProperties properties;
+
+    public LiveActivityService(
+            ObjectProvider<HttpExchangesController> httpExchanges,
+            ObjectProvider<SqlTraceController> sqlTrace,
+            ObjectProvider<RestClientTraceController> restClientTrace,
+            ObjectProvider<ExceptionsController> exceptions,
+            ObjectProvider<SecurityLogsController> securityLogs,
+            ObjectProvider<HealthController> health,
+            ObjectProvider<EmailController> email,
+            ObjectProvider<RequestCorrelationRegistry> requestCorrelations,
+            ObjectProvider<SecurityEventCorrelationRegistry> securityCorrelations,
+            ObjectProvider<CacheActivityRecorder> cacheActivity,
+            ObjectProvider<ScheduledTaskRunStore> scheduledTaskRuns,
+            ObjectProvider<KafkaActivityRecorder> kafka,
+            ObjectProvider<JmsActivityRecorder> jms,
+            ObjectProvider<RabbitActivityRecorder> rabbit,
+            ObjectProvider<FaultToleranceEventRecorder> faultTolerance,
+            BootUiProperties properties) {
+        this.httpExchanges = httpExchanges;
+        this.sqlTrace = sqlTrace;
+        this.restClientTrace = restClientTrace;
+        this.exceptions = exceptions;
+        this.securityLogs = securityLogs;
+        this.health = health;
+        this.email = email;
+        this.requestCorrelations = requestCorrelations;
+        this.securityCorrelations = securityCorrelations;
+        this.cacheActivity = cacheActivity;
+        this.scheduledTaskRuns = scheduledTaskRuns;
+        this.kafka = kafka;
+        this.jms = jms;
+        this.rabbit = rabbit;
+        this.faultTolerance = faultTolerance;
+        this.properties = properties;
+    }
+
+    /**
+     * Build the merged stream and KPIs.
+     *
+     * @param typeFilter optional case-insensitive type to keep, or {@code null} for all types
+     * @param severityFilter optional case-insensitive severity to keep, or {@code null} for all
+     * @param since only entries strictly newer than this epoch-millis cursor are returned (0 for all)
+     * @param limit maximum number of entries to return after filtering ({@code <= 0} for the configured max)
+     */
+    public LiveActivityReport report(String typeFilter, String severityFilter, long since, int limit) {
+        int cap = effectiveLimit(limit);
+        List<String> sources = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+
+        HttpExchangesReport requests = loadRequests(sources, warnings);
+        SqlTraceReport sql = loadSql(sources);
+        RestClientTraceReport rest = loadRestClientTrace(sources);
+        ExceptionsReport exceptionsReport = loadExceptions(sources);
+        SecurityLogsReport security = loadSecurity(sources);
+        EmailsReport emails = loadEmail(sources);
+        List<CacheActivityEvent> cache = loadCache(sources);
+        List<ScheduledTaskRunStore.Run> scheduledRuns = loadScheduledTaskRuns(sources);
+        List<CapturedMessage> kafkaMessages = loadKafka(sources);
+        List<JmsActivityRecorder.CapturedMessage> jmsMessages = loadJms(sources);
+        List<RabbitActivityRecorder.CapturedMessage> rabbitMessages = loadRabbit(sources);
+        List<FaultToleranceEventRecorder.CapturedEvent> faultToleranceEvents = loadFaultTolerance(sources);
+
+        List<RequestAnchor> anchors = buildAnchors(requests);
+        Map<String, RequestAnchor> anchorsById = new HashMap<>();
+        for (RequestAnchor anchor : anchors) {
+            anchorsById.put(anchor.id(), anchor);
+        }
+        List<ScheduledTaskAnchor> scheduledAnchors = buildScheduledTaskAnchors(scheduledRuns);
+        Map<String, String> executionEntryById =
+                executionEntries(scheduledAnchors, kafkaMessages, jmsMessages, rabbitMessages);
+        SecurityEventCorrelationRegistry securityRegistry =
+                securityCorrelations == null ? null : securityCorrelations.getIfAvailable();
+
+        List<ActivityEntryDto> all = new ArrayList<>();
+        // Build SQL, exception and security entries first so we know which requests carry a correlated
+        // security event (and the principal it ran as) before we build the request entries themselves.
+        // Also index each SQL entry by its resolved parent request id, reusing the exact same
+        // matchSqlParent(...) call already needed to build its ActivityEntryDto, so the REQUEST loop below
+        // can flag N+1 suspicion per request using precisely the SQL BootUI attributes to it.
+        Map<String, List<SqlTraceEntryDto>> sqlByRequestId = new HashMap<>();
+        if (sql != null) {
+            for (SqlTraceEntryDto entry : sql.entries()) {
+                String parentId = matchSqlParent(entry, anchors, executionEntryById);
+                all.add(toSqlEntry(entry, parentId));
+                if (parentId != null) {
+                    sqlByRequestId
+                            .computeIfAbsent(parentId, id -> new ArrayList<>())
+                            .add(entry);
+                }
+            }
+        }
+        // REST client calls correlate to their parent request the same way SQL statements do (trace-id
+        // first, then serving thread within the request window); unlike SQL there is no per-request
+        // N+1-style flag on the REQUEST entry in v1, so no index by parent id is needed here — each
+        // "chatty call" group is only surfaced inside the REST Client panel itself.
+        if (rest != null) {
+            for (RestClientTraceEntryDto entry : rest.entries()) {
+                all.add(toRestEntry(entry, matchRestParent(entry, anchors, executionEntryById)));
+            }
+        }
+        if (exceptionsReport != null) {
+            for (ExceptionGroupDto group : exceptionsReport.groups()) {
+                String parentId = matchExceptionParent(group, anchors);
+                if (parentId == null) {
+                    parentId = matchByExecutionId(group.lastExecutionId(), executionEntryById);
+                }
+                if (parentId == null) {
+                    // No owning HTTP request: fall back to attributing the exception to the background
+                    // @Scheduled execution that produced it (thread + time-window join, the same tiered
+                    // strategy matchSqlParent uses for its second tier), so a scheduled task's failure gets
+                    // the exact same nested-EXCEPTION-entry treatment a request's failure already does.
+                    parentId = matchScheduledTaskParent(group, scheduledAnchors);
+                }
+                all.add(toExceptionEntry(group, parentId));
+            }
+        }
+        Map<String, String> securedByRequest = new HashMap<>();
+        if (security != null) {
+            for (SecurityLogEventDto event : security.events()) {
+                String parentId = matchSecurityParent(event, anchors, securityRegistry);
+                String principal = event.principal();
+                // Only a non-blank principal marks the request as authenticated; a correlated event
+                // with no principal (e.g. an anonymous failure) must not flag a misleading lock icon.
+                if (parentId != null && principal != null && !principal.isBlank()) {
+                    securedByRequest.putIfAbsent(parentId, principal);
+                }
+                all.add(toSecurityEntry(event, parentId));
+            }
+        }
+        if (emails != null) {
+            for (EmailMessageDto message : emails.messages()) {
+                all.add(toEmailEntry(message, matchMailParent(message, anchors)));
+            }
+        }
+        if (cache != null) {
+            for (CacheActivityEvent event : cache) {
+                all.add(toCacheEntry(event, matchCacheParent(event, anchors)));
+            }
+        }
+        for (CapturedMessage message : kafkaMessages) {
+            all.add(KafkaActivityEntries.toEntry(
+                    message,
+                    message.direction() == KafkaActivityRecorder.Direction.PRODUCE
+                            ? senderOf(message.requestId(), message.executionId(), anchors, executionEntryById)
+                            : null));
+        }
+        for (JmsActivityRecorder.CapturedMessage message : jmsMessages) {
+            all.add(JmsActivityEntries.toEntry(
+                    message,
+                    message.direction() == JmsActivityRecorder.Direction.PRODUCE
+                            ? senderOf(message.requestId(), message.executionId(), anchors, executionEntryById)
+                            : null));
+        }
+        for (RabbitActivityRecorder.CapturedMessage message : rabbitMessages) {
+            all.add(io.github.jdubois.bootui.engine.rabbit.RabbitActivityEntries.toEntry(
+                    message,
+                    message.direction() == RabbitActivityRecorder.Direction.PUBLISH
+                            ? senderOf(message.requestId(), message.executionId(), anchors, executionEntryById)
+                            : null));
+        }
+        if (!faultToleranceEvents.isEmpty()) {
+            Map<String, String> requestIdByTraceId = uniqueRequestIdsByTraceId(anchors);
+            for (FaultToleranceEventRecorder.CapturedEvent event : faultToleranceEvents) {
+                String parentId = matchByRequestId(event.requestId(), anchors);
+                if (parentId == null && event.traceId() != null) {
+                    parentId = requestIdByTraceId.get(event.traceId());
+                }
+                all.add(FaultToleranceActivityEntries.toEntry(event, parentId));
+            }
+        }
+        if (requests != null) {
+            int nPlusOneThreshold = properties.getActivity().getNPlusOneThreshold();
+            for (HttpExchangeDto exchange : requests.exchanges()) {
+                RequestAnchor anchor = anchorsById.get(exchange.id());
+                boolean sqlNPlusOneSuspected = SqlTraceGrouping.anySuspectedNPlusOne(
+                        sqlByRequestId.getOrDefault(exchange.id(), List.of()), nPlusOneThreshold);
+                all.add(toRequestEntry(
+                        exchange,
+                        anchor == null ? null : anchor.thread(),
+                        securedByRequest.get(exchange.id()),
+                        sqlNPlusOneSuspected));
+            }
+        }
+        for (ScheduledTaskRunStore.Run run : scheduledRuns) {
+            all.add(toScheduledTaskEntry(run));
+        }
+
+        all.sort(Comparator.comparingLong(ActivityEntryDto::timestamp).reversed());
+
+        Map<String, Integer> typeCounts = new LinkedHashMap<>();
+        for (ActivityEntryDto entry : all) {
+            typeCounts.merge(entry.type(), 1, Integer::sum);
+        }
+
+        String normalizedType = BlankStrings.blankToNullTrimmed(typeFilter);
+        String normalizedSeverity = BlankStrings.blankToNullTrimmed(severityFilter);
+        List<ActivityEntryDto> visible = new ArrayList<>();
+        for (ActivityEntryDto entry : all) {
+            if (entry.timestamp() <= since) {
+                continue;
+            }
+            if (normalizedType != null && !entry.type().equalsIgnoreCase(normalizedType)) {
+                continue;
+            }
+            if (normalizedSeverity != null && !entry.severity().equalsIgnoreCase(normalizedSeverity)) {
+                continue;
+            }
+            visible.add(entry);
+            if (visible.size() >= cap) {
+                break;
+            }
+        }
+
+        ActivityKpiDto kpis = computeKpis(requests, sql, exceptionsReport, cache, scheduledRuns, rest);
+        boolean available = !sources.isEmpty();
+        return new LiveActivityReport(available, visible, typeCounts, kpis, sources, warnings);
+    }
+
+    /**
+     * The masked detail the panel buffers still hold for the feed rendered from the runtime journal
+     * ({@code docs/PLAN-v2.md} §5.3, D27): principals, exception messages, and email subjects.
+     */
+    JournalRowDetails journalRowDetails() {
+        List<String> ignored = new ArrayList<>();
+        HttpExchangesReport requests = loadRequests(ignored, new ArrayList<>());
+        ExceptionsReport exceptionsReport = loadExceptions(ignored);
+        EmailsReport emails = loadEmail(ignored);
+        SecurityLogsReport security = loadSecurity(ignored);
+        return JournalRowDetails.of(
+                requests == null ? null : requests.exchanges(),
+                exceptionsReport == null ? null : exceptionsReport.groups(),
+                emails == null ? null : emails.messages(),
+                security == null ? null : security.events());
+    }
+
+    private HttpExchangesReport loadRequests(List<String> sources, List<String> warnings) {
+        if (!properties.isPanelEnabled(BootUiPanels.HTTP_EXCHANGES)) {
+            return null;
+        }
+        HttpExchangesController controller = httpExchanges.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        // Every retained, visible exchange, exactly as the WebFlux and Quarkus adapters read them, so the
+        // shared request-latency KPIs cover the same window on all three stacks. The merged feed is capped
+        // separately, after sorting.
+        HttpExchangesReport report = controller.exchanges(null, null, null, null, null);
+        if (report.unavailableReason() != null) {
+            warnings.add("Requests: " + report.unavailableReason());
+            return null;
+        }
+        sources.add("HTTP Exchanges");
+        return report;
+    }
+
+    private SqlTraceReport loadSql(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.SQL_TRACE)) {
+            return null;
+        }
+        SqlTraceController controller = sqlTrace.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        SqlTraceReport report = controller.trace();
+        if (!report.available()) {
+            return null;
+        }
+        sources.add("SQL Trace");
+        return report;
+    }
+
+    private RestClientTraceReport loadRestClientTrace(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.REST_CLIENT_TRACE)) {
+            return null;
+        }
+        RestClientTraceController controller = restClientTrace.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        RestClientTraceReport report = controller.trace();
+        if (!report.available()) {
+            return null;
+        }
+        sources.add("REST Client");
+        return report;
+    }
+
+    private ExceptionsReport loadExceptions(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.EXCEPTIONS)) {
+            return null;
+        }
+        ExceptionsController controller = exceptions.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        ExceptionsReport report = controller.list();
+        if (!report.available()) {
+            return null;
+        }
+        sources.add("Exceptions");
+        return report;
+    }
+
+    private SecurityLogsReport loadSecurity(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.SECURITY_LOGS)) {
+            return null;
+        }
+        SecurityLogsController controller = securityLogs.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        SecurityLogsReport report = controller.logs(null, null, null, 0, effectiveLimit(0));
+        if (!report.auditEventsPresent()) {
+            return null;
+        }
+        sources.add("Security Logs");
+        return report;
+    }
+
+    private EmailsReport loadEmail(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.EMAIL)) {
+            return null;
+        }
+        EmailController controller = email.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        EmailsReport report = controller.list();
+        if (!report.available()) {
+            return null;
+        }
+        sources.add("Email");
+        return report;
+    }
+
+    private List<CacheActivityEvent> loadCache(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.CACHE) || cacheActivity == null) {
+            return null;
+        }
+        CacheActivityRecorder recorder = cacheActivity.getIfAvailable();
+        if (recorder == null || !recorder.isEnabled()) {
+            return null;
+        }
+        List<CacheActivityEvent> events = recorder.recentEvents();
+        if (events.isEmpty()) {
+            return null;
+        }
+        sources.add("Cache");
+        return events;
+    }
+
+    /**
+     * Reads the currently retained {@code @Scheduled} task executions, newest-first, capped to this
+     * report's effective limit. Absent (no scheduling infrastructure, or the Scheduled Tasks panel
+     * disabled) yields an empty list rather than {@code null} since callers iterate it directly.
+     */
+    private List<ScheduledTaskRunStore.Run> loadScheduledTaskRuns(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.SCHEDULED)) {
+            return List.of();
+        }
+        ScheduledTaskRunStore store = scheduledTaskRuns == null ? null : scheduledTaskRuns.getIfAvailable();
+        if (store == null) {
+            return List.of();
+        }
+        List<ScheduledTaskRunStore.Run> runs = store.runs();
+        if (runs.isEmpty()) {
+            return runs;
+        }
+        sources.add("Scheduled Tasks");
+        int cap = effectiveLimit(0);
+        return runs.size() > cap ? runs.subList(0, cap) : runs;
+    }
+
+    /**
+     * Loads recently captured Kafka messages from {@link KafkaActivityRecorder} directly. Gated on the
+     * dedicated {@code KAFKA} panel — like {@link #loadCache}/{@link #loadEmail} gate on their own domain
+     * panel — plus the recorder's own {@code bootui.kafka.enabled} toggle (folded into
+     * {@link KafkaActivityRecorder#isEnabled()} at construction).
+     */
+    private List<CapturedMessage> loadKafka(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.KAFKA)) {
+            return List.of();
+        }
+        KafkaActivityRecorder recorder = kafka == null ? null : kafka.getIfAvailable();
+        if (recorder == null || !recorder.isEnabled()) {
+            return List.of();
+        }
+        sources.add("Kafka");
+        return recorder.recent();
+    }
+
+    /** Loads recently captured JMS records independently from Kafka and RabbitMQ history. */
+    /**
+     * Loads recently captured fault tolerance outcomes. Gated on the Fault Tolerance panel, so disabling that panel
+     * removes its {@code FAULT_TOLERANCE} entries from the stream exactly as it stops the capture itself.
+     */
+    private List<FaultToleranceEventRecorder.CapturedEvent> loadFaultTolerance(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.FAULT_TOLERANCE)) {
+            return List.of();
+        }
+        FaultToleranceEventRecorder recorder = faultTolerance == null ? null : faultTolerance.getIfAvailable();
+        if (recorder == null || !recorder.isEnabled()) {
+            return List.of();
+        }
+        sources.add("Fault Tolerance");
+        return recorder.recent();
+    }
+
+    /**
+     * Indexes request ids by trace id, keeping only trace ids carried by exactly one request. A fault tolerance
+     * outcome recorded under a trace shared by several requests cannot be attributed to one of them, so it
+     * stays a top-level entry rather than being nested under a guess.
+     */
+    private static Map<String, String> uniqueRequestIdsByTraceId(List<RequestAnchor> anchors) {
+        Map<String, String> byTraceId = new HashMap<>();
+        Set<String> ambiguous = new HashSet<>();
+        for (RequestAnchor anchor : anchors) {
+            String traceId = anchor.traceId();
+            if (traceId == null || traceId.isBlank()) {
+                continue;
+            }
+            if (byTraceId.putIfAbsent(traceId, anchor.id()) != null) {
+                ambiguous.add(traceId);
+            }
+        }
+        byTraceId.keySet().removeAll(ambiguous);
+        return byTraceId;
+    }
+
+    private List<JmsActivityRecorder.CapturedMessage> loadJms(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.JMS)) {
+            return List.of();
+        }
+        JmsActivityRecorder recorder = jms == null ? null : jms.getIfAvailable();
+        if (recorder == null || !recorder.isEnabled()) {
+            return List.of();
+        }
+        sources.add("JMS");
+        return recorder.recent();
+    }
+
+    /**
+     * Loads recently captured RabbitMQ messages from {@link RabbitActivityRecorder} directly. Gated on the
+     * dedicated {@code RABBITMQ} panel — like {@link #loadKafka} gates on its own domain panel — plus the
+     * recorder's own {@code bootui.rabbitmq.enabled} toggle (folded into
+     * {@link RabbitActivityRecorder#isEnabled()} at construction).
+     */
+    private List<RabbitActivityRecorder.CapturedMessage> loadRabbit(List<String> sources) {
+        if (!properties.isPanelEnabled(BootUiPanels.RABBITMQ)) {
+            return List.of();
+        }
+        RabbitActivityRecorder recorder = rabbit == null ? null : rabbit.getIfAvailable();
+        if (recorder == null || !recorder.isEnabled()) {
+            return List.of();
+        }
+        sources.add("RabbitMQ");
+        return recorder.recent();
+    }
+
+    private ActivityEntryDto toRequestEntry(
+            HttpExchangeDto exchange, String servingThread, String securedPrincipal, boolean sqlNPlusOneSuspected) {
+        long timestamp =
+                exchange.timestamp() == null ? 0L : exchange.timestamp().toEpochMilli();
+        int status = exchange.status();
+        Long durationMs = exchange.durationMs();
+        String severity;
+        if (status >= 500) {
+            severity = SEVERITY_ERROR;
+        } else if (status >= 400) {
+            severity = SEVERITY_WARN;
+        } else if (RequestSlowThreshold.isSlow(durationMs, requestSlowThresholdMs())) {
+            severity = SEVERITY_SLOW;
+        } else {
+            severity = SEVERITY_OK;
+        }
+        String path = exchange.path() == null ? "" : exchange.path();
+        String summary = (exchange.method() == null ? "" : exchange.method() + " ") + path + " → " + status;
+        return new ActivityEntryDto(
+                exchange.id(),
+                TYPE_REQUEST,
+                timestamp,
+                severity,
+                summary.trim(),
+                exchange.principal() == null ? null : "as " + exchange.principal(),
+                durationMs,
+                exchange.traceId(),
+                exchange.method(),
+                exchange.path(),
+                status,
+                servingThread,
+                true,
+                null,
+                securedPrincipal,
+                sqlNPlusOneSuspected);
+    }
+
+    private ActivityEntryDto toSqlEntry(SqlTraceEntryDto entry, String parentId) {
+        String severity;
+        if (!entry.success()) {
+            severity = SEVERITY_ERROR;
+        } else if (entry.slow()) {
+            severity = SEVERITY_SLOW;
+        } else {
+            severity = SEVERITY_OK;
+        }
+        String sql = entry.sql() == null ? "" : entry.sql();
+        String summary = truncate(ActivitySql.summarize(entry.category(), ActivitySql.normalize(sql)));
+        String detail = entry.success() ? null : entry.errorMessage();
+        return new ActivityEntryDto(
+                "sql-" + entry.id(),
+                TYPE_SQL,
+                entry.timestamp(),
+                severity,
+                summary.trim(),
+                detail,
+                entry.durationMillis(),
+                entry.traceId(),
+                null,
+                null,
+                null,
+                entry.thread(),
+                false,
+                parentId,
+                null,
+                false);
+    }
+
+    private ActivityEntryDto toRestEntry(RestClientTraceEntryDto entry, String parentId) {
+        String severity;
+        if (!entry.success()) {
+            severity = SEVERITY_ERROR;
+        } else if (entry.status() != null && entry.status() >= 500) {
+            severity = SEVERITY_ERROR;
+        } else if (entry.status() != null && entry.status() >= 400) {
+            severity = SEVERITY_WARN;
+        } else if (entry.slow()) {
+            severity = SEVERITY_SLOW;
+        } else {
+            severity = SEVERITY_OK;
+        }
+        String host = RestClientAuthority.of(entry.host(), entry.uri());
+        String path = entry.path() == null ? "" : entry.path();
+        String outcome = entry.success() ? String.valueOf(entry.status()) : "failed";
+        String summary = (entry.method() == null ? "" : entry.method() + " ") + host + path + " → " + outcome;
+        String detail = entry.success() ? entry.clientType() : entry.errorMessage();
+        return new ActivityEntryDto(
+                "rest-" + entry.id(),
+                TYPE_REST_CLIENT,
+                entry.timestamp(),
+                severity,
+                summary.trim(),
+                detail,
+                entry.durationMillis(),
+                entry.traceId(),
+                entry.method(),
+                entry.path(),
+                entry.status(),
+                entry.thread(),
+                false,
+                parentId,
+                null,
+                false);
+    }
+
+    private ActivityEntryDto toExceptionEntry(ExceptionGroupDto group, String parentId) {
+        String message = group.message() == null ? "" : ": " + group.message();
+        String summary = group.exceptionClassName() + message;
+        String detail = group.location();
+        if (group.count() > 1) {
+            detail = (detail == null ? "" : detail + " ") + "×" + group.count();
+        }
+        return new ActivityEntryDto(
+                "exc-" + group.id(),
+                TYPE_EXCEPTION,
+                group.lastSeen(),
+                SEVERITY_ERROR,
+                summary.trim(),
+                detail,
+                null,
+                null,
+                group.lastRequestMethod(),
+                group.lastRequestPath(),
+                null,
+                group.lastThread(),
+                false,
+                parentId,
+                null,
+                false,
+                List.of(),
+                group.id());
+    }
+
+    private ActivityEntryDto toSecurityEntry(SecurityLogEventDto event, String parentId) {
+        long timestamp = ActivitySql.parseEpochMillis(event.timestamp());
+        String type = event.type() == null ? "" : event.type();
+        String upper = type.toUpperCase(Locale.ROOT);
+        String severity = upper.contains("FAILURE") || upper.contains("DENIED") ? SEVERITY_WARN : SEVERITY_OK;
+        String principal = event.principal() == null ? "" : " · " + event.principal();
+        return new ActivityEntryDto(
+                SecurityActivityIds.stableId(event),
+                TYPE_SECURITY,
+                timestamp,
+                severity,
+                (type + principal).trim(),
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                false,
+                parentId,
+                null,
+                false);
+    }
+
+    private ActivityEntryDto toEmailEntry(EmailMessageDto message, String parentId) {
+        String to = message.to().isEmpty() ? "" : String.join(", ", message.to());
+        String subject = message.subject() == null ? "(no subject)" : message.subject();
+        String detail = to.isBlank() ? null : "to " + to;
+        if (!message.sent()) {
+            detail = (detail == null ? "" : detail + " · ") + "dev-trap: not sent";
+        }
+        return new ActivityEntryDto(
+                message.id(),
+                TYPE_MAIL,
+                message.timestamp(),
+                message.sent() ? SEVERITY_OK : SEVERITY_WARN,
+                subject,
+                detail,
+                null,
+                message.traceId(),
+                null,
+                null,
+                null,
+                message.thread(),
+                false,
+                parentId,
+                null,
+                false);
+    }
+
+    private ActivityEntryDto toCacheEntry(CacheActivityEvent event, String parentId) {
+        String severity = event.operation() == CacheActivityOperation.MISS ? SEVERITY_WARN : SEVERITY_OK;
+        String summary = event.operation().name() + " " + event.cacheName();
+        String detail = event.keyHash() == null ? null : "key " + event.keyHash();
+        return new ActivityEntryDto(
+                "cache-" + event.seq(),
+                TYPE_CACHE,
+                event.timestampMillis(),
+                severity,
+                summary,
+                detail,
+                null,
+                event.traceId(),
+                null,
+                null,
+                null,
+                event.thread(),
+                false,
+                parentId,
+                null,
+                false);
+    }
+
+    /**
+     * Maps a captured {@code @Scheduled} execution to a {@code SCHEDULED} entry. There is no request
+     * to nest this entry itself under (it runs on a background thread), so its own {@code parentId} is
+     * always {@code null}; a run that threw is flagged {@code ERROR}, one slower than the shared
+     * request-slow threshold is flagged {@code SLOW}, otherwise {@code OK}. A failure is always summarized
+     * inline via {@code detail} (the run recorder observes the exception directly), and — when that same
+     * failure is independently captured into the shared exception log buffer — it additionally nests as a
+     * full {@code EXCEPTION} child entry under this one, exactly like a request's failure does today; see
+     * {@link #matchScheduledTaskParent(ExceptionGroupDto, List)}.
+     */
+    private ActivityEntryDto toScheduledTaskEntry(ScheduledTaskRunStore.Run run) {
+        String severity;
+        if (!run.success()) {
+            severity = SEVERITY_ERROR;
+        } else if (RequestSlowThreshold.isSlow(run.durationMs(), requestSlowThresholdMs())) {
+            severity = SEVERITY_SLOW;
+        } else {
+            severity = SEVERITY_OK;
+        }
+        String detail = run.success() ? null : run.exceptionClassName() + messageSuffix(run.message());
+        return new ActivityEntryDto(
+                "sched-" + run.sequence(),
+                TYPE_SCHEDULED,
+                run.startTimestamp(),
+                severity,
+                run.runnable(),
+                detail,
+                run.durationMs(),
+                null,
+                null,
+                null,
+                null,
+                run.thread(),
+                false,
+                null,
+                null,
+                false);
+    }
+
+    private static String messageSuffix(String message) {
+        return message == null || message.isBlank() ? "" : ": " + message;
+    }
+
+    /**
+     * Builds one {@link RequestAnchor} per recent HTTP request, resolving its serving thread and precise
+     * window from {@link RequestCorrelationRegistry} when available. Used to attach correlated SQL,
+     * exception, security, and MAIL entries to the request that caused them.
+     */
+    private List<RequestAnchor> buildAnchors(HttpExchangesReport requests) {
+        if (requests == null) {
+            return List.of();
+        }
+        RequestCorrelationRegistry registry = requestCorrelations == null ? null : requestCorrelations.getIfAvailable();
+        List<RequestAnchor> anchors = new ArrayList<>();
+        for (HttpExchangeDto exchange : requests.exchanges()) {
+            long start =
+                    exchange.timestamp() == null ? 0L : exchange.timestamp().toEpochMilli();
+            long end = exchange.durationMs() == null ? start : start + exchange.durationMs();
+            String thread = null;
+            if (registry != null && exchange.method() != null && exchange.path() != null) {
+                RequestCorrelationRegistry.RequestCorrelation corr =
+                        registry.match(exchange.method(), exchange.path(), start, end);
+                if (corr != null) {
+                    thread = corr.thread();
+                    start = corr.startMillis();
+                    end = corr.endMillis();
+                }
+            }
+            anchors.add(new RequestAnchor(
+                    exchange.id(),
+                    start,
+                    end,
+                    thread,
+                    exchange.traceId(),
+                    exchange.method(),
+                    exchange.path(),
+                    exchange.requestId()));
+        }
+        return anchors;
+    }
+
+    /**
+     * Resolves the request that a SQL statement belongs to: trace-id join first (exact), then serving
+     * thread within the request window (exact). Returns {@code null} when neither tier yields a unique
+     * request, so the entry stays top-level rather than being mis-attributed.
+     */
+    private static String matchSqlParent(
+            SqlTraceEntryDto entry, List<RequestAnchor> anchors, Map<String, String> executionEntryById) {
+        String byRequestId = matchByRequestId(entry.requestId(), anchors);
+        if (byRequestId != null) {
+            return byRequestId;
+        }
+        String byExecutionId = matchByExecutionId(entry.executionId(), executionEntryById);
+        if (byExecutionId != null) {
+            return byExecutionId;
+        }
+        return matchByTraceThenThread(entry.traceId(), entry.thread(), entry.timestamp(), anchors);
+    }
+
+    /**
+     * The scheduled run whose BootUI execution id the child carries ({@code docs/PLAN-v2.md} §5.1): exact, whatever
+     * thread the child ran on. {@code null} when it carries none or no retained run has it.
+     */
+    private static String matchByExecutionId(String executionId, Map<String, String> executionEntryById) {
+        if (executionId == null || executionId.isBlank()) {
+            return null;
+        }
+        return executionEntryById.get(executionId);
+    }
+
+    /**
+     * The entry of every execution BootUI can anchor signals to by execution id: each scheduled run and each consumed
+     * message ({@code docs/PLAN-v2.md} §5.1).
+     */
+    private static Map<String, String> executionEntries(
+            List<ScheduledTaskAnchor> scheduledAnchors,
+            List<CapturedMessage> kafkaMessages,
+            List<JmsActivityRecorder.CapturedMessage> jmsMessages,
+            List<RabbitActivityRecorder.CapturedMessage> rabbitMessages) {
+        Map<String, String> byExecutionId = new HashMap<>();
+        for (ScheduledTaskAnchor anchor : scheduledAnchors) {
+            putExecution(byExecutionId, anchor.executionId(), anchor.id());
+        }
+        for (CapturedMessage message : kafkaMessages) {
+            if (message.direction() == KafkaActivityRecorder.Direction.CONSUME) {
+                putExecution(byExecutionId, message.executionId(), KafkaActivityEntries.entryId(message));
+            }
+        }
+        for (JmsActivityRecorder.CapturedMessage message : jmsMessages) {
+            if (message.direction() == JmsActivityRecorder.Direction.CONSUME) {
+                putExecution(byExecutionId, message.executionId(), JmsActivityEntries.entryId(message));
+            }
+        }
+        for (RabbitActivityRecorder.CapturedMessage message : rabbitMessages) {
+            if (message.direction() == RabbitActivityRecorder.Direction.CONSUME) {
+                putExecution(
+                        byExecutionId,
+                        message.executionId(),
+                        io.github.jdubois.bootui.engine.rabbit.RabbitActivityEntries.entryId(message));
+            }
+        }
+        return byExecutionId;
+    }
+
+    private static void putExecution(Map<String, String> byExecutionId, String executionId, String entryId) {
+        if (executionId != null && !executionId.isBlank()) {
+            byExecutionId.putIfAbsent(executionId, entryId);
+        }
+    }
+
+    /** The entry that sent an outgoing message: its request, else its execution, else none. */
+    private static String senderOf(
+            String requestId, String executionId, List<RequestAnchor> anchors, Map<String, String> executionEntryById) {
+        String byRequestId = matchByRequestId(requestId, anchors);
+        return byRequestId != null ? byRequestId : matchByExecutionId(executionId, executionEntryById);
+    }
+
+    /** The request whose id the child carries, else {@link #matchByTraceThenThread}'s tiers. */
+    private static String matchByRequestIdThenTraceThenThread(
+            String requestId, String traceId, String thread, long timestamp, List<RequestAnchor> anchors) {
+        String byRequestId = matchByRequestId(requestId, anchors);
+        if (byRequestId != null) {
+            return byRequestId;
+        }
+        return matchByTraceThenThread(traceId, thread, timestamp, anchors);
+    }
+
+    /**
+     * Resolves the request that a cache access belongs to using the same trace-id-then-serving-thread
+     * tiering {@link #matchSqlParent} uses for SQL, since cache accesses are captured on the same
+     * application thread as the request that triggered them.
+     */
+    private static String matchCacheParent(CacheActivityEvent event, List<RequestAnchor> anchors) {
+        return matchByRequestIdThenTraceThenThread(
+                event.requestId(), event.traceId(), event.thread(), event.timestampMillis(), anchors);
+    }
+
+    /**
+     * The request whose BootUI request id the child carries ({@code docs/PLAN-v2.md} §5.1): exact, with or without
+     * tracing, and whatever thread the child ran on. {@code null} when the child carries none or no retained request
+     * has it.
+     */
+    private static String matchByRequestId(String requestId, List<RequestAnchor> anchors) {
+        if (requestId == null || requestId.isBlank()) {
+            return null;
+        }
+        for (RequestAnchor anchor : anchors) {
+            if (requestId.equals(anchor.requestId())) {
+                return anchor.id();
+            }
+        }
+        return null;
+    }
+
+    private static String matchByTraceThenThread(
+            String traceId, String thread, long timestamp, List<RequestAnchor> anchors) {
+        if (traceId != null && !traceId.isBlank()) {
+            String byTrace = uniqueByTrace(anchors, traceId);
+            if (byTrace != null) {
+                return byTrace;
+            }
+        }
+        if (thread == null) {
+            return null;
+        }
+        String found = null;
+        for (RequestAnchor anchor : anchors) {
+            if (thread.equals(anchor.thread()) && covers(anchor, timestamp)) {
+                if (found != null) {
+                    return null;
+                }
+                found = anchor.id();
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Resolves the request that a captured email belongs to using the same trace-id-then-serving-thread
+     * tiering {@link #matchSqlParent} uses for SQL, since captured emails are recorded on the same
+     * application thread as the request that triggered them.
+     */
+    private static String matchMailParent(EmailMessageDto message, List<RequestAnchor> anchors) {
+        return matchByRequestIdThenTraceThenThread(
+                message.requestId(), message.traceId(), message.thread(), message.timestamp(), anchors);
+    }
+
+    /**
+     * Resolves the request that an outbound REST call belongs to using the same trace-id-then-serving-thread
+     * tiering {@link #matchSqlParent} uses for SQL, since outbound calls are made on the same application
+     * thread as the request that triggered them.
+     */
+    private static String matchRestParent(
+            RestClientTraceEntryDto entry, List<RequestAnchor> anchors, Map<String, String> executionEntryById) {
+        String byRequestId = matchByRequestId(entry.requestId(), anchors);
+        if (byRequestId != null) {
+            return byRequestId;
+        }
+        String byExecutionId = matchByExecutionId(entry.executionId(), executionEntryById);
+        if (byExecutionId != null) {
+            return byExecutionId;
+        }
+        return matchByTraceThenThread(entry.traceId(), entry.thread(), entry.timestamp(), anchors);
+    }
+
+    /**
+     * Resolves the request that an exception group belongs to: the request whose BootUI request id its last
+     * occurrence carries, else the last request method/path within the request window, disambiguated by serving
+     * thread when more than one request matches.
+     */
+    private static String matchExceptionParent(ExceptionGroupDto group, List<RequestAnchor> anchors) {
+        String byRequestId = matchByRequestId(group.lastRequestId(), anchors);
+        if (byRequestId != null) {
+            return byRequestId;
+        }
+        String method = group.lastRequestMethod();
+        String path = group.lastRequestPath();
+        if (method == null || path == null) {
+            return null;
+        }
+        long ts = group.lastSeen();
+        List<RequestAnchor> candidates = new ArrayList<>();
+        for (RequestAnchor anchor : anchors) {
+            if (method.equalsIgnoreCase(anchor.method())
+                    && path.equalsIgnoreCase(anchor.path())
+                    && covers(anchor, ts)) {
+                candidates.add(anchor);
+            }
+        }
+        if (candidates.size() > 1 && group.lastThread() != null) {
+            candidates.removeIf(anchor -> !group.lastThread().equals(anchor.thread()));
+        }
+        return candidates.size() == 1 ? candidates.get(0).id() : null;
+    }
+
+    /**
+     * Resolves the {@code @Scheduled} execution an exception group belongs to when no HTTP request already
+     * claimed it: an exact serving-thread + time-window join against the run's execution window, mirroring
+     * {@code matchSqlParent}'s second tier (there is no method/path to join on for a background job, and no
+     * trace id either, since scheduled executions are not distributed-trace participants). Returns
+     * {@code null} when no run's window uniquely covers the exception, so the entry stays top-level rather
+     * than being mis-attributed.
+     */
+    private static String matchScheduledTaskParent(ExceptionGroupDto group, List<ScheduledTaskAnchor> anchors) {
+        String thread = group.lastThread();
+        if (thread == null || anchors.isEmpty()) {
+            return null;
+        }
+        long ts = group.lastSeen();
+        String found = null;
+        for (ScheduledTaskAnchor anchor : anchors) {
+            if (thread.equals(anchor.thread()) && covers(anchor.start(), anchor.end(), ts)) {
+                if (found != null) {
+                    return null;
+                }
+                found = anchor.id();
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Resolves the request that a security audit event belongs to: the request whose BootUI request id it carries,
+     * else the serving-thread classifier, which attributes it only when it was emitted on that request's serving
+     * thread.
+     */
+    private static String matchSecurityParent(
+            SecurityLogEventDto event, List<RequestAnchor> anchors, SecurityEventCorrelationRegistry registry) {
+        String byRequestId = matchByRequestId(event.requestId(), anchors);
+        if (byRequestId != null) {
+            return byRequestId;
+        }
+        if (registry == null) {
+            return null;
+        }
+        long ts = ActivitySql.parseEpochMillis(event.timestamp());
+        String type = event.type();
+        String found = null;
+        for (RequestAnchor anchor : anchors) {
+            if (anchor.thread() == null || !covers(anchor, ts)) {
+                continue;
+            }
+            if (registry.classify(anchor.thread(), type, ts, ActivitySql.SECURITY_THREAD_SLACK_MS)
+                    == SecurityEventCorrelationRegistry.ThreadMatch.OURS) {
+                if (found != null) {
+                    return null;
+                }
+                found = anchor.id();
+            }
+        }
+        return found;
+    }
+
+    private static String uniqueByTrace(List<RequestAnchor> anchors, String traceId) {
+        String found = null;
+        for (RequestAnchor anchor : anchors) {
+            if (traceId.equals(anchor.traceId())) {
+                if (found != null) {
+                    return null;
+                }
+                found = anchor.id();
+            }
+        }
+        return found;
+    }
+
+    private static boolean covers(RequestAnchor anchor, long timestamp) {
+        return covers(anchor.start(), anchor.end(), timestamp);
+    }
+
+    /**
+     * Whether {@code timestamp} falls within {@code [start, end]}, widened by the shared window-slack
+     * tolerance on both ends. Shared by {@link RequestAnchor} and {@link ScheduledTaskAnchor} matching so
+     * both anchor kinds use the exact same tolerance.
+     */
+    private static boolean covers(long start, long end, long timestamp) {
+        return timestamp >= start - ActivitySql.WINDOW_SLACK_MS && timestamp <= end + ActivitySql.WINDOW_SLACK_MS;
+    }
+
+    /**
+     * A recent HTTP request reduced to what is needed to attach correlated signals to it: its id, the
+     * (possibly thread-refined) time window, the serving thread when known, and the trace id.
+     */
+    private record RequestAnchor(
+            String id,
+            long start,
+            long end,
+            String thread,
+            String traceId,
+            String method,
+            String path,
+            String requestId) {}
+
+    /**
+     * Builds one {@link ScheduledTaskAnchor} per captured {@code @Scheduled} execution, so a correlated
+     * exception can be attached to the run that produced it the same way {@link #buildAnchors} lets SQL/
+     * exception/security entries attach to their owning request.
+     */
+    private static List<ScheduledTaskAnchor> buildScheduledTaskAnchors(List<ScheduledTaskRunStore.Run> runs) {
+        List<ScheduledTaskAnchor> anchors = new ArrayList<>(runs.size());
+        for (ScheduledTaskRunStore.Run run : runs) {
+            long start = run.startTimestamp();
+            anchors.add(new ScheduledTaskAnchor(
+                    "sched-" + run.sequence(), start, start + run.durationMs(), run.thread(), run.executionId()));
+        }
+        return anchors;
+    }
+
+    /**
+     * A captured {@code @Scheduled} execution reduced to what is needed to attach a correlated exception to
+     * it: its {@code SCHEDULED} entry id, its execution window, and the thread it ran on.
+     */
+    private record ScheduledTaskAnchor(String id, long start, long end, String thread, String executionId) {}
+
+    private ActivityKpiDto computeKpis(
+            HttpExchangesReport requests,
+            SqlTraceReport sql,
+            ExceptionsReport exceptions,
+            List<CacheActivityEvent> cache,
+            List<ScheduledTaskRunStore.Run> scheduledRuns,
+            RestClientTraceReport rest) {
+        double requestsPerMinute = 0;
+        double errorRate = 0;
+        // Computed by the shared engine helper the WebFlux and Quarkus assembler also uses, so all three
+        // stacks report the same latency KPIs and the same slowest request for the same retained exchanges.
+        RequestLatencyKpis latency =
+                requests == null ? RequestLatencyKpis.empty() : RequestLatencyKpis.of(requests.exchanges());
+        if (requests != null && !requests.exchanges().isEmpty()) {
+            List<HttpExchangeDto> list = requests.exchanges();
+            requestsPerMinute = perMinute(list.stream()
+                    .map(HttpExchangeDto::timestamp)
+                    .filter(Objects::nonNull)
+                    .map(Instant::toEpochMilli)
+                    .toList());
+            long errors = list.stream().filter(e -> e.status() >= 400).count();
+            errorRate = 100.0 * errors / list.size();
+        }
+
+        double sqlPerMinute = 0;
+        Long slowestQueryMs = null;
+        if (sql != null && !sql.entries().isEmpty()) {
+            sqlPerMinute = perMinute(
+                    sql.entries().stream().map(SqlTraceEntryDto::timestamp).toList());
+            slowestQueryMs = sql.entries().stream()
+                    .mapToLong(SqlTraceEntryDto::durationMillis)
+                    .max()
+                    .orElse(0L);
+        }
+
+        Double restCallErrorRate = null;
+        Long restCallP95 = null;
+        if (rest != null && !rest.entries().isEmpty()) {
+            List<RestClientTraceEntryDto> list = rest.entries();
+            long errors = list.stream()
+                    .filter(entry -> !entry.success() || (entry.status() != null && entry.status() >= 400))
+                    .count();
+            restCallErrorRate = 100.0 * errors / list.size();
+            restCallP95 = Percentiles.of(
+                    list.stream().map(RestClientTraceEntryDto::durationMillis).toList(), 95);
+        }
+
+        int activeExceptions = exceptions == null ? 0 : exceptions.groups().size();
+        String healthStatus = currentHealthStatus();
+
+        Double cacheHitRatioPercent = null;
+        if (cache != null && !cache.isEmpty()) {
+            long hits = cache.stream()
+                    .filter(e -> e.operation() == CacheActivityOperation.HIT)
+                    .count();
+            long misses = cache.stream()
+                    .filter(e -> e.operation() == CacheActivityOperation.MISS)
+                    .count();
+            long reads = hits + misses;
+            if (reads > 0) {
+                cacheHitRatioPercent = round(100.0 * hits / reads);
+            }
+        }
+
+        int scheduledTaskFailureCount =
+                (int) scheduledRuns.stream().filter(run -> !run.success()).count();
+
+        Long heapUsed = null;
+        Long heapMax = null;
+        try {
+            MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+            heapUsed = heap.getUsed();
+            heapMax = heap.getMax() < 0 ? null : heap.getMax();
+        } catch (RuntimeException ignored) {
+            // Heap metrics are best-effort.
+        }
+
+        return new ActivityKpiDto(
+                round(requestsPerMinute),
+                round(errorRate),
+                latency.p50Ms(),
+                latency.p95Ms(),
+                latency.slowestPath(),
+                latency.slowestMs(),
+                activeExceptions,
+                round(sqlPerMinute),
+                slowestQueryMs,
+                healthStatus,
+                heapUsed,
+                heapMax,
+                cacheHitRatioPercent,
+                scheduledTaskFailureCount,
+                restCallErrorRate == null ? null : round(restCallErrorRate),
+                restCallP95,
+                latency.sampleCount(),
+                latency.slowestRoute(),
+                latency.slowestRouteId(),
+                latency.slowestRouteSource());
+    }
+
+    String currentHealthStatus() {
+        if (!properties.isPanelEnabled(BootUiPanels.HEALTH)) {
+            return null;
+        }
+        HealthController controller = health.getIfAvailable();
+        if (controller == null) {
+            return null;
+        }
+        try {
+            HealthNodeDto node = controller.health();
+            return node == null ? null : node.status();
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static double perMinute(List<Long> timestamps) {
+        if (timestamps.size() < 2) {
+            return timestamps.size();
+        }
+        long min = Long.MAX_VALUE;
+        long max = Long.MIN_VALUE;
+        for (long timestamp : timestamps) {
+            min = Math.min(min, timestamp);
+            max = Math.max(max, timestamp);
+        }
+        long spanMs = max - min;
+        if (spanMs <= 0) {
+            return timestamps.size();
+        }
+        double minutes = spanMs / 60_000.0;
+        return timestamps.size() / Math.max(minutes, 1.0 / 60);
+    }
+
+    private static double round(double value) {
+        return Math.round(value * 100.0) / 100.0;
+    }
+
+    private long requestSlowThresholdMs() {
+        return properties.getActivity().getRequestSlowThresholdMs();
+    }
+
+    private int effectiveLimit(int requested) {
+        int max = properties.getActivity().getMaxEntries();
+        if (requested <= 0) {
+            return max;
+        }
+        return Math.min(requested, max);
+    }
+
+    private static String truncate(String value) {
+        if (value.length() <= SQL_SUMMARY_LENGTH) {
+            return value;
+        }
+        return value.substring(0, SQL_SUMMARY_LENGTH) + "…";
+    }
+}

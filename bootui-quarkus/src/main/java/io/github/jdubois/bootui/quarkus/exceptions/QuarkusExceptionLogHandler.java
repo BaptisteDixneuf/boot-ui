@@ -1,9 +1,11 @@
 package io.github.jdubois.bootui.quarkus.exceptions;
 
+import io.github.jdubois.bootui.engine.correlation.TraceIdSource;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
+import io.github.jdubois.bootui.engine.support.BootUiThreadLocal;
 import io.github.jdubois.bootui.engine.support.InternalPackageMatcher;
 import io.github.jdubois.bootui.quarkus.QuarkusBootUiPaths;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.quarkus.correlation.QuarkusRequestCorrelation;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.ext.web.RoutingContext;
 import java.util.logging.Handler;
@@ -28,7 +30,7 @@ import org.eclipse.microprofile.config.Config;
  * re-entrancy guard plus the store's own dedup means capture can never recurse into the logging system,
  * and every path is silent so a misbehaving log can never disrupt the application.</p>
  *
- * <p>When an OpenTelemetry {@link TraceIdProvider} is present it stamps a best-effort trace id on each
+ * <p>When an OpenTelemetry {@link TraceIdSource} is present it stamps a best-effort trace id on each
  * captured throwable so a logged failure can nest under its request in the Live Activity timeline — when
  * the logging thread still carries the request's OpenTelemetry context. It is nullable and fully guarded:
  * with no provider, no context, or a failure, the trace id is simply {@code null}.</p>
@@ -55,15 +57,15 @@ public final class QuarkusExceptionLogHandler extends Handler {
 
     private final ExceptionStore store;
     private final InternalPackageMatcher internalPackages;
-    private final TraceIdProvider traceIdProvider;
+    private final TraceIdSource traceIdProvider;
     private final CurrentVertxRequest currentVertxRequest;
     private final Config config;
-    private final ThreadLocal<Boolean> capturing = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    private final ThreadLocal<Boolean> capturing = BootUiThreadLocal.withInitial(() -> Boolean.FALSE);
 
     public QuarkusExceptionLogHandler(
             ExceptionStore store,
             InternalPackageMatcher internalPackages,
-            TraceIdProvider traceIdProvider,
+            TraceIdSource traceIdProvider,
             CurrentVertxRequest currentVertxRequest,
             Config config) {
         this.store = store;
@@ -85,11 +87,15 @@ public final class QuarkusExceptionLogHandler extends Handler {
         capturing.set(Boolean.TRUE);
         try {
             RoutingContext rc = currentRoutingContext();
-            String path = rc == null ? null : rc.normalizedPath();
+            // Off the request scope, such as on the event loop before routing, the request's duplicated context still
+            // carries its request line.
+            QuarkusRequestCorrelation.RequestLine line =
+                    rc == null ? QuarkusRequestCorrelation.currentRequestLine() : null;
+            String path = rc != null ? rc.normalizedPath() : line == null ? null : line.path();
             if (QuarkusBootUiPaths.isBootUiRequest(config, path)) {
                 return; // never capture BootUI's own traffic
             }
-            String method = rc == null ? null : rc.request().method().name();
+            String method = rc != null ? rc.request().method().name() : line == null ? null : line.method();
             String handler = QuarkusResourceHandlers.currentHandler();
             store.record(thrown, Thread.currentThread().getName(), method, path, handler, "log", currentTraceId());
         } catch (RuntimeException ignored) {

@@ -24,8 +24,8 @@ the running application instead:
 - **Core context** — application overview, health, effective configuration (secrets masked), beans, and request
   mappings.
 
-Every tool reuses the same controllers and immutable DTOs as the browser UI, so the agent sees the same masked,
-bounded shape a human would, never raw internals.
+Every tool reuses the same services and immutable DTO contracts as the browser UI, with compact agent projections
+where needed, so the agent sees masked, bounded evidence, never raw internals. Method-probe shapes stay in the panel.
 
 ::: details Dismissed Pentesting findings
 `pentest_scan`, `get_pentest_report`, their CLI equivalents, and the REST API retain accepted findings with
@@ -104,8 +104,9 @@ BootUI must already be running in your application, and its MCP server must be e
 
 If the application uses another port or a custom [`bootui.api-path`](PROPERTIES.md), disable the bundled BootUI MCP
 server in **Customize** and use the manual `~/.cursor/mcp.json` entry below with the correct URL. Do the same for an
-application reached from a container or another host, adding its `Authorization` bearer token to your local
-configuration. Agent Plugins does not expand environment variables in remote URLs, and the portable plugin deliberately
+application reached from a container or another host. If its raw peer is not loopback, a configured trusted proxy, or
+a trusted container gateway, add its `Authorization` bearer token to your local configuration.
+Agent Plugins does not expand environment variables in remote URLs, and the portable plugin deliberately
 ships no credentials.
 
 Agent Plugins names BootUI's transport `streamable-http`; Claude Code and VS Code call the same transport `http`, while
@@ -138,7 +139,7 @@ Two things to know before your first call:
    export BOOTUI_MCP_URL=http://127.0.0.1:8081/bootui/api/mcp
    ```
 
-An agent reaching BootUI from anywhere other than loopback must also present the bearer token; the plugin's
+An agent reaching BootUI from an untrusted non-loopback peer must also present the bearer token; the plugin's
 configuration carries no header, so register that server yourself with the
 [`claude mcp add` form below](#connect-an-agent-to-the-bootui-mcp-server) instead.
 
@@ -150,8 +151,16 @@ mutating actions — applies exactly as it does to any other MCP client.
 ## Connect an agent to the BootUI MCP server
 
 The BootUI MCP server is a local, opt-in JSON-RPC 2.0 endpoint at `POST /bootui/api/mcp`. It is **disabled by default**
-(fail-closed) and, like the rest of BootUI, only reachable over the loopback interface unless non-loopback access is
-explicitly enabled, which requires authentication.
+(fail-closed) and, like the rest of BootUI, rejects non-loopback peers unless access is explicitly enabled.
+Configured trusted proxy ranges and trusted container gateways are loopback-equivalent for authentication;
+`bootui.allow-non-localhost=true` alone does not confer that trust and requires a token for other peers.
+
+The endpoint speaks both MCP eras. A client that opens with `initialize` gets MCP 2025-06-18 exactly as before; a client
+that sends MCP 2026-07-28 per-request `_meta` (with the matching `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name`
+headers) can call `server/discover` and gets `resultType`, the server's identity, and cache hints on every result. Both
+eras see the same tools, prompts, policies, and limits. A modern call that asks for progress on a tool with real phases
+answers on a request-scoped `text/event-stream`; every other response is a single JSON object. There is no `GET`
+stream in either era (`405`). See [Protocol eras](#protocol-eras) for the details a client implementer needs.
 
 1. **Run your app locally with BootUI active** (the `dev` / `local` profiles, or `spring-boot-devtools` on the
    classpath). See [Setup](SETUP.md).
@@ -212,10 +221,10 @@ explicitly enabled, which requires authentication.
    non-browser MCP client connects with a plain HTTP config, while the loopback, `Host` allow-list, and cross-site write
    defenses still apply.
 
-4. **If the agent is not on loopback, send the bearer token.** An agent that reaches the app from anywhere other than
-   loopback — the common case being an app in a container reached through a published port — is a remote API caller
-   like any other, and every MCP call answers `401` until it presents BootUI's token in the standard `Authorization`
-   header.
+4. **For an untrusted non-loopback peer, send the bearer token.** Loopback peers, configured
+   `bootui.trusted-proxies` ranges, and a gateway trusted by `bootui.trust-container-gateway` bypass authentication.
+   Any other peer allowed through `bootui.allow-non-localhost=true` answers `401` until it presents BootUI's token in
+   the standard `Authorization` header. Host and cross-site-write checks apply in every case.
    Tick **Agent connects from another host or container** in the panel and the snippets gain the header. For Claude Code
    that is:
 
@@ -251,20 +260,39 @@ agent will see before you wire it up.
 ### Tools the agent can call
 
 Tools whose backing panel/controller is absent (for example Hibernate or Spring Security when those libraries are not on
-the classpath) are simply not advertised.
+the classpath) are not advertised. Calling one anyway answers JSON-RPC `-32602` with the reason in the message, such as
+`Tool not available in this application: get_kafka_activity. Its Kafka panel is unavailable: …`, and in `error.data`
+(`tool`, `panel`, and `reason` when the panel gives one). A name BootUI does not know at all still answers
+`Unknown tool: <name>`. A tool of a disabled panel is refused in-band as disabled, whether or not it is advertised.
+
+Each `tools/list` entry carries MCP `annotations` derived from the tool's kind: a read has `readOnlyHint: true` and
+`idempotentHint: true`; an action has `readOnlyHint: false`, the `clear_*` actions `destructiveHint: true` (they discard
+buffered evidence), clearing, pausing, and resuming `idempotentHint: true`, and `vulnerabilities_scan`
+`openWorldHint: true` (it contacts OSV.dev). Its `inputSchema` describes each argument for that tool: where an `id`
+comes from, the words a `query` understands, one example, and the `default` a call gets when it omits `limit` (a
+compacted tool's short page, otherwise `bootui.mcp.max-results`). The hints help an agent host decide when to ask the
+user; BootUI's own panel and read-only gates still apply.
 
 - **Advisor scans (actions):** `architecture_scan`, `spring_scan`, `hibernate_scan`, `database_advisor_scan`,
   `memory_scan`, `security_scan`, `pentest_scan`, `rest_api_scan`, `graalvm_scan`, `crac_scan`, and
-  `vulnerabilities_scan`. Each runs the same scan as the panel's action button and returns the report DTO;
+  `vulnerabilities_scan`. Each runs the same scan as the panel's action button and answers with a
+  [compact summary](#compact-answers-from-scans-and-capture-controls) pointing at its cached report tool;
   `vulnerabilities_scan` additionally sends package names/versions to OSV.dev and, when EPSS is enabled, CVE ids to FIRST.
   Run it only with approval. Inspect `scan.status`, `scan.message`, `coverage`, and `scan.packagesSkipped`; partial or
   unknown evidence is not a clean result. `coverage.archivesFirstParty`/`firstPartyArchives` name the application's own
   module JARs, which are not a coverage gap. Fix candidates need compatibility checks, and EPSS is the highest available
   per-CVE probability, not a combined probability or severity. See [Vulnerabilities checks](VULNERABILITIES-CHECKS.md).
+  On Quarkus, `spring_scan`, `get_spring_report`, and `get_spring_rule_violations` run and read the Quarkus application
+  advisor (QA-* rules); they keep their Spring names, shared with Spring Boot, so published CLI binaries and agent
+  configurations keep working. A rule appears once per scan: in `results` when it found something, with any coverage
+  gap stated on the finding and in `evidence.limitations`, or in `analysisErrors` when it could not be evaluated.
 - **Cached advisor reports:** `get_architecture_report`, `get_spring_report`, `get_hibernate_report`,
   `get_database_advisor_report`, `get_memory_report`, `get_security_report`, `get_pentest_report`,
   `get_rest_api_report`, `get_graalvm_report`, `get_crac_report`, and `get_vulnerabilities_report` return the last
-  completed report without starting another scan.
+  completed report without starting another scan. With the BootUI agent, the vulnerabilities report's `runtimeReach`
+  says whether each dependency's classes, or a class its advisory names, loaded in this JVM; it is read when answered,
+  never changes a severity, and `NOT_LOADED` means not loaded yet, not unreachable
+  ([Runtime reach](features/advisors.md#runtime-reach)).
 - **Cached per-rule violations (reads):** `get_architecture_rule_violations`, `get_hibernate_rule_violations`,
   `get_spring_rule_violations`, `get_rest_api_rule_violations`, `get_memory_rule_violations`,
   `get_security_rule_violations`, and `get_database_advisor_rule_violations` page the retained details from that
@@ -279,52 +307,287 @@ the classpath) are simply not advertised.
   evidence window they cover; its optional `limit` is the number of routes each ranking criterion contributes.
   `get_live_activity` returns the correlated feed the [Live Activity panel](features/overview.md#live-activity) shows (HTTP requests, SQL
   statements, exceptions, and security events grouped by request/trace); `get_request_profile` takes the required `id`
-  of a `REQUEST` entry whose `profileable` flag is true and returns the same masked profile as
-  `GET /bootui/api/activity/request/{id}` and the panel's profile drawer — see
+  of a profileable request, scheduled run, or consumed message (also an insight exemplar). It returns a selection
+  with `source: "journal"`, `"buffers"`, or `"none"`; a retained journal `journal` profile is preferred,
+  and a retained HTTP-exchange `buffers` profile accompanies it for HTTP requests (or is returned alone as a
+  fallback). It is not the single legacy REST DTO — see
   [Investigate one request](#investigate-one-request); `get_exception_detail` takes a required `id`
-  (from `get_exceptions`, `get_live_activity`, or a profile exception's `exceptionGroupId`) and returns that exception
-  group's full stack trace, causes, and individual occurrences. `get_http_exchanges`, `get_sql_traces`, and `get_rest_client_traces` read bounded buffers
+  (from `get_exceptions`, an `EXCEPTION` entry's `exceptionGroupId` in `get_live_activity`, never the entry's own `id`, or a profile exception's `exceptionGroupId`) and returns that exception
+  group's full stack trace, causes, and individual occurrences. With the BootUI agent's opt-in `caught-exceptions`
+  sensor, `get_exceptions` also returns `caughtInCode`: counts and the top findings of the exceptions application code
+  caught. A finding was not seen rethrown or logged at `WARN` or above while the evidence was complete; `unknown`
+  counts incomplete evidence, never a swallowed exception
+  ([Caught in application code](features/diagnostics.md#caught-in-application-code)). `get_http_exchanges`, `get_sql_traces`, and `get_rest_client_traces` read bounded buffers
   that keep recent failed and slow records longer than routine ones; each includes a `retention` object with the
   capacity and the retained, reserved, and evicted counts, so an agent can tell a partial window from "it never
   happened". See [Failure-preserving retention](features/diagnostics.md#failure-preserving-retention).
+- **Runtime Insights reads:** `get_runtime_insights`, `get_runtime_insight`, `get_runtime_impact`, and
+  `get_runtime_run_comparison`, compact facts an agent can refuse to act on; see
+  [Runtime Insights for agents](#runtime-insights-for-agents).
 - **Core context and integration reads:** `get_overview`, `get_health`, `get_config` (masked), `get_beans`,
   `get_mappings`, `get_loggers`, `get_conditions`, `get_http_sessions`, `get_scheduled_tasks`, `get_fault_tolerance`,
   `get_cache_stats`,
   `get_database_connection_pools`, `get_postgresql_report`, `get_mysql_report`, `get_metrics`, `get_live_memory`, `get_jvm_tuning`, `get_heap_dump_report`,
   `get_threads`, `get_startup_timeline`, `get_profile_diff`, `get_spring_data_repositories`,
   `get_flyway_migrations`, `get_liquibase_changesets`, `get_spring_security`, `get_ai_overview`, `get_emails`,
-  `get_kafka_activity`, `get_rabbitmq_activity`, `get_jms_activity`, `get_devtools_status`, `get_dev_services`,
-  `get_github_dashboard`, `get_copilot_sessions`, and `get_claude_code_sessions`. Stack-specific or unavailable
-  capabilities are omitted.
+  `get_kafka_activity`, `get_rabbitmq_activity`, `get_jms_activity`, `get_agent_status`, `get_devtools_status`,
+  `get_dev_services`, `get_github_dashboard`, `get_copilot_sessions`, `get_claude_code_sessions`,
+  `get_hibernate_statistics` (Hibernate ORM counters; it never enables statistics, and reports `available: false` with
+  the reason while they are off), and `get_websockets` (endpoints, sessions, subscriptions, and frame metadata, never a
+  payload). Stack-specific or unavailable capabilities are omitted.
+- **Code Inventory read:** `get_code_inventory`, whether the code changed since the previous run executed in this run;
+  see [Did my change run?](#did-my-change-run).
+- **Code Paths read:** `get_code_paths`, which application methods each route spends its time in; see
+  [Where does the handler's time go?](#where-does-the-handler-s-time-go).
+- **Method probes:** `start_method_probe`, an action that needs the user's separate approval, and `get_method_probe`;
+  see [Did this method run, and how?](#did-this-method-run-and-how).
+- **Side Effects read:** `get_side_effects`, which processes, hosts, and other side-effect sensor rows each route or background
+  execution produced; see [What side effects did the application start?](#what-side-effects-did-the-application-start).
 - **Bounded controls (actions):** `clear_exceptions`, `clear_sql_traces`, `pause_sql_trace_recording`,
   `resume_sql_trace_recording`, `clear_transactions`, `pause_transaction_recording`, `resume_transaction_recording`,
   `clear_traces`, `clear_rest_client_traces`, `pause_rest_client_recording`, `resume_rest_client_recording`,
-  `postgresql_read`, `mysql_read`, `analyze_heap_dump`, and `trigger_devtools_livereload`. They never capture or download a heap dump,
+  `postgresql_read`, `mysql_read`, `analyze_heap_dump`, `trigger_devtools_livereload`, `start_method_probe`,
+  `enable_agent_sensor`, and `disable_agent_sensor`. The Java agent actions take a switchable sensor id such as
+  `security-sinks`; use them only with the user's approval, and read `get_agent_status` to confirm the result. They
+  require an attached, armed agent and are refused by Java Agent panel read-only policy. Overrides last only for this JVM.
+  Enabling `security-sinks` includes its JDK checks; request-value matching additionally requires
+  `bootui.agent.security-sinks.request-values=true` at startup. These tools never capture or download a heap dump,
   execute an HTTP probe, mutate a database, clear a cache, write GitHub state, restart a dev service, or run an agent
-  command.
+  command. The capture controls and the database reads answer
+  [compactly](#compact-answers-from-scans-and-capture-controls); the matching read tool returns the rows.
+- **Browser only, by design:** HTTP Probe (it sends requests the user composes), Profile resources and its JDK Flight
+  Recorder results in Runtime Insights, enabling Hibernate statistics, the WebSockets capture switch, changing a logger
+  level, and the other panel controls not listed above have no MCP tool or CLI
+  command. An agent should point the user to the panel rather than work around it.
 
 ### Investigate one request
 
-`get_live_activity` says which request was slow or failed; `get_request_profile` says why. The workflow is the same
+`get_live_activity` says which execution was slow or failed; `get_request_profile` opens its retained evidence. The workflow is the same
 through MCP and the CLI:
 
 1. **List activity.** Call `get_live_activity` (`bootui activity --limit 50 --json`) and pick the `REQUEST` entry in
-   question. Only entries with `profileable: true` have a profile, and `sqlNPlusOneSuspected` or an `ERROR` or `SLOW`
+   question (or a scheduled/message execution). Only entries with `profileable: true` have a profile, and `sqlNPlusOneSuspected` or an `ERROR` or `SLOW`
    severity marks the ones worth opening.
 2. **Fetch its profile.** Call `get_request_profile` with that entry's `id` (`bootui request-profile <id> --json`). The
-   profile carries the request, its correlated SQL as normalized statement groups with N+1 flags and the application
-   call sites that issued them, exceptions, security events, REST client calls, cache accesses, a timing breakdown,
-   per-section correlation tiers and truncation counts, and notes. It is the same DTO the REST endpoint returns, masked
-   the same way, including the embedded trace's status messages, exception events, and attribute values
-   ([Trace value exposure](features/diagnostics.md#trace-value-exposure)). An unknown or evicted id returns `available: false` with an `unavailableReason`; that is an answer,
-   not a failure to retry.
-3. **Follow each exception.** Every profile exception carries an `exceptionGroupId`; pass it to
+   `source: "journal"` carries the `journal` profile's timeline, route or execution label, resources and touched
+   metadata. `source: "buffers"` carries the `buffers` HTTP-exchange profile's normalized SQL groups with N+1 flags,
+   application call sites, exceptions, security events, REST client calls, cache accesses, timing, correlation tiers
+   and truncation counts. A child tiered `PROPAGATED` ran in a task the BootUI
+   agent propagated from the request to a JDK executor, as exact as `REQUEST_ID`; `correlationTiers` reports
+   `PROPAGATED` unavailable, with the reason, unless the agent's `executors` sensor propagates for the application. It
+   follows the same panel policy and masking as the browser. When both are retained, `buffers` also accompanies the
+   journal result so its SQL grouping and exception ids remain available. The buffer profile includes a trace whose
+   values follow [Trace value exposure](features/diagnostics.md#trace-value-exposure). An id that neither the runtime
+   journal nor the HTTP-exchange buffer retains is a tool error naming both windows: it was evicted, cleared, or never
+   recorded, so pick a current id rather than retry. `source: "none"` with `available: false` and an
+   `unavailableReason` is kept for what another id cannot fix: the journal is off, the id's panel hides it, or the
+   request carried nothing to correlate. See [Unknown ids and unavailable capabilities](#unknown-ids-and-unavailable-capabilities).
+3. **Follow each exception.** When the `buffers` profile is present, its exceptions carry an `exceptionGroupId`; pass it to
    `get_exception_detail` (`bootui exceptions show <id> --json`) for the stack trace, cause chain, and recent
    occurrences.
 
 The tool belongs to the Live Activity panel, so it is unavailable when that panel is disabled. In the browser,
 **Copy for AI** in the profile drawer and in an Exceptions detail renders the same evidence as one Markdown document,
 previewed with what it omits before anything reaches the clipboard. It sends nothing to any AI provider.
+
+### Runtime Insights for agents
+
+[Runtime Insights](features/overview.md#runtime-insights) answers what this run did that no single panel shows. Its four
+read tools return short, stable facts rather than a dashboard:
+
+| Tool | CLI | Returns |
+| --- | --- | --- |
+| `get_runtime_insights` | `bootui insights list [--query Q] [--limit N]` | The completed HTTP exchanges in `requests`, coverage, the checks that did not fully run, then at most `limit` (8) observations: id, status, one sentence, eligible and affected counts, tier, one exemplar request id, a `verify` line, and `listed`. Past the limit listed rows come first and every kind is listed once before any kind twice, and a limitation names what was left out. Then at most 8 `notExercised` routes. `query` is empty (the default list: what the panel lists by default, which leaves several kinds out, for example time breakdowns, exception hotspots, repeated SELECTs, and garbage collection and heap rows; a limitation names each kind it left out with its count), `all` (every observation), `latency`, `repeated-selects`, `new`, `security`, `diff`, an observation kind such as `proxy-bypass`, or a route, table, bean, or class. Every query but the empty one also matches rows the default list leaves out |
+| `get_runtime_insight` | `bootui insights show <id>` | One observation with every check and at most 20 evidence rows; open its exemplar with `get_request_profile`. A row the default list leaves out says where its evidence is shown first among its limitations |
+| `get_runtime_impact` | `bootui insights impact <id>` | For a route, bean, class, method (`Class#method`, with parameter types such as `Class#method(String)` for one overload), repository, table, cache, host, or event type: the routes that ran through it, those that did not, and those sharing a resource, at most 8 each with their totals and a limitation naming the rest, or `AMBIGUOUS` with candidates. A bare method name, such as `applyDiscount`, resolves through Code Inventory, `AMBIGUOUS` when several classes declare it; parameters that match no overload return `NOT_FOUND` with the real overloads as `candidates`. With the BootUI agent, a method's `observed` routes are those whose requests' own call trees ran it (`observedFrom: ROUTE_TREES`, each with `executedRequests`), and `notObserved` routes ran without showing it, which proves nothing |
+| `get_runtime_run_comparison` | `bootui insights compare [<id>]` | Omitted `id` or `previous` selects this application's newest kept run, including listener-only or idle runs; another application sharing the JVM is never compared. A run id from `runs` selects another. Comparability first, then `codeChanges` (with the BootUI agent: at most 8 changed or added methods, not run yet first, each with its status and the routes that ran it), then `sideEffects` (with the agent: hosts, file patterns, processes, and variable names new, gone, or whose owner was not exercised, per sensor `COMPARED`, `PARTIAL`, or `NOT_COMPARED` with the reason; at most 8), then at most 8 route/execution behavior rows and edges; latency is left out |
+
+**Every answer names the next call.** Each of the four answers carries `next`: at most three follow-up calls, each
+with the `bootui` `command` line, the MCP `tool` and its `arguments`, and `why`. The list names the lead observation's
+evidence (`get_runtime_insight`, call sites included), one request that shows it (`get_request_profile`), the kind a
+`limit` left out, and for an anonymous-access observation the security rules (`get_spring_security`, on Spring) and
+the route's mapping. An `AMBIGUOUS` or `NOT_FOUND` impact names the candidates, `get_beans`, or `get_mappings`. An
+unknown or evicted observation id, and a run id no kept run has, are tool errors instead, whose message names
+`get_runtime_insights` or `previous` and the runs still kept. Only tools the application advertises are named, so Quarkus is never told to call a Spring-only tool;
+a named tool whose panel is disabled is still refused like any other call.
+Calling a tool without its required `id` fails with the message naming where the id comes from, such as `Missing
+required argument: id (an observation id from get_runtime_insights)`. In the panel, the change impact's `next` is
+always empty.
+
+`INSUFFICIENT`, `PARTIAL`, `NOT_APPLICABLE`, `UNAVAILABLE`, and `NOT_COMPARABLE` are not successes, and an empty list
+never means healthy: read `requests`, `checksNotRun`, and `limitations` first. `checksNotRun` also lists a check that
+ran but left evidence out, as `<kind>: EVALUATED, partly: <what it could not see>`, such as changed methods the agent
+could not track; what a check judged and does not report, such as fast calls, is not listed. `requests` counts completed HTTP
+exchanges only. `requests: 0` means not exercised only when the limitations say so: an observation that names a
+request or execution, a limitation naming retained scheduled runs or consumed messages, or evicted events mean work
+ran that `requests` does not count. A run-level observation with no exemplar does not. If comparison's limitations
+say HTTP Exchanges is disabled or unavailable, that comparison's run references retain `requests: 0` as a hidden
+count, not evidence of zero traffic. Source-panel policy also hides disabled sources' counters, fingerprints,
+exception classes, execution names, and edges, with a “not compared because &lt;panel&gt; is disabled” limitation;
+configuration comparability and restart timings are independent facts.
+Run comparison returns `PARTIAL` when admission drops, clear boundaries, aggregate limits, or unknown legacy
+completeness prevent comparing some dimensions: reliable rows remain, but empty rows never prove no change.
+Evidence eviction alone does not invalidate incremental aggregates. After a clear, fresh complete requests and jobs
+remain comparable; a crossing completion cannot supply zero SQL for work the clear discarded. HTTP capture off,
+dropped HTTP completions, and clears also make whole-run unexercised routes unknown, without hiding retained positive
+route evidence. The same status, limits, and decisions appear in browser, MCP, and CLI output.
+
+The `diagnose_runtime_issue` prompt starts
+with `get_runtime_insights`, calls it again with `all` or the route when nothing listed explains the issue, then one
+`get_request_profile`, and for a slow route whose time is in its handler,
+`get_code_paths` when the agent is attached, and it words a dependency reached or request input matched verbatim as a
+check to verify against source and configuration, never as a vulnerability verdict. That includes
+`request-input-in-sink` rows of the opt-in `security-sinks` sensor (`get_side_effects` with `query=security-sinks`),
+such as "request input reached this SQL text unchanged": the prompt asks the agent to check that the value is bound,
+escaped, or chosen from a fixed list. Its JDK rows are checks too: verify deserialization's input origin and
+`ObjectInputFilter`, an algorithm's security or non-security purpose, and certificate-chain and hostname validation;
+an application trust-manager class alone is not a trust-all verdict. Read each group's coverage and disabled reason.
+`assess_application` marks unrecorded checks unavailable, never clean, and suggests listing `security-sinks` in
+`bootui.agent.sensors` for these JDK checks. Request-input matching separately requires
+`bootui.agent.security-sinks.request-values=true`; the agent suggests it rather than setting it
+([the security-sinks sensor](features/java-agent.md#the-security-sinks-sensor)). The
+`verify_after_change` prompt starts with `get_code_inventory` and `changed` (see [Did my change run?](#did-my-change-run)),
+names `start_method_probe` as the next step when the edited method still did not run after the test that should reach
+it, calls `get_runtime_impact` on each changed method it names (`Class#method`), or on the changed symbol when it is
+known, runs the tests, calls
+`get_runtime_insights` with `query=repeated-selects`, then `get_runtime_run_comparison` with `previous`, and stops.
+
+**Change, then verify.** An agent editing code uses the four tools as one loop:
+
+1. Before editing `OrderService`, `bootui insights impact OrderService --json` lists the routes this run exercised
+   through it, the mapped routes it reaches that no request did, and the routes sharing its tables. Those are what the
+   tests must reach. With the BootUI agent, `bootui insights impact 'OrderService#total' --json` narrows that to the
+   routes whose requests ran the method itself; a route under `notObserved` ran without showing it, which is not proof
+   it never does.
+2. After the edit and a DevTools restart or Quarkus live reload, run the tests, then
+   `bootui insights list --query repeated-selects --json`. The default list leaves repeated SELECTs out, so that
+   query shows whether a repeat is gone; a statement repeated after the handler
+   returned is reported by `lazy-sql-after-handler` instead, with its cause. Absence is evidence only when the
+   route it named ran again: check `requests` and `notExercised`.
+3. Then `bootui insights compare --json` (or `compare previous`), and stop. With the BootUI agent, its `codeChanges`
+   come first: the methods changed since the previous run, which ran, and on which routes; its `sideEffects` then name
+   a new host, file, process, or variable a route uses, only for sensors marked `COMPARED`. Omitted `id` or `previous`
+   selects the newest kept run, including listener-only and idle runs. A new statement fingerprint or a higher statement count
+   per request on a route is a behavior change the agent caused; `INSUFFICIENT` means the tests did not reach the
+   route 3 times in both runs, not that nothing changed. Do not edit from a latency row.
+
+**Analyze after tests.** Tests are where realistic traffic comes from: run the application's integration or browser
+tests against the running application, then `bootui insights list --json`. In the browser, **Copy for AI** on an
+observation renders the same evidence as one Markdown document, previewed before anything reaches the clipboard.
+
+### Did my change run?
+
+With the [BootUI agent](features/java-agent.md) attached, [Code Inventory](features/java-agent.md#code-inventory)
+answers the question an agent most needs after an edit: did the method it changed execute, and on which route?
+
+| Tool | CLI | Returns |
+| --- | --- | --- |
+| `get_code_inventory` | `bootui code inventory [--query Q] [--limit N]` | The summary first (this run, N of M tracked methods executed, changed, added, and removed counts, dependency counts, limitations), then at most `limit` (25) rows of `query`: `changed` (the default; the methods changed or added since the previous DevTools restart or Quarkus live reload, not executed first, each with its status and the first request id and route that ran it), `never-executed`, `not-tracked`, `executed`, `dependencies` (declared jars not loaded in this run first), or a package, class, or method name (`applyDiscount`, `OrderService#applyDiscount`) |
+
+The tool is advertised only while the agent's inventory sensor records this run, like every tool of an unavailable
+panel; read `get_agent_status` once to learn whether it can be, and why not. `summary.available: false`, from a run
+that stopped recording since, carries the reason too. `NEVER_EXECUTED` on a changed method means the change has not run yet:
+run the test or send the request that reaches it, then call the tool again before reading any latency. `NOT_TRACKED`
+is not evidence either way, and a jar `NOT_LOADED` in this run is not proof it is unused. Runtime Insights reports the
+same gap as `changed-code-not-executed`.
+
+**Verify, then probe.** When a changed method is still `NEVER_EXECUTED` after the test or request that should reach
+it, the next step is a [method probe](#did-this-method-run-and-how): with the user's separate approval, start one on the
+method as Code Inventory names it, poll `get_method_probe` until the probe is `active` (it starts `starting`, and the
+method is retransformed afterwards), rerun the same test or request before its `endsAt`, then read `get_method_probe`
+again. `invocations` at 0 is evidence that path never reaches the method (the wrong route, the wrong bean, or never
+wired) only when the probe was active before the rerun and is still active after it, or the rerun finished before its
+`endsAt` and it did not end early; a probe that never became active, failed, or ended before the rerun finished is
+inconclusive; `get_code_paths` on the
+route shows what it did run. The `verify_after_change` prompt and the [agent skill](#install-the-bootui-agent-skill)
+follow this workflow. [Set up the Java agent](setup/java-agent.md) walks through it from a fresh application.
+
+### Before relying on the BootUI agent
+
+The server's instructions tell an agent to call `get_agent_status` once before relying on any tool or observation that
+needs the BootUI agent, so it learns up front whether Code Paths, Code Inventory, Side Effects, and method probes can
+answer, rather than one refused or unadvertised tool at a time. An observation `NOT_APPLICABLE` because it requires the
+BootUI agent (or one of its sensors) was **not measured**: it is never healthy, never "nothing to worry about", and
+never a passed check. `ARMED` means the claim was accepted, not that every asynchronous sensor self-test passed.
+Inspect the sensor states and reasons. After executor snapshot overflow, a reused task can have run under another
+submitter's request context: the tool description and Java Agent panel warn about this, and disabling a sensor does not
+reset its cumulative overflow or never-applied counters.
+
+### Where does the handler's time go?
+
+With the [BootUI agent](features/java-agent.md) attached, [Code Paths](features/java-agent.md#code-paths) names the
+application methods a route spends its time in, from the agent's `code-paths` sensor.
+
+| Tool | CLI | Returns |
+| --- | --- | --- |
+| `get_code_paths` | `bootui code paths [--query Q] [--limit N]` | At most `limit` (10) routes matching `query` (blank for every route; else a route, or part of a route or of a method its requests ran, a route's first request included), slowest warm median first, each with its warm requests, median and 95th percentile, `assemblyOnly`, and top methods by self time per request; for a single route, its method nodes with the most self time, each with `calls`: the SQL, REST client, cache, and AI calls it issued per request, by kind; then the excluded methods and limitations |
+
+Like `get_code_inventory`, it is advertised only while the sensor records this run. Times are per warm request, each
+route's first recorded request kept apart. A node's `calls` are the recorded calls stamped with it: it was the innermost
+instrumented method open on their thread when they ran. Their time is part of the node's self time. A statement
+Hibernate flushes at commit runs after the `@Transactional` method returned, in the transaction interceptor around it,
+so it shows under the method that called the `@Transactional` one. A call issued while no instrumented method was open,
+as in a filter or while the response is written, and a call recorded on another thread than the one that issued it,
+such as a streaming AI call, show under no node, and the limitations count each apart. `route-time-breakdown` splits
+only the handler's other work by each method's own time, its self time minus its stamped calls, and not at all when
+calls without a stamp take a tenth of the handler or none is stamped; `repeated-selects` names the method that issued
+a repeated statement, past an application repository or DAO method to the method that called it. An `assemblyOnly` route's handler ran on an event loop, returned a reactive or asynchronous
+result, or BootUI could not tell where its work ran, so its tree times assembly, not the work. Node percentiles are
+approximate (≈), interpolated within log2 buckets. The `diagnose_runtime_issue` prompt calls it for a slow route whose time is in its handler.
+
+### Did this method run, and how?
+
+A [method probe](features/java-agent.md#method-probes) records one application method's next invocations: metadata
+only, in every exposure mode. A probe the user started in the Code Paths panel with argument and return shapes
+says so (`recordShapes`), but `get_method_probe` never returns those shapes, in any exposure mode: its
+`shapesHiddenReason` says they are shown in the panel only.
+
+| Tool | CLI | Returns |
+| --- | --- | --- |
+| `start_method_probe` | `bootui probe start <method>` | An action: starts a probe on `id`, the method as `binary.Class#name`, with its JVM descriptor for an overloaded one (`com.example.PriceService#quote(I)J`), as Code Paths and Code Inventory name it. Returns the probe, `starting`. A method that cannot be probed is a client error (REST/CLI 400); an unavailable or busy probe service is 409. Disabled/read-only panel policy refuses the action before it runs (REST/CLI 403, CLI exit 2); MCP reports refusals in-band with `isError: true`, not an HTTP status in the result. Without the agent, the tool is normally not advertised |
+| `get_method_probe` | `bootui probe show <id>` | The probe `id`: its state (`starting`, `active`, `ending`, `ended`, `failed`), `endReason` or `failure`, `waitingForClass`, `async`, and each recorded invocation's duration, thread kind, request id, outcome or exception type, and calling frame |
+
+A probe records at most 20 invocations, for at most 60 seconds, five at once, and ends with the run; the agent enforces
+those bounds where the method runs and then removes its instrumentation. It never records an argument or a return value.
+**Ask the user before starting one**, as for `memory_scan` or `pentest_scan`: it changes the running application's code
+for its window, even though read-only policy refuses it. The loop it serves: start a probe on the method an edit
+changed, poll `get_method_probe` until it is `active`, run the test or send the request that should reach it before the
+probe's `endsAt` (60 seconds from activation; prefer the request to a slow test run), then read `get_method_probe`
+again. `invocations` at 0 is evidence the path never reaches the method (the wrong route, the wrong bean, never wired)
+only when the probe was active before the code ran and is still active after it, or the code finished before its
+`endsAt` and it did not end early: `start_method_probe` returns `starting` and the agent retransforms the method
+afterwards, so a fast rerun can finish before the probe records anything, and a slow one can outlast its window, which
+then ends during the rerun. A probe that never became active, failed, or ended before the rerun finished is
+inconclusive, and `dropped` above 0 counts invocations it could not record. A probe
+`waitingForClass` has not seen this run load its class yet; an `async` method's durations time the assembly of its
+reactive or asynchronous result, not the work that runs later.
+
+### What side effects did the application start?
+
+With the [BootUI agent](features/java-agent.md) attached, [Side Effects](features/java-agent.md#side-effects) lists the
+side-effect sensors and, in this version, the processes application code starts from the agent's `processes` sensor,
+its network from the `network` sensor: hosts and ports it connects to, datagrams it sends, and names the JVM resolves,
+each with the recognized client and whether any panel captured the work, the files it opens, deletes, moves,
+and copies from the `files` sensor, and, opt-in, the environment variables and system properties it reads from the
+`environment` sensor, the blocking calls started on an event loop from the `blocking` sensor, and, opt-in, the threads it starts and
+the executors it creates from the `thread-activity` sensor, with those a request left running when it ended
+(`leftRunning`) and how many a request starts (`count` / `requests`), and, opt-in, the thread locals a request or a job
+left set on its pooled thread from the `thread-locals` sensor, named by the static field holding them, never their
+values, and, by default, the sockets, and with `files` the file streams, from the `resources` sensor: those the collector reclaimed without
+`close()` (`failed`, the leak), and those still open after their request (`leftRunning`) or closed after it
+(`completed`), a pool's or a cache's hand-off. Ask with `query` `not captured` for the outbound calls no panel shows (an SDK's own socket, say).
+
+| Tool | CLI | Returns |
+| --- | --- | --- |
+| `get_side_effects` | `bootui side-effects [--query Q] [--limit N]` | Every sensor's coverage, then at most `limit` (20) rows matching `query`: a sensor id such as `processes`, `network`, `files`, `blocking`, `thread-activity`, `thread-locals`, or `resources`, `not captured`, part of a route, target, client, or call site, or a request id among a row's exemplars, most frequent first; process rows name only the sanitized command name (cut at whitespace or `=`, basename-only, non-safe characters as `?`); network rows a host and port or a looked-up name, the client, and `capture` (`captured` with `capturedBy`, `not-captured`, `infrastructure`), never a byte; file rows a path pattern with its kind, location, and origin, never contents; environment rows a name, never a value; blocking rows the operation (`sleep`, `wait`, `park`, `network`, `file`) and the event loop's thread family, with how long it blocked; each with counts, failures, exits or connections, durations, call site, bean method stamp, and up to three request ids |
+
+Like `get_code_paths`, it is advertised only while the agent is armed for this run. Rows are per run and bounded by
+the agent evidence contract. When HTTP Exchanges is disabled, route rows merge under
+`(route hidden: HTTP Exchanges is disabled)` and expose no request ids. When Code Paths is disabled, rows lose their
+inside bean method. A disabled Side Effects panel shows no rows. Sensor groups this version does not ship are listed as
+`not-available` with reason `Not available in this version.` Every Side Effects sensor in the current catalog ships;
+an older attached agent can still lack one. `blocking` is
+`not-applicable` on Spring MVC until a WebClient's event loop is registered.
 
 ### MySQL operational evidence
 
@@ -396,11 +659,14 @@ Always verify each finding against source and effective configuration before edi
 
 These reads never rerun checks, import classes, query the database, or start a scan. A missing or replaced snapshot
 returns a known client failure (REST 409): **reread the cached report, not the scan tool**, then restart paging that
-report's scan ID. An unknown/non-finding rule returns REST 404. MCP exposes these as in-band `isError: true` failures
-with actionable messages, not internal errors. The CLI facade retains its existing tool-error mapping: unknown
+report's scan ID. A rule id outside the advisor's rule catalogue (a typo, a retired rule, or another advisor's rule)
+answers `Unknown advisor rule: ...`. A catalogue rule without a retained finding, whether it passed, was skipped, or
+failed (the report's `results` lists only violating rules, and its `analysisErrors` the failed ones), answers `Advisor rule has no findings
+in the current scan.`; both are REST 404. MCP exposes these as in-band `isError: true` failures whose text
+is that message, with no status code, not internal errors. The CLI facade retains its existing tool-error mapping: unknown
 rules are HTTP 400 (HTTP 404 is reserved for an unadvertised tool), and stale snapshots remain HTTP 409.
 
-MCP still refuses an oversized rendered response with JSON-RPC `-32003`. Retry the **same scan ID and offset**
+MCP still refuses an oversized rendered response with JSON-RPC `-32003` (legacy) or `-31003` (modern). Retry the **same scan ID and offset**
 with a smaller `limit`; a byte-budget refusal is neither an empty page nor proof of completion. Do not advance
 the offset on any error. Keep pages bounded and stop rather than looping if even one detail exceeds the byte budget.
 
@@ -448,8 +714,9 @@ Dismissals remove penalties, not coverage gaps; optional EPSS availability does 
 See [Score eligibility](features/advisors.md#score-eligibility). Existing MCP/CLI commands return the additive facts;
 no new tool or backend numeric scorer is introduced.
 
-Advisor scores and the Overall score are calculated in the browser, not by a separate MCP/CLI scorer. Overview averages
-eligible visible advisor scores and GitHub's eligible security-alert score; missing signals never supply a fake 100.
+Advisor scores and the Overall score are calculated in the browser, not by a separate MCP/CLI scorer. The Scorecard
+averages eligible visible advisor scores and GitHub's eligible security-alert score; missing signals never supply a fake
+100.
 `get_overview` (`bootui overview`) returns application context, not that aggregate. CLI transport success and JSON output
 must not be interpreted as a passing assessment.
 
@@ -463,7 +730,11 @@ them:
 | `offset` | Where this page starts within the matched items |
 | `limit` | The page size actually used, capped by `bootui.mcp.max-results` (`bootui.cli.max-results` from the CLI) |
 | `returned` | How many rows this response carries |
-| `hasMore` | Whether matched items remain past this page — raise `offset` to walk them |
+| `hasMore` | Whether matched items remain past this page: narrow the `query`, or raise `limit` up to the server's maximum |
+
+List and search tools take no `offset`; only the advisor violation reads page with one (see
+[Reading retained advisor violations](#reading-retained-advisor-violations)). The `offset` in the envelope is where the
+page starts, `0` for these tools.
 
 The distinction that matters is `total` versus `matched`. A large `total` beside `matched: 0` does **not** mean the
 data is missing; it means the query matched none of it. Retry with a shorter query before concluding a property,
@@ -474,6 +745,123 @@ bean, or mapping does not exist.
 property source enumerates under that literal name. Values are matched literally, and each row still reports the exact
 name and source its property source published. See the [Configuration panel](features/configuration.md#configuration)
 for the panel-side behavior.
+
+### Unknown ids and unavailable capabilities
+
+Every tool that takes an `id` follows one convention, on Spring MVC, WebFlux, and Quarkus alike:
+
+- **An unknown or expired id the caller supplied is a tool error.** MCP answers `isError: true` with a message naming
+  the id and where current ids come from; the CLI exits `1` with that message. This covers `get_exception_detail`,
+  `get_request_profile`, `get_runtime_insight`, `get_runtime_run_comparison` (a run id no kept run has),
+  `get_method_probe`, and the advisor `get_*_rule_violations` reads (an unknown rule or a stale `scanId`). Retrying the
+  same id cannot help; read the listing tool again.
+- **`available: false` with an `unavailableReason` means the capability is absent**, not that the id is wrong: the
+  panel's data source is off (the runtime journal, Runtime Insights), a dependency is missing, or DevTools LiveReload
+  is not running (`trigger_devtools_livereload`). The tool ran and that is its answer; the CLI exits `0`.
+- `get_runtime_impact` and `start_method_probe` take a code symbol rather than an id BootUI issued. An impact that
+  resolves to nothing answers `status: "NOT_FOUND"` (or `AMBIGUOUS`) with candidates and the calls that resolve it;
+  a probe on a method the agent cannot instrument is refused as an action.
+- A `query` is a search, not an id. A query that matches nothing, on `get_code_paths` or any other searchable tool,
+  answers `matched: 0` (with a limitation naming the call that lists everything, on `get_code_paths`), never a tool
+  error; `get_code_paths` answers `available: false` only when its agent evidence is absent.
+
+A panel that is disabled refuses its tools before they run (CLI exit `2`); a tool this application does not advertise
+answers with why its panel is unavailable.
+
+### Agent-sized defaults
+
+An agent pays for every byte it reads, so the reads below answer with a short first page when the call gives no
+`limit`, and keep the full payload for the browser. Most accept `query`; HTTP Exchanges accepts only `limit`.
+They carry the `page` envelope above (Live Activity uses `pageInfo`):
+`hasMore: true` means rows were left out, so narrow the query or raise `limit` (still capped by `max-results`).
+
+| Tool (command) | Default | `query` matches |
+| --- | --- | --- |
+| `get_sql_traces` (`bootui sql traces`) | 20 newest statements | SQL text, category, call site, error, request, trace, or execution id |
+| `get_rest_client_traces` (`bootui rest-client traces`) | 20 newest calls | Method, URI, host, path, status, client type, call site, error, request, trace, or execution id |
+| `get_startup_timeline` (`bootui startup`) | 25 slowest steps; a parent includes its children | Step name or tag value, such as a bean name |
+| `get_log_tail` (`bootui logs tail`) | 50 newest lines | Level, logger, thread, or message |
+| `get_copilot_sessions`, `get_claude_code_sessions` | 10 sessions; the first read after startup parses the newest session files and can take seconds on a large session directory | Id, model, working directory, status, or last activity |
+| `get_vulnerabilities_report` (`bootui vulnerabilities report`) | 10 dependencies, vulnerable first, each with at most 5 advisories without details | Coordinates, severity, or an advisory id or alias; an exact `group:artifact` lists all its advisories, an exact advisory id or alias returns it whole |
+| `get_live_activity` (`bootui activity`) | 25 newest entries | An entry type (`SQL`, `EXCEPTION`, ...), a severity (`SLOW`, `WARN`, `ERROR`), or text such as a route |
+| `get_config`, `get_beans`, `get_metrics`, `get_conditions`, `get_threads` | 25 rows | As before; `get_conditions` pages positive then negative matches and also narrows `unconditionalClasses` and `exclusions` |
+| `get_http_exchanges` (`bootui http exchanges`) | 25 newest exchanges | No `query` argument; raise `limit` within the server cap |
+
+Totals such as the vulnerabilities report's `total` and `vulnerable` still count the whole report. Live Activity keeps
+its own shape: `typeCounts` counts every retained entry by type, and `pageInfo.hasMore` says whether more entries
+matched. A filtered read searches the newest entries the feed returns (up to 5,000 from the runtime journal, or
+`bootui.activity.max-entries` from Spring's panel buffers); when older retained entries were not searched, `hasMore` is
+true and a warning names the window, so no match there does not mean the route never ran. `get_config` leaves
+out `propertySuggestions`, the browser's completion list of every known property. `get_agent_status` and
+`get_side_effects` summarize each sensor (state, reason, counters, runtime switch) without its hooks; `get_agent_status`
+lists every matching sensor and takes no `limit`, ignoring one sent by an older CLI. Side Effects
+lists the fixed limitations of a sensor's rows only for sensors with listed rows; query a sensor id, such as
+`executors`, for its hooks (and, from agent status, its self-test steps). A 1.x CLI, which knows these commands without the newer
+options, keeps working for commands it already provides and gets the same first page. New Java-agent commands require
+a CLI version that includes them; an old binary does not gain commands just because the running server advertises them.
+
+### Compact answers from scans and capture controls
+
+An active scan and a capture control change state; the agent then reads what it needs. So they answer with a compact
+summary or acknowledgement, and the browser's endpoints keep returning the full panel report.
+
+Every active scan (`architecture_scan`, `spring_scan`, `hibernate_scan`, `memory_scan`, `security_scan`,
+`rest_api_scan`, `database_advisor_scan`, `pentest_scan`, `graalvm_scan`, `crac_scan`, `vulnerabilities_scan`)
+answers with the same summary:
+
+| Field | Meaning |
+| --- | --- |
+| `reportTool` | The tool that reads the cached report this scan produced, without scanning again |
+| `detailsTool` | The tool that pages a rule's retained violations; `null` for an advisor without one |
+| `scan`, `evidence` | The scan status and the advisor's coverage, as the report carries them |
+| `findingsFound`, `severityCounts` | The report's whole counts; dismissed findings are excluded |
+| `topFindings` | At most 10 rows, most severe first, then most frequent: `id`, `title`, `severity`, `count`. A row is a rule or a check, and `count` its violations or findings |
+| `moreFindings` | The rows left out of `topFindings`; `0` means every rule or check with a finding is listed |
+| `violationDetails` | The rule advisors' `scanId` and retention, for [paging violations](#reading-retained-advisor-violations) |
+
+A vulnerability row is a vulnerable dependency: `id` is its coordinates, `title` its most severe advisory, and `count`
+its advisory count. So for `vulnerabilities_scan`, `findingsFound` counts vulnerable dependencies while
+`severityCounts` counts advisories, as the Vulnerabilities report does. The summary adds the inventory's
+`dependencies`, `scanningEnabled`, and `coverage`.
+`postgresql_read` and `mysql_read` grade nothing, so they answer with the read's `status`, `message`, `readAt`,
+`truncated`, and each database's status and sections (`id`, `status`, `reason`, `rowCount`, `truncated`); read the
+rows with `get_postgresql_report` or `get_mysql_report`.
+
+The capture controls — `pause_*`, `resume_*` and `clear_*` for SQL Trace, Transactions, and REST Client Trace, plus
+`clear_exceptions` and `clear_traces` — all answer with one acknowledgement:
+
+```json
+{"action":"paused","available":true,"unavailableReason":null,"capturing":false,"retained":200,"capacity":200,"totalCaptured":872}
+```
+
+`action` is `paused`, `resumed`, or `cleared`; `capturing` is the recording state after it; `retained` counts the
+entries still held (exception groups for Exceptions), `0` after a clear; `capacity` is the panel's retention limit.
+
+A clear empties the retained window and nothing else. These counters keep their meaning across a clear, in the
+browser, the MCP tools, and the CLI alike:
+
+| Counter | Panels | Counts | After a clear |
+| --- | --- | --- | --- |
+| `totalCaptured` | SQL Trace, Transactions, REST Client Trace | Entries recorded since startup, shown as "captured since startup" | Kept: it is a lifetime count |
+| `stats.evicted`, and `retention.evicted` on SQL Trace and REST Client Trace | SQL Trace, Transactions, REST Client Trace | Entries dropped since startup because the buffer was full | Kept |
+| `stats`, `entries`, `topStatements`, `topCalls` | SQL Trace, Transactions, REST Client Trace | The retained window | Reset |
+| `totalExceptions`, `groups` | Exceptions | Occurrences in the retained groups | Reset |
+| `retained`, `traces` | Traces | The retained traces | Reset |
+
+Exceptions and Traces keep no lifetime count, so their acknowledgement's `totalCaptured` is `null`.
+
+Every tool response, report tools included, obeys `bootui.mcp.max-response-bytes` (4 MiB by default). A response that
+does not fit is refused with a bounded JSON-RPC `-32003` (legacy) or `-31003` (modern) rather than truncated, so the agent never mistakes a cut report for a
+complete one. If even that fallback with the original correlation id cannot fit, BootUI refuses before dispatch with
+HTTP `413` and an empty body: no tool runs and no progress stream opens. Use a shorter correlation id, or review the
+configured response budget; retrying with a smaller result limit cannot fix an id that itself exceeds the budget.
+This is an implementation resource limit, not a requirement imposed by MCP. Ordinary legacy responses and modern
+result decoration are unchanged. Report tools stay well below it: a rule advisor's report keeps at most 10 (or 20) sample violations per
+rule and pages the rest with its `get_*_rule_violations` tool; `get_vulnerabilities_report` lists `limit` dependencies,
+each with at most 5 advisories (active and most severe first) without their OSV `details` and with at most 3
+references and symbols, so `limit` bounds the whole answer; its `advisories` object counts what was left out, an exact
+`group:artifact` query lists all of one dependency's advisories, and an exact advisory id or alias returns that
+advisory whole. The PostgreSQL and MySQL reports cap each section's rows and flag the cut with `truncated`.
 
 ### Safety model
 
@@ -492,7 +880,120 @@ The MCP server inherits BootUI's full safety posture, so handing it to an agent 
   `bootui.mcp.*`; capacity, timeout, and response-limit failures are explicit rather than silently truncated.
 
 See [Properties](PROPERTIES.md) for the `bootui.mcp.*` settings and [Features](features/developer-tools.md#mcp-server) for the full MCP Server panel
-description.
+description. `get_agent_status` is read-only and reports only the local BootUI Java agent state, setup snippets, and
+claim metadata.
+
+
+## Protocol eras
+
+BootUI selects the era of each `POST /bootui/api/mcp` from the request itself, as MCP 2026-07-28's backward
+compatibility rules describe. Protocol fields belong in `params._meta`, not at the JSON-RPC envelope's top level:
+
+- **Legacy (MCP 2025-06-18).** A request without `_meta["io.modelcontextprotocol/protocolVersion"]`, and every
+  `initialize`, is served as in BootUI 1.x: `initialize`, `ping`, the same result shapes, and error codes `-32000`
+  (disabled), `-32001` (at capacity), `-32002` (timeout), and `-32003` (response too large). An `MCP-Protocol-Version`
+  header with any value other than `2025-06-18` or `2026-07-28`, or sent more than once, is refused with `400` and
+  `-32600`; `2026-07-28` without the modern `_meta` is a malformed modern request (`400`, `-32602`, echoing the request
+  id; BootUI 1.x answered `-32600` with a `null` id). For `initialize`, only an absent header or `2025-06-18` is
+  accepted; a `2026-07-28` header is refused with `400`, `-32600`, even if `_meta` is present. The envelope fields
+  `jsonrpc`, `method`, and `params.name` count
+  only when they are strings, so a `null` or numeric `method` is `Missing 'method'` and a `null` tool name is `Missing
+  tool name` on every stack. `MCP-Protocol-Version` is judged after the body is read, so an oversized, unparseable, or
+  batch body reports that problem first.
+- **Modern (MCP 2026-07-28).** A request whose `_meta` names a protocol version is validated in this order, each failure
+  being `400`: first, for any request BootUI 1.x never saw (its `_meta` names a version other than `2025-06-18`, or
+  one that is not a string, or its only `MCP-Protocol-Version` header is `2026-07-28`), the `id` must be a string or an
+  integer (`-32600`, with a `null` id echoed), so `null`, fractional, and other ids are refused, and a request method
+  sent without an id is refused rather than run as a notification (only a `notifications/` method may omit it); the version must be a string (`-32602`);
+  `MCP-Protocol-Version` must be sent once and equal it
+  (`-32020`); an unsupported version answers `-32022` with `data.supported` (`["2026-07-28", "2025-06-18"]`) and
+  `data.requested`; `io.modelcontextprotocol/clientCapabilities` must be an object (`-32602`); `Mcp-Method` must be sent
+  once and equal the method (`-32020`); for `tools/call` and `prompts/get`, `Mcp-Name` must be sent once and equal
+  `params.name`, after decoding the `=?base64?…?=` form (`-32020`); a `progressToken` must be an integer or a string of at most 128 characters
+  (`-32602`). A request whose `_meta` names `2025-06-18` is served as legacy.
+- **Legacy tokens are never refused.** A legacy request is never rejected or altered because of its
+  `_meta.progressToken`: an integer, or a string of at most 128 characters, can start a progress stream (below), and
+  any other value is ignored.
+- **Modern results.** Every result carries `resultType: "complete"` and `_meta["io.modelcontextprotocol/serverInfo"]`.
+  `server/discover`, `tools/list`, and `prompts/list` also carry `ttlMs: 60000` and `cacheScope: "private"`; tools stay
+  in catalog order. Modern clients have no `initialize` or `ping`; an unknown method answers `404` with `-32601`.
+  BootUI's own server errors move out of the JSON-RPC reserved range for modern clients: `-31000` (disabled), `-31001`
+  (at capacity), `-31002` (timeout), and `-31003` (response too large), with the same messages.
+- **Unchanged in both eras.** Loopback, Host, cross-site write, token, panel enable and read-only, masking,
+  payload/response limits, concurrency, and `bootui.mcp.execution-timeout` apply exactly the same way. Notifications
+  answer `202`.
+- **Progress on a request-scoped stream (both eras).** A `tools/call` with `_meta.progressToken` (a string or an
+  integer), to a tool that reports measured phases (`architecture_scan` and `vulnerabilities_scan`), from a client whose `Accept` lists
+  `text/event-stream` explicitly, answers `200` with `Content-Type: text/event-stream` and `X-Accel-Buffering: no`.
+  The stream carries `data:` events, each one JSON-RPC message: `notifications/progress` with the request's token, a
+  strictly increasing `progress`, the `total` when known, and a fixed phase `message`, then exactly one final
+  response, after which the stream closes. There are no event ids, and `:` comment lines every 2 seconds keep the
+  connection open. Notifications are rate-limited: a burst of 8, then one every 250 ms, coalescing to the newest. Every
+  event's UTF-8 JSON payload obeys `bootui.mcp.max-response-bytes` (SSE framing and heartbeats are excluded): a notification that would not fit is dropped (counted as `progressDropped`
+  in the `GET /bootui/api/mcp-server` status and shown in the MCP Server panel), and a final response that
+  would not fit is replaced by the byte-bounded response-too-large error. Before dispatch, BootUI ensures that this
+  fallback fits with the original id; otherwise the HTTP transport answers bodyless `413`, never a forged `id: null`
+  or a notification-shaped `202`. Budget refusals, including this admission refusal, count once as
+  `responseLimitRefusals`. A string `progressToken` longer than 128 characters is
+  refused on a modern request and ignored on a legacy one, which then answers with one JSON response. Any
+  other call, apart from an unanswerable byte-budget transport refusal, stays a single JSON response, including other
+  refusals and a call without a token; ordinary legacy replies keep BootUI 1.x's bytes.
+  A legacy stream's final response is a legacy one: no `resultType` or `_meta`, and the
+  `-32000`…`-32003` codes.
+- **Cancellation by closing the stream (modern).** Closing the response stream cancels the call, as MCP 2026-07-28 requires:
+  BootUI writes nothing more, interrupts the tool, which stops at its next step and keeps its previous report, and frees
+  the concurrency slot once the tool has returned and the stream is written. WebFlux and Quarkus notice the disconnect
+  at once; Spring MVC notices it when a write fails, within two keep-alive intervals (about 4 seconds).
+  `bootui.mcp.execution-timeout` stays the absolute bound, whatever progress flows: a timed-out stream ends with the
+  timeout error as its final response, even when the call timed out before its stream opened. Events are always one
+  line of compact JSON, whatever the application's Jackson configuration (an indenting mapper included). Only a
+  streamed call is cancelled by a disconnect: a single JSON response has no stream to close, so a blocking call runs to
+  its end, its timeout, or a legacy `notifications/cancelled` (below). A client that goes away before its stream starts is a cancellation too, not a timeout. The
+  `GET /bootui/api/mcp-server` status reports `supportedProtocolVersions` and counts `cancellations` apart from
+  `timeouts`; `callCount` includes cancelled calls. A server fault while writing a stream is reported as a fault, not
+  counted as a cancellation.
+- **A client that stops reading.** The writer then blocks and keeps the call's concurrency slot, so
+  `bootui.mcp.max-concurrent-calls` also bounds stalled streams; on WebFlux it waits for the subscriber's demand
+  instead of buffering. On every stack it gives up 10 seconds after the execution timeout: Spring MVC's async request
+  times out, WebFlux stops waiting for demand, and Quarkus resets the response, which frees the slot.
+- **Cancellation by `notifications/cancelled` (legacy).** MCP 2025-06-18 cancels differently: "Disconnection SHOULD NOT
+  be interpreted as the client cancelling its request. To cancel, the client SHOULD explicitly send an MCP
+  `CancelledNotification`." So closing a legacy stream only stops BootUI writing to it; the tool runs on, still bounded
+  by `bootui.mcp.execution-timeout`, and keeps its concurrency slot until it returns. A client that leaves before its
+  stream even starts releases the call at once: nothing has begun, and there is nowhere left to answer. A `notifications/cancelled`
+  notification whose `params.requestId` names an in-flight legacy `tools/call` is answered `202` and cancels it.
+  Numeric ids match by value: an integer exactly, and a fractional id by its double value, so `7.0`, or an id within
+  double rounding of `7`, finds `7`. A fractional id whose double value is not whole, is zero, or reaches 2^53 (`7.5`,
+  `1e-400`, `1e400`) is never matched, so its call cannot be cancelled. A cancelled **stream ends with no
+  response**: the cancellation rule ("Not send a response for the cancelled request") takes precedence over the
+  transport's one-response-per-stream rule. A cancelled **blocking call answers `-32800`**, because its HTTP request
+  still needs an answer, which the client ignores ("The sender of the cancellation notification SHOULD ignore any
+  response to the request that arrives afterward"). Unknown, finished, ambiguous, or malformed cancellations are
+  ignored, still with `202`, and `initialize` is never cancelled; the `reason` is only logged, at debug level,
+  sanitized and truncated. MCP 2025-06-18 over HTTP has no sessions, so any local caller that passes BootUI's checks
+  (loopback, Host, cross-site write, token) and knows a request id can cancel that request, and BootUI tracks at most
+  one entry per concurrency slot. Because clients number their ids from 0 per connection, this can also happen by
+  accident: a late `notifications/cancelled` from one client for id 5, sent after its own call 5 finished, cancels
+  another client's call 5 if one is in flight, whose stream then ends with no response. Two calls in flight with the
+  same id are never cancelled. BootUI accepts this rather than add an `Mcp-Session-Id`, which would change MCP
+  2025-06-18's bytes ([known limitations](KNOWN-LIMITATIONS.md#mcp)).
+
+### Client compatibility
+
+Clients that speak only the legacy era keep working as before; those that send a `progressToken` get progress in either
+era.
+
+| Client | Version checked | Date | Era it uses with BootUI | Progress from BootUI | How it was checked |
+| ------ | --------------- | ---- | ----------------------- | -------------------- | ------------------ |
+| GitHub Copilot CLI | 1.0.93-1 | 2026-10-08 | Modern: sends `server/discover` (2026-07-28) and `initialize` together, keeps 2026-07-28 when discovery answers within about a second, and falls back to legacy otherwise | Yes, in both eras: it sends an integer `progressToken` on `tools/call`, and showed 11 `architecture_scan` progress events as tool progress | Run against the Spring sample app; its log and a logging proxy recorded the exchange, including the legacy fallback |
+| GitHub Copilot CLI | 1.0.92 | 2026-10-07 | Legacy: its MCP client's latest version was `2025-11-25` | Not checked | Read from the installed bundle |
+| Claude Code | 2.1.154 | 2026-10-08 | Legacy: `initialize` asking for `2025-11-25`, then `2025-06-18` | Not verified: no tool call could run without a signed-in account, so whether it sends a `progressToken` is unknown | Recorded on the wire against a local recorder |
+| VS Code (GitHub Copilot) | 1.141.0 | 2026-10-07 | Legacy: its MCP client's latest version is `2025-11-25` | Not verified | Read from the installed bundle; not observed on the wire |
+| Cursor | Not installed | — | Not verified | Not verified | Not checked locally |
+
+Cancellation from a real client was not observed: none of these runs cancelled a call. Anthropic states that MCP
+2026-07-28 support is
+[rolling out across Claude products](https://claude.com/resources/articles/bringing-mcp-2026-07-28-to-claude).
 
 ## Assess an application and approve an action plan
 
@@ -504,8 +1005,13 @@ When you do not know which panel to investigate first, ask your coding agent for
 The BootUI skill — installed [on its own](#install-the-bootui-agent-skill) or through the
 [Claude Code plugin](#install-the-bootui-claude-code-plugin) — teaches this workflow through MCP, the CLI, or the plain
 HTTP command-line endpoint. MCP clients with prompt support can select **`assess_application`** instead. BootUI advertises
-three argument-free prompts: `diagnose_runtime_issue` for a focused runtime failure, `review_application` for a focused
-advisor review, and `assess_application` for a broader assessment and approval-gated plan. Clients without prompt support
+four prompts: `diagnose_runtime_issue` for a focused runtime failure, `verify_after_change` to run the tests,
+compare with the previous run, and stop, `review_application` for a focused
+advisor review, and `assess_application` for a broader assessment and approval-gated plan. Each declares optional
+string arguments that focus it: `symptom` and `route` for `diagnose_runtime_issue`, `change` and `route` for
+`verify_after_change`, `focus` for `review_application`, and `goal` for `assess_application`. A supplied value is
+appended to the prompt as context to verify (at most 500 characters each); without arguments the prompt is unchanged,
+and an undeclared or non-string argument is refused with `-32602`. Clients without prompt support
 can use the skill and the request above; there is no `bootui assess` command or new assessment tool.
 
 ### What the assessment does
@@ -585,6 +1091,7 @@ Docker.
 ```bash
 git clone https://github.com/jdubois/boot-ui.git
 cd boot-ui
+./mvnw -B -ntp -pl bootui-spring-sample-app -am install -DskipTests
 ./mvnw -pl bootui-spring-sample-app spring-boot:run
 ```
 
@@ -606,8 +1113,9 @@ With the agent connected and the repository open in your editor, ask it:
 
 ### 4. What the agent sees
 
-The agent calls `hibernate_scan` over MCP and gets back the same report the
-[Hibernate panel](features/advisors.md#hibernate) shows. Among the findings is a real
+The agent calls `hibernate_scan` over MCP and gets back a summary of the scan, whose `topFindings` rank the violated
+rules, then reads the same report the [Hibernate panel](features/advisors.md#hibernate) shows with
+`get_hibernate_report`. Among the findings is a real
 [`HIB-FETCH-001`](HIBERNATE-CHECKS.md#hib-fetch-001-eager-fetching-should-stay-explicit-and-bounded) (severity
 `HIGH`, 3 violations), one of whose `sampleViolations` names
 [`SampleOrder.customer`](https://github.com/jdubois/boot-ui/blob/main/bootui-spring-sample-app/src/main/java/io/github/jdubois/bootui/sample/advisor/hibernate/SampleOrder.java):
@@ -623,23 +1131,24 @@ join or entity graph where a use case needs it up front.
 
 ### 6. Verify
 
-The agent re-runs `hibernate_scan`. `HIB-FETCH-001`'s `violationCount` drops from 3 to 2, and its `sampleViolations`
+Rebuild and restart or let DevTools reload the edited application before scanning again. The agent re-runs
+`hibernate_scan`, whose summary counts `HIB-FETCH-001` at 2 instead of 3, then reads
+`get_hibernate_report`: the rule's `violationCount` is 2, and its `sampleViolations`
 no longer mention `SampleOrder#customer` — confirmed against the actually running app, not by re-reading the source.
 `HIB-FETCH-001` itself does **not** disappear from the report: `SampleAppPreferences#enabledFeatures` and
 `SampleOrder#details` are separate, intentional eager-fetch fixtures the same rule also catches, so the rule keeps
 firing until those are fixed too. Confirm just the one violation is gone from a terminal with:
 
 ```bash
-bootui hibernate scan --json \
+bootui hibernate scan > /dev/null && bootui hibernate report --json \
   | jq '.results[] | select(.id == "HIB-FETCH-001") | .sampleViolations[] | select(contains("SampleOrder#customer"))'
 ```
 
 An empty result means the fix held.
 
 `SampleOrder` intentionally ships with several other mappings that trip other Hibernate checks (see the comments in
-the source file), so a fresh clone always has this same finding to practice on. Discard the change afterwards
-(`git checkout -- bootui-spring-sample-app`) if you want to leave the fixture as-is for next time, or keep it if
-you're using the sample app as a personal scratch pad.
+the source file), so a fresh clone has this finding to practice on. If you want to restore the exercise fixture,
+review the diff and revert only the association change you made, preserving any unrelated local work.
 
 ### The same pattern for every advisor
 

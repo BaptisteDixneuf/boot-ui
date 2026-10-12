@@ -1,5 +1,0 @@
-io.github.jdubois.bootui.autoconfigure.BootUiAutoConfiguration
-io.github.jdubois.bootui.autoconfigure.BootUiReactiveAutoConfiguration
-io.github.jdubois.bootui.autoconfigure.BootUiSpringSecurityAutoConfiguration
-io.github.jdubois.bootui.autoconfigure.BootUiReactiveSpringSecurityAutoConfiguration
-io.github.jdubois.bootui.autoconfigure.BootUiShellGuardAutoConfiguration

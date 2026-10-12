@@ -19,11 +19,45 @@ applyTo: ".github/workflows/**,.github/scripts/**,.github/dependabot.yml,Dockerf
   stay version-free: they resolve the version at run time, and a literal version would not be rewritten by a release.
   `install.sh` must also pass `shellcheck -s sh`.
 - `build.yml` is the Java 17 baseline: it is the gate for formatting, the full reactor with coverage, the SBOM, and the
-  Spring and Quarkus Playwright suites. `jdk-compatibility.yml` covers Java 21 and 25 with a focused build, plus a
-  non-blocking Java 27 early-warning lane that stays `continue-on-error` until Spring Boot and Quarkus document
-  support for it. Keep new checks on the baseline workflow unless they are genuinely JDK-specific.
-- Quarkus/Hibernate build-time augmentation is gated to the JDKs the shared Quarkus LTS platform supports. Preserve the
-  JDK skip profile and the matrix gating rather than widening a job onto an unsupported JDK.
+  Spring and Quarkus Playwright suites. To keep it fast, the per-extension Quarkus integration-test modules run in a
+  parallel `quarkus-extension-its` job (the main build passes `-Dbootui.skipQuarkusExtensionIts`; the `base` module
+  stays in the main build because it feeds the coverage aggregate), and each Spring and Quarkus Playwright suite,
+  including the agent-attached ones and the companion legs that attach the OpenTelemetry Java agent (both orders) or
+  JaCoCo's agent beside BootUI's, is its own matrix leg. Companion agent jars come from Maven Central through the
+  sample's build (`target/agent-companions`), never from a download in a workflow step. The `agent-overhead` job records the BootUI agent's
+  overhead benchmark, warns above its 10 % budget, and fails only above 30 %. Each overhead measurement is one leg of
+  the `agent-overhead-legs` matrix, or of `agent-overhead-extra-legs` for those that need the `extras` output (gated at
+  job level, so a run without them starts no runner), on its own runner, with its arguments unchanged; both run the
+  same anchored steps. The runtime journal's on-versus-off throughput A/B, BootUI on in both arms, for the 2.0
+  sign-off, is one of those legs, report-only: it never fails the build, and its report keeps the `journal-overhead`
+  artifact. `agent-overhead` (the job name `Agent overhead (Java 17)`) gathers the legs' reports, runs every check on
+  them, and fails when any leg failed, so a new measurement is a new matrix leg and a new check a step there.
+  Each e2e job caches `~/.cache/ms-playwright` and `~/.cache/playwright-apt` per runner image (`ImageOS`) and
+  Playwright version and installs through `.github/scripts/install-playwright-chromium.sh`, which installs only the
+  system packages Playwright's dry run finds missing, from the cached .deb files when it can. `build.yml` and
+  `jdk-compatibility.yml` set `MAVEN_OPTS` at workflow level to the resolver's retry and timeout properties
+  (`aether.transport.http.*`, read as system properties, since `mvnw` ignores `MAVEN_ARGS`): only 429 and 5xx answers
+  are retried, never a 404 or a timeout, and a stalled transfer fails after 120 s instead of hanging. A step that sets
+  its own `MAVEN_OPTS` should append to it. `.mvn/maven.config` stays git-ignored for per-worktree overrides. The
+  agent-attached legs, `agent-overhead`,
+  and the JDK lanes run on every push to `main` and `v2`, every pull request into `main`, and the nightly schedule; a
+  pull request into `v2` runs them only when it changes a path listed in `.github/scripts/agent-changes.sh` or carries
+  the `agent` label (otherwise the agent legs pass without starting anything). Keep that path list in step with new
+  agent-backed code, and list the files the agent legs depend on in `.github/scripts/test_agent_changes.py`, which
+  `build.yml` runs. `jdk-compatibility.yml` covers
+  Java 21 and 25 with a focused build, the BootUI agent's forked-JVM tests, the Spring sample's agent integration
+  tests, and the whole Spring MVC browser suite with the agent attached (`agent-e2e`), plus a non-blocking Java 27 early-warning lane that stays `continue-on-error` until Spring Boot and Quarkus
+  document support for it. Keep new checks on the baseline workflow unless they are genuinely JDK-specific.
+- Quarkus/Hibernate build-time augmentation has an explicit JDK gate (currently 17 through 27), separate from the
+  platform's officially supported JDKs and older-LTS compatibility job. Preserve the JDK skip profile and matrix gating
+  rather than widening a job without verifying augmentation on the new JDK.
+- `build.yml`'s `quarkus-lts` job runs the extension, built on the pinned platform, through every Quarkus integration
+  module on the older supported LTS release, then the extension's own tests compiled against it. Its matrix version,
+  `requiresQuarkusCore` in `bootui-quarkus/pom.xml`, and the release `docs/setup/quarkus.md` names change together; a
+  step checks them.
+- `build.yml`'s `published-cli` job runs `.github/scripts/published-cli-smoke.sh`: the newest published `bootui-cli`
+  `all` jar, pinned by SHA-256, against the Spring sample built from the checkout. After a release, bump its version
+  and checksum together.
 - `dependency-submission.yml` submits the Maven dependency tree, transitive dependencies included, to the dependency
   graph on pushes to `main` only, since Dependabot alerts read only the default branch. GitHub's automatic dependency
   submission is turned off because it ran on every branch and pull request; keep it off.

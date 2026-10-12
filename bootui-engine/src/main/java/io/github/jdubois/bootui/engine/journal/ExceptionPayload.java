@@ -1,0 +1,81 @@
+package io.github.jdubois.bootui.engine.journal;
+
+import java.util.List;
+
+/**
+ * An exception occurrence's payload: the group it belongs to, its exception class, and its cross-run signature, never
+ * its message.
+ *
+ * @param groupId the Exceptions panel's group id, which includes line numbers
+ * @param exceptionClass the exception's class name
+ * @param signature a hash of the class and the declaring class and method of its top frames, without line numbers, so
+ *     the same failure keeps its signature when an edit shifts its lines ({@code docs/PLAN-v2.md} §5.5), or
+ *     {@code null} when unknown
+ * @param types bounded class and superclass names, deepest cause first, without messages
+ * @param marks the exception's identity marks ({@link ThrowableMarks}, M5-6a), so the engine can tell that an exception
+ *     application code caught was later reported; never rendered, exported, or persisted, and {@code null} when none
+ * @param logged whether a log feeder reported it, rather than the framework's error handling (a handler resolver, a
+ *     failure handler)
+ */
+public record ExceptionPayload(
+        String groupId,
+        String exceptionClass,
+        String signature,
+        List<String> types,
+        ThrowableMarks marks,
+        boolean logged)
+        implements RuntimeEventPayload {
+
+    public static final int MAX_TYPES = 16;
+
+    public ExceptionPayload {
+        types = types == null
+                ? List.of()
+                : List.copyOf(types.stream().limit(MAX_TYPES).toList());
+    }
+
+    public ExceptionPayload(String groupId, String exceptionClass, String signature, List<String> types) {
+        this(groupId, exceptionClass, signature, types, null, false);
+    }
+
+    public ExceptionPayload(String groupId, String exceptionClass, String signature) {
+        this(groupId, exceptionClass, signature, List.of());
+    }
+
+    /** An occurrence without a cross-run signature. */
+    public ExceptionPayload(String groupId, String exceptionClass) {
+        this(groupId, exceptionClass, null);
+    }
+
+    /** This occurrence with its group id, class, and signature replaced by the run's shared copies. */
+    @Override
+    public RuntimeEventPayload interned(JournalDictionary dictionary) {
+        return new ExceptionPayload(
+                dictionary.shared(groupId),
+                dictionary.shared(exceptionClass),
+                dictionary.shared(signature),
+                types.stream().map(dictionary::shared).toList(),
+                marks,
+                logged);
+    }
+
+    /** Its fixed part and its strings, each counted as the payload's own. */
+    @Override
+    public int estimatedBytes() {
+        return estimatedBytes(null);
+    }
+
+    /** Its fixed part, with each string {@code dictionary} shares counted as a reference. */
+    @Override
+    public int estimatedBytes(JournalDictionary dictionary) {
+        return 48
+                + JournalDictionary.REFERENCE_BYTES * types.size()
+                + JournalDictionary.retained(dictionary, groupId)
+                + JournalDictionary.retained(dictionary, exceptionClass)
+                + JournalDictionary.retained(dictionary, signature)
+                + types.stream()
+                        .mapToInt(type -> JournalDictionary.retained(dictionary, type))
+                        .sum()
+                + (marks == null ? 0 : marks.estimatedBytes());
+    }
+}

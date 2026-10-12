@@ -7,8 +7,14 @@ import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.github.jdubois.bootui.core.dto.JavaAgentReport;
+import io.github.jdubois.bootui.core.dto.MySqlInsightReport;
 import io.github.jdubois.bootui.core.dto.RestClientTraceRecordingRequest;
+import io.github.jdubois.bootui.core.dto.RestClientTraceReport;
+import io.github.jdubois.bootui.core.dto.RestClientTraceStatsDto;
 import io.github.jdubois.bootui.core.dto.SqlTraceRecordingRequest;
+import io.github.jdubois.bootui.core.dto.SqlTraceReport;
+import io.github.jdubois.bootui.core.dto.SqlTraceStatsDto;
 import io.github.jdubois.bootui.engine.mcp.McpArguments;
 import io.github.jdubois.bootui.engine.mcp.McpTool;
 import io.github.jdubois.bootui.engine.mcp.McpToolCatalog;
@@ -16,6 +22,9 @@ import io.github.jdubois.bootui.engine.mcp.McpToolSchema;
 import io.github.jdubois.bootui.engine.panel.BootUiPanels;
 import io.github.jdubois.bootui.quarkus.QuarkusPanelAvailability;
 import io.github.jdubois.bootui.quarkus.web.*;
+import io.github.jdubois.bootui.quarkus.web.HibernateStatisticsResource;
+import io.github.jdubois.bootui.quarkus.web.RuntimeInsightsResource;
+import io.github.jdubois.bootui.quarkus.web.WebSocketsResource;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -90,7 +99,13 @@ class QuarkusMcpToolsTest {
         org.mockito.Mockito.verifyNoInteractions(mysql);
         invoke(tools, "get_mysql_report", new McpArguments(null, 100, null));
         verify(mysql).mysql();
-        invoke(tools, "mysql_read", new McpArguments(null, 100, null));
+        when(mysql.read())
+                .thenReturn(new MySqlInsightReport(
+                        true, "Local only.", "OK", null, 1L, 2L, 0, List.of(), List.of(), List.of(), false));
+        assertThat(invoke(tools, "mysql_read", new McpArguments(null, 100, null)))
+                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
+                .containsEntry("reportTool", "get_mysql_report")
+                .containsEntry("status", "OK");
         verify(mysql).read();
         assertThat(tools)
                 .filteredOn(tool -> tool.name().equals("mysql_read"))
@@ -150,16 +165,84 @@ class QuarkusMcpToolsTest {
         RestClientTraceResource restClientTrace = mock(RestClientTraceResource.class);
         List<McpTool> tools = tools(availability, sqlTrace, restClientTrace);
         McpArguments noArguments = new McpArguments(null, 100, null);
+        when(sqlTrace.recording(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(new SqlTraceReport(
+                        true,
+                        null,
+                        false,
+                        false,
+                        200,
+                        7,
+                        100,
+                        List.of(),
+                        SqlTraceStatsDto.empty(),
+                        List.of(),
+                        List.of(),
+                        List.of()));
+        when(restClientTrace.recording(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(new RestClientTraceReport(
+                        true,
+                        null,
+                        true,
+                        false,
+                        50,
+                        3,
+                        1000,
+                        List.of(),
+                        RestClientTraceStatsDto.empty(),
+                        List.of(),
+                        List.of(),
+                        List.of()));
 
-        invoke(tools, "pause_sql_trace_recording", noArguments);
+        assertThat(invoke(tools, "pause_sql_trace_recording", noArguments))
+                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
+                .containsEntry("action", "paused")
+                .containsEntry("capturing", false)
+                .containsEntry("totalCaptured", 7L);
         invoke(tools, "resume_sql_trace_recording", noArguments);
         invoke(tools, "pause_rest_client_recording", noArguments);
-        invoke(tools, "resume_rest_client_recording", noArguments);
+        assertThat(invoke(tools, "resume_rest_client_recording", noArguments))
+                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
+                .containsEntry("action", "resumed")
+                .containsEntry("capacity", 50);
 
         verify(sqlTrace).recording(new SqlTraceRecordingRequest(false));
         verify(sqlTrace).recording(new SqlTraceRecordingRequest(true));
         verify(restClientTrace).recording(new RestClientTraceRecordingRequest(false));
         verify(restClientTrace).recording(new RestClientTraceRecordingRequest(true));
+    }
+
+    @Test
+    void agentSensorActionsSwitchTheNativeJavaAgentResource() throws Exception {
+        QuarkusPanelAvailability availability = mock(QuarkusPanelAvailability.class);
+        when(availability.isPanelAvailable(anyString())).thenReturn(true);
+        JavaAgentResource javaAgent = mock(JavaAgentResource.class);
+        when(javaAgent.switchSensorReport(anyString(), org.mockito.ArgumentMatchers.anyBoolean()))
+                .thenReturn(agentReport());
+        java.lang.reflect.Constructor<?> constructor = java.util.Arrays.stream(
+                        QuarkusMcpTools.class.getDeclaredConstructors())
+                .max(java.util.Comparator.comparingInt(java.lang.reflect.Constructor::getParameterCount))
+                .orElseThrow();
+        Object[] arguments = java.util.Arrays.stream(constructor.getParameterTypes())
+                .map(type -> type == QuarkusPanelAvailability.class
+                        ? availability
+                        : type == JavaAgentResource.class ? javaAgent : mock(type))
+                .toArray();
+        List<McpTool> tools = ((QuarkusMcpTools) constructor.newInstance(arguments)).tools();
+
+        invoke(tools, "enable_agent_sensor", new McpArguments(null, 100, "security-sinks"));
+        invoke(tools, "disable_agent_sensor", new McpArguments(null, 100, "security-sinks"));
+
+        verify(javaAgent).switchSensorReport("security-sinks", true);
+        verify(javaAgent).switchSensorReport("security-sinks", false);
+        assertThat(tools)
+                .filteredOn(tool ->
+                        tool.name().equals("enable_agent_sensor") || tool.name().equals("disable_agent_sensor"))
+                .allSatisfy(tool -> {
+                    assertThat(tool.action()).isTrue();
+                    assertThat(tool.panelId()).isEqualTo(BootUiPanels.JAVA_AGENT);
+                    assertThat(tool.schema()).isEqualTo(McpToolSchema.ID);
+                });
     }
 
     @Test
@@ -228,16 +311,46 @@ class QuarkusMcpToolsTest {
                         mock(RabbitResource.class),
                         mock(DevServicesResource.class),
                         mock(GitHubResource.class),
-                        mock(CopilotResource.class),
-                        mock(ClaudeCodeResource.class))
+                        () -> mock(CopilotResource.class),
+                        () -> mock(ClaudeCodeResource.class),
+                        mock(RuntimeInsightsResource.class),
+                        mock(JavaAgentResource.class),
+                        mock(CodeInventoryResource.class),
+                        mock(CodePathsResource.class),
+                        mock(SideEffectsResource.class),
+                        mock(HibernateStatisticsResource.class),
+                        mock(WebSocketsResource.class))
                 .tools();
     }
 
-    private static void invoke(List<McpTool> tools, String name, McpArguments arguments) {
-        tools.stream()
+    private static Object invoke(List<McpTool> tools, String name, McpArguments arguments) {
+        return tools.stream()
                 .filter(tool -> tool.name().equals(name))
                 .findFirst()
                 .orElseThrow()
                 .invoke(arguments);
+    }
+
+    private static JavaAgentReport agentReport() {
+        return new JavaAgentReport(
+                JavaAgentReport.ARMED,
+                null,
+                "2.0.0",
+                "2.0.0",
+                1,
+                1,
+                "21",
+                "javaagent",
+                null,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                null,
+                null,
+                List.of(),
+                List.of(),
+                null);
     }
 }

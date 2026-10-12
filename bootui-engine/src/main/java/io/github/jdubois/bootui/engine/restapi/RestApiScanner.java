@@ -73,7 +73,8 @@ public final class RestApiScanner {
             sourceLocations;
     private final SingleFlightAction singleFlight = new SingleFlightAction();
     private volatile Supplier<SpringWebStack> springWebStack = () -> SpringWebStack.UNKNOWN;
-    private final AdvisorScanState<RestApiReport> state = new AdvisorScanState<>(RestApiReport::withViolationDetails);
+    private final AdvisorScanState<RestApiReport> state =
+            new AdvisorScanState<>(RestApiReport::withViolationDetails, this::ruleCatalog);
 
     RestApiScanner(
             Supplier<List<String>> basePackagesSupplier,
@@ -162,8 +163,8 @@ public final class RestApiScanner {
         return report(
                 "NOT_SCANNED",
                 failures.isEmpty()
-                        ? "REST API rules have not run yet. Click Run REST API checks to analyse the application"
-                                + " controllers."
+                        ? "REST API rules have not run yet. Run REST API checks in the panel, or call rest_api_scan"
+                                + " (bootui rest-api scan), to analyse the application controllers."
                         : "REST API rules have not run yet. Application base packages could not be read; retry the"
                                 + " scan.",
                 null,
@@ -498,5 +499,10 @@ public final class RestApiScanner {
 
     private static boolean isViolation(RestApiRuleResultDto result) {
         return RestApiRuleSupport.VIOLATION.equals(result.status());
+    }
+
+    /** The ids of the rules this scanner runs, the catalogue its detail reads know. */
+    private List<String> ruleCatalog() {
+        return AdvisorScanState.ruleIds(rules, rule -> rule.definition().id());
     }
 }

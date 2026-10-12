@@ -53,7 +53,10 @@ public final class MemoryScanner {
     private final Supplier<MemoryContext> contextSupplier;
     private final Clock clock;
     private final SingleFlightAction singleFlight = new SingleFlightAction();
-    private final AdvisorScanState<MemoryReport> state = new AdvisorScanState<>(MemoryReport::withViolationDetails);
+    private final AdvisorScanState<MemoryReport> state = new AdvisorScanState<>(
+            MemoryReport::withViolationDetails,
+            () -> AdvisorScanState.ruleIds(
+                    MemoryRuleRegistry.activeRules(), rule -> rule.definition().id()));
 
     /**
      * Post-histogram GC counters from the previous scan, used as the lower bound of the recent-GC
@@ -109,7 +112,8 @@ public final class MemoryScanner {
     public MemoryReport initialReport() {
         return report(
                 "NOT_SCANNED",
-                "Memory Advisor has not run yet. Click Run memory checks to inspect the JVM runtime.",
+                "Memory Advisor has not run yet. Run memory checks in the panel, or call memory_scan (bootui memory scan),"
+                        + " to inspect the JVM runtime.",
                 null,
                 null,
                 0,

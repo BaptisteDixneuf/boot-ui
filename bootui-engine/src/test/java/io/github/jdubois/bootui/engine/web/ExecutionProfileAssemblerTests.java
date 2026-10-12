@@ -18,6 +18,7 @@ import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
 import io.github.jdubois.bootui.core.dto.TraceDetailDto;
 import io.github.jdubois.bootui.engine.cache.CacheActivityEvent;
 import io.github.jdubois.bootui.engine.cache.CacheActivityOperation;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
 import io.github.jdubois.bootui.engine.web.ProfileCapabilities.ServingThread;
 import io.github.jdubois.bootui.engine.web.ProfileCapabilities.ThreadMatch;
 import java.time.Instant;
@@ -39,6 +40,34 @@ class ExecutionProfileAssemblerTests {
 
     private final ExecutionProfileAssembler assembler = new ExecutionProfileAssembler();
 
+    @Test
+    void unverifiedSqlCoverageQualifiesEmptyProfilesAndKeepsConfirmedExecutions() {
+        HttpExchangeDto request = request("req-1", "/orders", "trace-a", null, 1_000L, 50L);
+        String limitation = "SQL preparation is not execution evidence.";
+        for (List<SqlTraceEntryDto> statements :
+                List.of(List.<SqlTraceEntryDto>of(), List.of(sql(1, "select 1", "trace-a", 0L, 1_010L)))) {
+            ProfileEvidence evidence = new ProfileEvidence(
+                    List.of(request), ProfileEvidence.Source.of(statements, limitation), null, null, null, null, null);
+            RequestProfileDto profile = assembler.requestProfile("req-1", evidence, ProfileCapabilities.traceIdOnly());
+            assertThat(profile.notes()).contains(limitation);
+            assertThat(section(profile, "SQL").available()).isEqualTo(!statements.isEmpty());
+            assertThat(profile.sql()).hasSize(statements.size());
+            if (statements.isEmpty()) {
+                assertThat(section(profile, "SQL").unavailableReason()).isEqualTo(limitation);
+            } else {
+                assertThat(section(profile, "SQL").tier()).isEqualTo("TRACE_ID");
+                assertThat(profile.sqlGroups())
+                        .singleElement()
+                        .satisfies(group -> assertThat(group.executions()).isEqualTo(1));
+            }
+        }
+        ProfileEvidence emptyJdbc = new ProfileEvidence(
+                List.of(request), new ProfileEvidence.Source<>(true, null, List.of()), null, null, null, null, null);
+        assertThat(section(assembler.requestProfile("req-1", emptyJdbc, ProfileCapabilities.traceIdOnly()), "SQL")
+                        .available())
+                .isTrue();
+    }
+
     /** Spring WebFlux and Quarkus: trace id only. */
     @Nested
     class TraceIdOnly {
@@ -51,6 +80,9 @@ class ExecutionProfileAssemblerTests {
 
             assertThat(profile.available()).isFalse();
             assertThat(profile.unavailableReason()).isEqualTo("Request missing-1 is no longer in the buffer");
+            assertThat(ExecutionProfileAssembler.notInBuffer(profile, "missing-1"))
+                    .isTrue();
+            assertThat(ExecutionProfileAssembler.notInBuffer(profile, "other")).isFalse();
         }
 
         @Test
@@ -60,8 +92,9 @@ class ExecutionProfileAssemblerTests {
             RequestProfileDto profile = assembler.requestProfile("req-1", evidence(List.of(request)), capabilities);
 
             assertThat(profile.available()).isFalse();
-            assertThat(profile.unavailableReason()).contains("No distributed trace id was captured");
-            assertThat(profile.unavailableReason()).contains("resolvable trace id");
+            assertThat(profile.unavailableReason())
+                    .contains("No distributed trace id and no BootUI request id was captured");
+            assertThat(profile.unavailableReason()).contains("OpenTelemetry");
         }
 
         @Test
@@ -94,7 +127,7 @@ class ExecutionProfileAssemblerTests {
             assertThat(securityDto.threadMatched()).isFalse();
 
             assertThat(profile.notes())
-                    .anyMatch(note -> note.contains("reduced, trace-id-only"))
+                    .anyMatch(note -> note.contains("reduced profile"))
                     .anyMatch(note -> note.contains("SQL is correlated exactly by trace id trace-a"))
                     .anyMatch(note -> note.contains("Exceptions are correlated exactly by trace id trace-a"))
                     .anyMatch(note -> note.contains("Security events are correlated exactly by trace id trace-a"));
@@ -173,6 +206,202 @@ class ExecutionProfileAssemblerTests {
         }
 
         @Test
+        void aRequestWithOnlyARequestIdGetsAnExactProfileWithoutTracing() {
+            HttpExchangeDto request = stamped(request("0123456789abcdef", "/orders", null, "alice", 1_000L, 50L));
+            HttpExchangeDto twin = stamped(request("fedcba9876543210", "/orders", null, "alice", 1_000L, 50L));
+            ProfileEvidence evidence = new Evidence(request, twin)
+                    .sql(
+                            withRequestId(sql(1, "select 1", null, 2L, 1_010L), "0123456789abcdef"),
+                            withRequestId(sql(2, "select 2", null, 2L, 1_010L), "fedcba9876543210"),
+                            sql(3, "select 3", null, 2L, 1_010L))
+                    .security(new SecurityLogEventDto(
+                            Instant.ofEpochMilli(1_020L).toString(),
+                            "alice",
+                            "AUTHENTICATION_SUCCESS",
+                            List.of(),
+                            null,
+                            "0123456789abcdef"))
+                    .restCalls(withRequestId(restCall(7, null, "worker-1", 1_030L), "0123456789abcdef"))
+                    .cache(new CacheActivityEvent(
+                            9L,
+                            1_040L,
+                            "cacheManager",
+                            "orders",
+                            CacheActivityOperation.HIT,
+                            "h",
+                            null,
+                            "worker-1",
+                            "fedcba9876543210"))
+                    .build();
+
+            RequestProfileDto profile = assembler.requestProfile("0123456789abcdef", evidence, capabilities);
+
+            assertThat(profile.available()).isTrue();
+            assertThat(profile.approximate()).isFalse();
+            assertThat(profile.sql()).extracting(SqlTraceEntryDto::id).containsExactly(1L);
+            assertThat(profile.security())
+                    .singleElement()
+                    .extracting(RequestProfileSecurityDto::principal)
+                    .isEqualTo("alice");
+            assertThat(profile.restCalls())
+                    .extracting(RestClientTraceEntryDto::id)
+                    .containsExactly(7L);
+            assertThat(profile.cacheAccesses()).isEmpty();
+            assertThat(section(profile, "SQL").tier()).isEqualTo("REQUEST_ID");
+            assertThat(section(profile, "SECURITY").tier()).isEqualTo("REQUEST_ID");
+            assertThat(section(profile, "REST_CLIENT").tier()).isEqualTo("REQUEST_ID");
+            assertThat(profile.notes())
+                    .anyMatch(note -> note.contains("reduced profile"))
+                    .anyMatch(note -> note.startsWith("SQL statements carrying this request's BootUI request id"))
+                    .anyMatch(note -> note.startsWith("REST client calls carrying this request's BootUI request id"));
+        }
+
+        @Test
+        void attributesExceptionOccurrencesByRequestIdWithoutTracing() {
+            HttpExchangeDto request = stamped(request("0123456789abcdef", "/orders", null, null, 1_000L, 50L));
+            HttpExchangeDto twin = stamped(request("fedcba9876543210", "/orders", null, null, 1_000L, 50L));
+            ProfileEvidence evidence = new Evidence(request, twin)
+                    .exceptions(occurrences(
+                            "java.lang.IllegalStateException",
+                            new ExceptionOccurrenceDto(
+                                    1_010L, "worker-1", "GET", "/orders", "h", "web", null, "0123456789abcdef"),
+                            new ExceptionOccurrenceDto(
+                                    1_020L, "worker-2", "GET", "/orders", "h", "web", null, "fedcba9876543210")))
+                    .build();
+
+            RequestProfileDto profile = assembler.requestProfile("0123456789abcdef", evidence, capabilities);
+
+            assertThat(profile.exceptions())
+                    .extracting(RequestProfileExceptionDto::timestamp)
+                    .containsExactly(1_010L);
+            assertThat(section(profile, "EXCEPTION").tier()).isEqualTo("REQUEST_ID");
+            assertThat(profile.notes())
+                    .anyMatch(
+                            note -> note.startsWith("Exception occurrences carrying this request's BootUI request id"));
+        }
+
+        @Test
+        void workTheAgentPropagatedIsAttributedAtThePropagatedTierWithinItsHandoffWindow() {
+            HttpExchangeDto request = stamped(request("0123456789abcdef", "/orders", null, null, 1_000L, 50L));
+            ProfileEvidence evidence = new Evidence(request)
+                    .sql(
+                            inExecution(sql(1, "select 1", null, 2L, 1_010L), "0123456789abcdef", null),
+                            inExecution(sql(2, "insert into audit", null, 2L, 1_500L), "0123456789abcdef", "async-1"),
+                            // Its handoff started more than max-handoff after the request ended.
+                            inExecution(
+                                    sql(3, "delete from carts", null, 2L, 1_050L + 300_001L),
+                                    "0123456789abcdef",
+                                    "async-2"),
+                            // Recorded more than max-handoff after its handoff started.
+                            inExecution(
+                                    sql(4, "delete from wishlists", null, 2L, 1_500L + 300_001L),
+                                    "0123456789abcdef",
+                                    "async-1"),
+                            // A handoff that started within max-handoff of the request's end keeps its whole window,
+                            // even past max-handoff after the request's end.
+                            inExecution(sql(5, "update stock", null, 2L, 200_000L), "0123456789abcdef", "async-3"),
+                            inExecution(sql(6, "update prices", null, 2L, 450_000L), "0123456789abcdef", "async-3"))
+                    .build();
+
+            RequestProfileDto profile = assembler.requestProfile("0123456789abcdef", evidence, capabilities);
+
+            assertThat(profile.sql())
+                    .as("statements outside their handoff's window are left out")
+                    .extracting(SqlTraceEntryDto::id)
+                    .containsExactlyInAnyOrder(1L, 2L, 5L, 6L);
+            assertThat(section(profile, "SQL").childTiers())
+                    .containsExactlyInAnyOrder("REQUEST_ID", "PROPAGATED", "PROPAGATED", "PROPAGATED");
+            assertThat(section(profile, "SQL").tier()).isEqualTo("PROPAGATED");
+            assertThat(profile.notes())
+                    .anyMatch(note -> note.startsWith("SQL statements recorded in tasks the BootUI agent propagated"));
+            assertThat(profile.correlationTiers())
+                    .as("a profile never uses a tier its own tier table calls unavailable")
+                    .contains(new RequestProfileTierDto("PROPAGATED", true, null));
+            assertThat(profile.notes())
+                    .contains(ExecutionProfileAssembler.RETAINED_PROPAGATION_NOTE
+                            + ProfileCapabilities.PROPAGATION_REASON);
+        }
+
+        @Test
+        void aProfileWithoutPropagatedWorkKeepsThePropagatedTierUnavailableWithoutTheRetainedNote() {
+            HttpExchangeDto request = stamped(request("0123456789abcdef", "/orders", null, null, 1_000L, 50L));
+            ProfileEvidence evidence = new Evidence(request)
+                    .sql(inExecution(sql(1, "select 1", null, 2L, 1_010L), "0123456789abcdef", null))
+                    .build();
+            String reason = JavaAgentService.PROPAGATION_REQUIREMENT + ": the sensor is failed.";
+
+            RequestProfileDto profile =
+                    assembler.requestProfile("0123456789abcdef", evidence, capabilities.withPropagation(reason));
+            RequestProfileDto propagating =
+                    assembler.requestProfile("0123456789abcdef", evidence, capabilities.withPropagation(null));
+
+            assertThat(profile.correlationTiers()).contains(new RequestProfileTierDto("PROPAGATED", false, reason));
+            assertThat(profile.notes())
+                    .noneMatch(note -> note.startsWith(ExecutionProfileAssembler.RETAINED_PROPAGATION_NOTE));
+            assertThat(propagating.notes())
+                    .noneMatch(note -> note.startsWith(ExecutionProfileAssembler.RETAINED_PROPAGATION_NOTE));
+        }
+
+        @Test
+        void cacheAccessesOfAPropagatedTaskAreAttributedAtThePropagatedTierWithinItsHandoffWindow() {
+            HttpExchangeDto request = stamped(request("0123456789abcdef", "/orders", null, null, 1_000L, 50L));
+            ProfileEvidence evidence = new Evidence(request)
+                    .cache(
+                            new CacheActivityEvent(
+                                    1,
+                                    1_500L,
+                                    "cacheManager",
+                                    "orders",
+                                    CacheActivityOperation.HIT,
+                                    "a1b2c3d4e5f60718",
+                                    null,
+                                    "pool-1-thread-1",
+                                    "0123456789abcdef",
+                                    "async-1"),
+                            new CacheActivityEvent(
+                                    2,
+                                    1_500L + 300_001L,
+                                    "cacheManager",
+                                    "orders",
+                                    CacheActivityOperation.PUT,
+                                    "a1b2c3d4e5f60718",
+                                    null,
+                                    "pool-1-thread-1",
+                                    "0123456789abcdef",
+                                    "async-1"))
+                    .build();
+
+            RequestProfileDto profile = assembler.requestProfile("0123456789abcdef", evidence, capabilities);
+
+            assertThat(profile.cacheAccesses())
+                    .singleElement()
+                    .satisfies(access -> assertThat(access.operation()).isEqualTo("HIT"));
+            assertThat(section(profile, "CACHE").childTiers()).containsExactly("PROPAGATED");
+        }
+
+        @Test
+        void aRequestIdDecidesBeforeASharedTraceId() {
+            HttpExchangeDto request = stamped(request("0123456789abcdef", "/orders", "trace-a", null, 1_000L, 50L));
+            HttpExchangeDto other = stamped(request("fedcba9876543210", "/orders", "trace-a", null, 1_000L, 50L));
+            ProfileEvidence evidence = new Evidence(request, other)
+                    .sql(
+                            withRequestId(sql(1, "select 1", "trace-a", 2L, 1_010L), "0123456789abcdef"),
+                            withRequestId(sql(2, "select 2", "trace-a", 2L, 1_010L), "fedcba9876543210"),
+                            withRequestId(sql(3, "select 3", "trace-a", 2L, 1_010L), "not-captured"))
+                    .build();
+
+            RequestProfileDto profile = assembler.requestProfile("0123456789abcdef", evidence, capabilities);
+
+            assertThat(profile.sql())
+                    .as("a statement carrying another request's id, or only the shared trace id, is not ours")
+                    .extracting(SqlTraceEntryDto::id)
+                    .containsExactly(1L);
+            assertThat(section(profile, "SQL").ambiguous())
+                    .as("the shared trace id leaves the uncaptured id's statement ambiguous")
+                    .isEqualTo(1);
+        }
+
+        @Test
         void reportsServingThreadAndTimeWindowTiersUnavailable() {
             HttpExchangeDto request = request("req-1", "/orders", "trace-a", null, 1_000L, 50L);
 
@@ -180,9 +409,28 @@ class ExecutionProfileAssemblerTests {
 
             assertThat(profile.correlationTiers())
                     .containsExactly(
+                            new RequestProfileTierDto("REQUEST_ID", true, null),
+                            new RequestProfileTierDto("PROPAGATED", false, ProfileCapabilities.PROPAGATION_REASON),
                             new RequestProfileTierDto("TRACE_ID", true, null),
                             new RequestProfileTierDto("SERVING_THREAD", false, ProfileCapabilities.EVENT_LOOP_REASON),
                             new RequestProfileTierDto("TIME_WINDOW", false, ProfileCapabilities.EVENT_LOOP_REASON));
+        }
+
+        @Test
+        void reportsThePropagatedTierAvailableOnlyWhileTheAgentPropagatesExecutorWork() {
+            HttpExchangeDto request = request("req-1", "/orders", "trace-a", null, 1_000L, 50L);
+            String reason = JavaAgentService.PROPAGATION_REQUIREMENT + ": the sensor is failed.";
+
+            RequestProfileDto propagating =
+                    assembler.requestProfile("req-1", evidence(List.of(request)), capabilities.withPropagation(null));
+            RequestProfileDto disabled =
+                    assembler.requestProfile("req-1", evidence(List.of(request)), capabilities.withPropagation(reason));
+
+            assertThat(propagating.correlationTiers())
+                    .contains(new RequestProfileTierDto("PROPAGATED", true, null))
+                    .contains(
+                            new RequestProfileTierDto("SERVING_THREAD", false, ProfileCapabilities.EVENT_LOOP_REASON));
+            assertThat(disabled.correlationTiers()).contains(new RequestProfileTierDto("PROPAGATED", false, reason));
         }
 
         @Test
@@ -386,9 +634,15 @@ class ExecutionProfileAssemblerTests {
             RequestProfileDto profile = assembler.requestProfile("r1", evidence(List.of(request)), capabilities);
 
             assertThat(profile.available()).isTrue();
-            assertThat(profile.notes()).noneMatch(note -> note.contains("reduced, trace-id-only"));
+            assertThat(profile.notes()).noneMatch(note -> note.contains("reduced profile"));
             assertThat(profile.correlationTiers())
+                    .filteredOn(tier -> !tier.tier().equals("PROPAGATED"))
                     .allSatisfy(tier -> assertThat(tier.available()).isTrue());
+            assertThat(profile.correlationTiers())
+                    .filteredOn(tier -> tier.tier().equals("PROPAGATED"))
+                    .singleElement()
+                    .satisfies(tier ->
+                            assertThat(tier.unavailableReason()).isEqualTo(ProfileCapabilities.PROPAGATION_REASON));
         }
 
         @Test
@@ -933,6 +1187,98 @@ class ExecutionProfileAssemblerTests {
                 traceId,
                 List.of(),
                 List.of());
+    }
+
+    /** The exchange stamped with BootUI's request id, which is then its id. */
+    private static HttpExchangeDto stamped(HttpExchangeDto base) {
+        return new HttpExchangeDto(
+                base.id(),
+                base.timestamp(),
+                base.method(),
+                base.path(),
+                base.query(),
+                base.uri(),
+                base.status(),
+                base.statusFamily(),
+                base.durationMs(),
+                base.responseSizeBytes(),
+                base.remoteAddress(),
+                base.principal(),
+                base.sessionId(),
+                base.traceId(),
+                base.requestHeaders(),
+                base.responseHeaders(),
+                null,
+                null,
+                base.id());
+    }
+
+    private static SqlTraceEntryDto withRequestId(SqlTraceEntryDto entry, String requestId) {
+        return new SqlTraceEntryDto(
+                entry.id(),
+                entry.timestamp(),
+                entry.sql(),
+                entry.statementType(),
+                entry.category(),
+                entry.durationMicros(),
+                entry.durationMillis(),
+                entry.success(),
+                entry.errorMessage(),
+                entry.affectedRows(),
+                entry.batchSize(),
+                entry.connectionId(),
+                entry.thread(),
+                entry.slow(),
+                entry.parameters(),
+                entry.traceId(),
+                entry.callSite(),
+                requestId);
+    }
+
+    private static SqlTraceEntryDto inExecution(SqlTraceEntryDto entry, String requestId, String executionId) {
+        return new SqlTraceEntryDto(
+                entry.id(),
+                entry.timestamp(),
+                entry.sql(),
+                entry.statementType(),
+                entry.category(),
+                entry.durationMicros(),
+                entry.durationMillis(),
+                entry.success(),
+                entry.errorMessage(),
+                entry.affectedRows(),
+                entry.batchSize(),
+                entry.connectionId(),
+                entry.thread(),
+                entry.slow(),
+                entry.parameters(),
+                entry.traceId(),
+                entry.callSite(),
+                requestId,
+                executionId,
+                null,
+                null);
+    }
+
+    private static RestClientTraceEntryDto withRequestId(RestClientTraceEntryDto call, String requestId) {
+        return new RestClientTraceEntryDto(
+                call.id(),
+                call.timestamp(),
+                call.method(),
+                call.uri(),
+                call.host(),
+                call.path(),
+                call.status(),
+                call.durationMillis(),
+                call.success(),
+                call.errorMessage(),
+                call.slow(),
+                call.clientType(),
+                call.requestHeaders(),
+                call.traceId(),
+                call.thread(),
+                call.callSite(),
+                requestId);
     }
 
     private static SqlTraceEntryDto sql(long id, String sql, String traceId, long durationMillis, long timestamp) {

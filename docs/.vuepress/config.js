@@ -6,7 +6,7 @@ import {slimsearchPlugin} from '@vuepress/plugin-slimsearch'
 import {defaultTheme} from '@vuepress/theme-default'
 import {defineUserConfig} from 'vuepress'
 import {inferRoutePath} from 'vuepress/shared'
-import {toDocLink} from './doc-links.js'
+import {toDocLink, toRepositoryLink} from './doc-links.js'
 import {parseRuleCatalog} from './rule-catalog.js'
 import {createDocsSidebar} from './sidebar.js'
 
@@ -19,10 +19,12 @@ export default defineUserConfig({
   // The JVM Tuning panel is a memory-budget calculator, not a rule catalog, so its design record has
   // no checks to publish alongside the other catalogs. It stays in the repository for contributors
   // and the Runtime page links to it there.
-  pagePatterns: ['**/*.md', '!JVM-TUNING-CHECKS.md', '!.vuepress', '!node_modules'],
+  // The validation rerun's data (docs/validation/) stays in the repository for reproducibility; only the report and the
+  // adjudication file that link to it are published.
+  pagePatterns: ['**/*.md', '!JVM-TUNING-CHECKS.md', '!validation/**', '!.vuepress', '!node_modules'],
   lang: 'en-US',
   title: 'BootUI',
-  description: 'A local-only developer console for Spring Boot 4 and Quarkus applications.',
+  description: 'A local-only developer console for Spring Boot and Quarkus applications.',
   head: [
     ['link', {rel: 'icon', type: 'image/svg+xml', href: `${siteBase}favicon.svg`}],
     ['meta', {name: 'theme-color', content: '#198754'}],
@@ -32,7 +34,7 @@ export default defineUserConfig({
       'meta',
       {
         property: 'og:description',
-        content: 'A local-only developer console for Spring Boot 4 and Quarkus applications.'
+        content: 'A local-only developer console for Spring Boot and Quarkus applications.'
       }
     ]
   ],
@@ -84,6 +86,7 @@ export default defineUserConfig({
       {text: 'Try it', link: toDocLink('TRY-SAMPLE-APP.md')},
       {text: 'Setup', link: toDocLink('SETUP.md')},
       {text: 'Features', link: toDocLink('features/README.md')},
+      {text: 'Workshop', link: toDocLink('workshop/README.md')},
       {text: 'Properties', link: toDocLink('PROPERTIES.md')},
       {text: 'AI agents', link: toDocLink('AI-AGENTS.md')},
       {text: 'Ecosystem', link: toDocLink('WORKS-WITH.md')}
@@ -224,11 +227,24 @@ function cleanMarkdownDocLinksPlugin() {
         ((tokens, index, options, _env, self) => self.renderToken(tokens, index, options))
 
       markdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
+        // Before VuePress resolves it: a link into a repository-only directory goes to GitHub, not to a missing page.
+        rewriteRepositoryOnlyLink(tokens[index], env)
         rawLinkOpenRule(tokens, index, options, env, self)
         rewriteMarkdownDocLink(tokens[index], cleanRouteByInferredRoute)
         return self.renderToken(tokens, index, options)
       }
     }
+  }
+}
+
+function rewriteRepositoryOnlyLink(token, env) {
+  const hrefAttrIndex = token.attrIndex('href')
+  if (hrefAttrIndex < 0 || !env?.filePathRelative) {
+    return
+  }
+  const repositoryLink = toRepositoryLink(token.attrs[hrefAttrIndex][1], env.filePathRelative)
+  if (repositoryLink) {
+    token.attrs[hrefAttrIndex][1] = repositoryLink
   }
 }
 

@@ -189,10 +189,12 @@ function finish(doc) {
  * @param {any} timing
  * @returns {string}
  */
-export function timingText(timing) {
+export function timingText(timing, sqlAvailable = true) {
   if (!timing) return ''
-  let text = `${plural(timing.sqlCount ?? 0, 'SQL statement')}, ${formatDuration(timing.sqlMs ?? 0)} in SQL`
-  if (timing.sqlPercent != null) text += ` (${formatNumber(timing.sqlPercent)}% of the request)`
+  let text = sqlAvailable
+    ? `${plural(timing.sqlCount ?? 0, 'SQL statement')}, ${formatDuration(timing.sqlMs ?? 0)} in SQL`
+    : 'SQL execution timing unavailable'
+  if (sqlAvailable && timing.sqlPercent != null) text += ` (${formatNumber(timing.sqlPercent)}% of the request)`
   if (timing.restCallCount) {
     text += `; ${plural(timing.restCallCount, 'REST client call')}, ${formatDuration(timing.restCallMs)} outbound`
   }
@@ -232,7 +234,8 @@ function requestSection(doc, profile, level) {
   if (request.durationMs != null) lines.push(bullet('Duration', formatDuration(request.durationMs)))
   if (request.principal) lines.push(bullet('Principal', inlineCode(request.principal)))
   if (request.traceId) lines.push(bullet('Trace id', inlineCode(request.traceId)))
-  if (profile.timing) lines.push(bullet('Timing', timingText(profile.timing)))
+  if (profile.timing)
+    lines.push(bullet('Timing', timingText(profile.timing, profileSections(profile).SQL?.available !== false)))
   if (profile.approximate) {
     lines.push(bullet('Correlation', 'approximate; some signals were matched by time window only'))
   }
@@ -664,4 +667,102 @@ export async function loadExceptionCorrelation(detail, fetchJson) {
   } catch (error) {
     return none(`the request profile could not be loaded: ${loadFailure(error, 'Live Activity')}`)
   }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Runtime Insights observation (docs/PLAN-v2.md §5.6)
+// ---------------------------------------------------------------------------------------------------
+
+// Engine sentences mark routes, statements, and classes with backticks: those parts stay code, the rest is escaped.
+function insightProse(text) {
+  return String(text ?? '')
+    .split('`')
+    .map((part, index) => {
+      if (index % 2 === 1) return inlineCode(part)
+      // escapeMarkdown trims the start, so the space after a code span is kept here; only the first part can open a block.
+      const lead = index > 0 ? (oneLine(part).match(/^\s*/)?.[0] ?? '') : ''
+      return lead + escapeMarkdown(part)
+    })
+    .join('')
+}
+
+function tableCell(value) {
+  const text = oneLine(value)
+  return text ? escapeMarkdown(text) : ' '
+}
+
+/**
+ * The Markdown "Copy for AI" exports for one Runtime Insights observation: what was counted, how it was linked, the
+ * checks to run before editing anything, and its evidence, built only from the detail the panel already shows.
+ *
+ * @param {any} detail the observation detail from `GET /runtime-insights/insights/{id}`
+ * @param {{title?: string, checkReason?: string}} [context] the check's title, and why it ran partially, if it did
+ * @returns {{markdown: string, omissions: string[]}}
+ */
+export function insightMarkdown(detail, {title, checkReason} = {}) {
+  const doc = newDocument()
+  const observation = detail?.observation
+  if (!detail?.available || !observation) {
+    push(doc, heading(1, 'BootUI runtime insight'), escapeMarkdown(detail?.unavailableReason || 'Not available.'))
+    return finish(doc)
+  }
+  push(
+    doc,
+    heading(1, `BootUI runtime insight: ${escapeMarkdown(title || observation.kind)}`),
+    insightProse(observation.sentence),
+    [
+      bullet('Id', inlineCode(observation.id)),
+      bullet('Subject', inlineCode(observation.subject)),
+      bullet('Status', escapeMarkdown(observation.status)),
+      observation.eligible > 0
+        ? bullet('Counted', `${formatNumber(observation.affected)} of ${formatNumber(observation.eligible)} requests`)
+        : null,
+      bullet('Linked by', escapeMarkdown(observation.minimumTier)),
+      observation.listed === false
+        ? bullet('Not listed by default', escapeMarkdown(observation.unlistedReason || 'Left out of the default list.'))
+        : null,
+      checkReason ? bullet('Check', escapeMarkdown(checkReason)) : null
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    'This is an observation of what this run did, not a verdict: verify it against the source before changing code,' +
+      ' and do not treat a missing observation as proof that a behavior is gone.'
+  )
+  if (observation.whatToCheck?.length) {
+    push(
+      doc,
+      heading(2, 'What to check'),
+      observation.whatToCheck.map((check, index) => `${index + 1}. ${insightProse(check)}`).join('\n')
+    )
+  }
+  if (observation.exemplarRequestIds?.length) {
+    push(
+      doc,
+      heading(2, 'Executions to open'),
+      'Each command reads the retained runtime-journal profile first and falls back to HTTP-exchange details.' +
+        ' Check `source` and `available` before using the evidence; neither source may retain an older id.',
+      observation.exemplarRequestIds
+        .map((id) => `- ${inlineCode(id)}: \`bootui request-profile ${oneLine(id).replace(/`/g, '')}\``)
+        .join('\n')
+    )
+  }
+  const columns = detail.columns ?? []
+  const rows = detail.rows ?? []
+  if (columns.length && rows.length) {
+    const lines = [
+      `| ${columns.map(tableCell).join(' | ')} |`,
+      `| ${columns.map(() => '---').join(' | ')} |`,
+      ...rows.map((row) => `| ${columns.map((_, index) => tableCell(row.cells?.[index])).join(' | ')} |`)
+    ]
+    push(doc, heading(2, 'Evidence'), lines.join('\n'))
+  }
+  if (detail.truncated > 0) omit(doc, `${plural(detail.truncated, 'evidence row')} beyond the first ${rows.length}.`)
+  if (observation.limitations?.length) {
+    push(
+      doc,
+      heading(2, 'What it cannot see'),
+      observation.limitations.map((text) => `- ${insightProse(text)}`).join('\n')
+    )
+  }
+  return finish(doc)
 }

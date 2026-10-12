@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.jdubois.bootui.conformance.BootUiHttpProbe.Response;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
@@ -24,6 +25,14 @@ public abstract class AbstractCliConformanceTest {
 
     private static final String CLI = "/bootui/api/cli";
 
+    /**
+     * A tool such as {@code architecture_scan} runs a whole scan inside its request, which a loaded runner can stretch
+     * past the default 30 s. Implementations raise the server's {@code bootui.cli.execution-timeout} to 60 s, the
+     * {@code bootui} CLI's own request budget; the probe waits a little longer, so a true overrun reads as the server's
+     * 504 rather than a client timeout.
+     */
+    private static final Duration CLI_TIMEOUT = Duration.ofSeconds(70);
+
     protected abstract String baseUrl();
 
     private BootUiHttpProbe probe() {
@@ -31,7 +40,8 @@ public abstract class AbstractCliConformanceTest {
     }
 
     private Response invoke(String tool, String body) {
-        return probe().request("POST", CLI + "/tools/" + tool, Map.of("Content-Type", "application/json"), body);
+        return probe().request(
+                        "POST", CLI + "/tools/" + tool, Map.of("Content-Type", "application/json"), body, CLI_TIMEOUT);
     }
 
     private JsonNode catalogEntry(String tool) {
@@ -72,7 +82,7 @@ public abstract class AbstractCliConformanceTest {
         assertThat(tool.path("name").asText()).isNotBlank();
         assertThat(tool.path("description").asText()).isNotBlank();
         assertThat(tool.path("panel").asText()).isNotBlank();
-        assertThat(tool.path("schema").asText()).isIn("NONE", "LIMIT", "QUERY_LIMIT", "ID", "RULE_VIOLATIONS");
+        assertThat(tool.path("schema").asText()).isIn("NONE", "LIMIT", "QUERY_LIMIT", "QUERY", "ID", "RULE_VIOLATIONS");
         assertThat(tool.path("arguments").isArray()).isTrue();
         assertThat(tool.path("action").isBoolean()).isTrue();
         assertThat(tool.path("panelEnabled").isBoolean()).isTrue();
@@ -88,8 +98,9 @@ public abstract class AbstractCliConformanceTest {
         assertThat(scan.status()).isEqualTo(200);
         String scanId = scan.json().path("violationDetails").path("scanId").asText();
         assertThat(scanId).isNotBlank();
-        if (!scan.json().path("results").isEmpty()) {
-            JsonNode rule = scan.json().path("results").get(0);
+        assertThat(scan.json().has("results")).isFalse();
+        if (!scan.json().path("topFindings").isEmpty()) {
+            JsonNode rule = scan.json().path("topFindings").get(0);
             Response page = invoke(
                     "get_architecture_rule_violations",
                     "{\"id\":\"" + rule.path("id").asText() + "\",\"scanId\":\"" + scanId
@@ -97,7 +108,7 @@ public abstract class AbstractCliConformanceTest {
             assertThat(page.status()).isEqualTo(200);
             assertThat(page.json().path("scanId").asText()).isEqualTo(scanId);
             assertThat(page.json().path("violationCount").asInt())
-                    .isEqualTo(rule.path("violationCount").asInt());
+                    .isEqualTo(rule.path("count").asInt());
             assertThat(page.json().path("page").path("limit").asInt()).isEqualTo(1);
         }
         assertThat(invoke("get_architecture_rule_violations", "{\"id\":\"ARCH-CODE-002\"}")
@@ -189,6 +200,35 @@ public abstract class AbstractCliConformanceTest {
         assertThat(response.json().path("error").asText()).contains("no_such_tool");
     }
 
+    /**
+     * The agent's commands without the BootUI agent ({@code docs/PLAN-v2.md} M5-10's acceptance pass): the catalog
+     * lists {@code bootui agent status}, which answers that the agent is not attached and why, and none of the commands
+     * that need one of its sensors, which answer 404 as a command this instance does not serve, never an empty success.
+     */
+    @Test
+    void testCliAgentCommandsSayTheAgentIsNotAttachedAndTheOthersAreNotServed() {
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                JavaAgentPresence.detached(), "this JVM runs with the BootUI agent attached");
+        java.util.List<String> listed = new java.util.ArrayList<>();
+        probe().get(CLI)
+                .json()
+                .path("tools")
+                .forEach(tool -> listed.add(tool.path("name").asText()));
+        assertThat(listed).contains("get_agent_status");
+        assertThat(listed).doesNotContainAnyElementsOf(JavaAgentPresence.AGENT_SENSOR_TOOLS);
+
+        Response status = invoke("get_agent_status", "{}");
+        assertThat(status.status()).isEqualTo(200);
+        assertThat(status.json().path("state").asText()).isEqualTo("NOT_ATTACHED");
+        assertThat(status.json().path("reason").asText()).isNotBlank();
+
+        for (String tool : JavaAgentPresence.AGENT_SENSOR_TOOLS) {
+            Response response = invoke(tool, "{}");
+            assertThat(response.status()).as("%s without the agent", tool).isEqualTo(404);
+            assertThat(response.json().path("error").asText()).contains(tool);
+        }
+    }
+
     @Test
     void testCliArgumentTheToolDoesNotDeclareIsRejected() {
         Response response = invoke("get_overview", "{\"id\":\"anything\"}");
@@ -216,20 +256,49 @@ public abstract class AbstractCliConformanceTest {
     }
 
     @Test
-    void testCliRequestProfileReturnsTheSameDtoAsTheRestEndpoint() {
-        // An unknown id is the one profile every instance can produce deterministically: no traffic is
-        // needed, and the tool must answer with the REST endpoint's unavailable profile, not an error.
+    void testCliRequestProfileRefusesAnIdNeitherRetentionWindowHas() {
         String id = "conformance-unknown-request";
         assertThat(catalogEntry("get_request_profile").path("panel").asText()).isEqualTo("activity");
 
         Response cli = invoke("get_request_profile", "{\"id\":\"" + id + "\"}");
-        Response rest = probe().get("/bootui/api/activity/request/" + id);
+        assertThat(cli.status())
+                .as("an unknown id is the caller's mistake, so the CLI exits with an error")
+                .isEqualTo(400);
+        assertThat(cli.json().path("error").asText()).contains(id, "journal", "buffer", "get_live_activity");
+    }
 
-        assertThat(cli.status()).isEqualTo(200);
-        assertThat(rest.status()).isEqualTo(200);
-        assertThat(cli.json()).isEqualTo(rest.json());
-        assertThat(cli.json().path("available").asBoolean(true)).isFalse();
-        assertThat(cli.json().path("unavailableReason").asText()).contains(id);
+    @Test
+    void testCliRuntimeInsightsCommandsAnswerOnEveryStack() {
+        assertThat(catalogEntry("get_runtime_insights").path("command").asText())
+                .isEqualTo("insights list");
+        Response list = invoke("get_runtime_insights", "{\"query\":\"\",\"limit\":2}");
+        assertThat(list.status()).isEqualTo(200);
+        assertThat(list.json().has("coverage")).isTrue();
+        assertThat(list.json().path("observations").size()).isLessThanOrEqualTo(2);
+        assertThat(invoke("get_runtime_insights", "{}")
+                        .json()
+                        .path("observations")
+                        .size())
+                .as("bootui insights list without --limit gets the compact default")
+                .isLessThanOrEqualTo(8);
+        for (JsonNode observation : invoke("get_runtime_insights", "{}").json().path("observations")) {
+            assertThat(observation.path("listed").asBoolean(false))
+                    .as("bootui insights list shows only rows listed by default (M4-19)")
+                    .isTrue();
+        }
+        assertThat(invoke("get_runtime_insights", "{\"query\":\"all\"}").status())
+                .isEqualTo(200);
+        Response comparison = invoke("get_runtime_run_comparison", "{\"id\":\"previous\"}");
+        assertThat(comparison.status()).isEqualTo(200);
+        assertThat(comparison.json().path("status").asText()).isNotBlank();
+        assertThat(invoke("get_runtime_insight", "{}").status()).isEqualTo(400);
+        assertThat(invoke("get_runtime_insight", "{}").json().path("error").asText())
+                .as("a missing id names the command that lists the ids")
+                .contains("get_runtime_insights");
+        Response unknown = invoke("get_runtime_insight", "{\"id\":\"conformance-unknown-observation\"}");
+        assertThat(unknown.status()).isEqualTo(400);
+        assertThat(unknown.json().path("error").asText())
+                .contains("conformance-unknown-observation", "get_runtime_insights");
     }
 
     @Test
@@ -243,6 +312,24 @@ public abstract class AbstractCliConformanceTest {
 
         assertThat(response.status()).isEqualTo(400);
         assertThat(response.json().path("error").asText()).isNotBlank();
+    }
+
+    @Test
+    void testCliAgentSensorSwitchesRejectMissingAndUnsupportedIds() {
+        for (String tool : java.util.List.of("enable_agent_sensor", "disable_agent_sensor")) {
+            JsonNode entry = catalogEntry(tool);
+            assertThat(entry.path("panel").asText()).isEqualTo("java-agent");
+            assertThat(entry.path("action").asBoolean()).isTrue();
+            assertThat(entry.path("command").asText())
+                    .isEqualTo(tool.equals("enable_agent_sensor") ? "agent sensor enable" : "agent sensor disable");
+            assertThat(invoke(tool, "{}").status()).isEqualTo(400);
+            Response invalid = invoke(tool, "{\"id\":\"executors\"}");
+            assertThat(invalid.status()).isEqualTo(400);
+            assertThat(invalid.json().path("error").asText()).contains("cannot be switched", "executors");
+            Response refused = invoke(tool, "{\"id\":\"files\"}");
+            assertThat(refused.status()).isEqualTo(409);
+            assertThat(refused.json().path("error").asText()).contains("not armed");
+        }
     }
 
     @Test

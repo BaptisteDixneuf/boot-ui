@@ -51,7 +51,11 @@ public final class ReactiveSecurityScanner {
     private final Supplier<ReactiveSecurityObservation> observationSupplier;
     private final Clock clock;
     private final SingleFlightAction singleFlight = new SingleFlightAction();
-    private final AdvisorScanState<SecurityReport> state = new AdvisorScanState<>(SecurityReport::withViolationDetails);
+    private final AdvisorScanState<SecurityReport> state = new AdvisorScanState<>(
+            SecurityReport::withViolationDetails,
+            () -> AdvisorScanState.ruleIds(
+                    ReactiveSecurityRuleRegistry.activeRules(),
+                    rule -> rule.definition().id()));
 
     private ReactiveSecurityScanner(Supplier<ReactiveSecurityObservation> observationSupplier, Clock clock) {
         this.observationSupplier = observationSupplier;
@@ -72,7 +76,8 @@ public final class ReactiveSecurityScanner {
     public SecurityReport initialReport() {
         return report(
                 "NOT_SCANNED",
-                "Security Advisor has not run yet. Click Run security checks to inspect the filter chains.",
+                "Security Advisor has not run yet. Run security checks in the panel, or call security_scan"
+                        + " (bootui security scan), to inspect the filter chains.",
                 null,
                 0,
                 0,

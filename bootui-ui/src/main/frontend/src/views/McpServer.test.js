@@ -2,6 +2,7 @@ import {flushPromises, mount} from '@vue/test-utils'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import McpServer from './McpServer.vue'
+import PanelHeader from './components/PanelHeader.vue'
 
 function jsonResponse(body, ok = true, status = 200) {
   return {ok, status, json: () => Promise.resolve(body)}
@@ -17,7 +18,11 @@ function mcpStatus(overrides = {}) {
     transport: 'http',
     endpoint: '/bootui/api/mcp',
     protocolVersion: '2025-06-18',
+    supportedProtocolVersions: ['2026-07-28', '2025-06-18'],
     maxResults: 200,
+    callCount: 7,
+    timeouts: 1,
+    cancellations: 2,
     toolCount: 2,
     tools: [
       {
@@ -72,6 +77,40 @@ describe('McpServer', () => {
     expect(wrapper.text()).toContain('MCP server status is unavailable')
   })
 
+  it('lists both protocol eras and counts timeouts apart from cancellations', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(mcpStatus())))
+
+    wrapper = mount(McpServer)
+    await flushPromises()
+
+    const protocols = wrapper.get('[data-testid="mcp-protocols"]').text()
+    expect(protocols).toContain('2026-07-28, 2025-06-18')
+    expect(protocols).toContain('progress')
+    expect(wrapper.get('[data-testid="mcp-call-stats"]').text()).toBe('7 · 1 timed out · 2 cancelled')
+  })
+
+  it('shows dropped progress events only when there are some', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(mcpStatus({progressDropped: 0}))))
+    wrapper = mount(McpServer)
+    await flushPromises()
+    expect(wrapper.find('[data-testid="mcp-progress-dropped"]').exists()).toBe(false)
+    wrapper.unmount()
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(mcpStatus({progressDropped: 3}))))
+    wrapper = mount(McpServer)
+    await flushPromises()
+    expect(wrapper.get('[data-testid="mcp-progress-dropped"]').text()).toBe('3 over bootui.mcp.max-response-bytes')
+  })
+
+  it('falls back to the single advertised revision', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(mcpStatus({supportedProtocolVersions: undefined}))))
+
+    wrapper = mount(McpServer)
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="mcp-protocols"]').text()).toBe('2025-06-18')
+  })
+
   it('renders the toggle, explanation, and tool catalog', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(mcpStatus())))
 
@@ -108,11 +147,13 @@ describe('McpServer', () => {
 
   it('posts the new state when the toggle is flipped', async () => {
     document.cookie = 'XSRF-TOKEN=test-token'
+    let enabled = false
     const fetchMock = vi.fn().mockImplementation((url) => {
       if (url === 'api/mcp-server/toggle') {
+        enabled = true
         return Promise.resolve(jsonResponse(mcpStatus({enabled: true, overridden: true})))
       }
-      return Promise.resolve(jsonResponse(mcpStatus()))
+      return Promise.resolve(jsonResponse(mcpStatus({enabled})))
     })
     vi.stubGlobal('fetch', fetchMock)
 
@@ -127,6 +168,78 @@ describe('McpServer', () => {
       expect.objectContaining({method: 'POST', body: JSON.stringify({enabled: true})})
     )
     expect(wrapper.get('#mcp-enabled-toggle').element.checked).toBe(true)
+  })
+
+  it.each(
+    ['invalid JSON', 'empty', 'wrong shape'].flatMap((kind) =>
+      [false, true].map((initiallyEnabled) => ({kind, initiallyEnabled}))
+    )
+  )(
+    'preserves accepted status $initiallyEnabled after a $kind acknowledgement and reports unknown outcome',
+    async ({kind, initiallyEnabled}) => {
+      document.cookie = 'XSRF-TOKEN=test-token'
+      let reads = 0
+      const fetchMock = vi.fn((url) => {
+        if (url === 'api/mcp-server/toggle') {
+          return Promise.resolve(
+            kind === 'wrong shape'
+              ? jsonResponse({enabled: false})
+              : new Response(kind === 'empty' ? '' : '<html>Not JSON</html>')
+          )
+        }
+        reads++
+        return reads === 1
+          ? Promise.resolve(jsonResponse(mcpStatus({enabled: initiallyEnabled})))
+          : Promise.reject(new Error('status temporarily unreachable'))
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      wrapper = mount(McpServer)
+      await flushPromises()
+      wrapper.getComponent(PanelHeader).vm.$emit('update:autoRefresh', false)
+      await wrapper.get('#mcp-enabled-toggle').setValue(!initiallyEnabled)
+      await flushPromises()
+      expect(wrapper.get('#mcp-enabled-toggle').element.checked).toBe(initiallyEnabled)
+      expect(wrapper.text()).toContain('action outcome is unknown')
+      expect(wrapper.text()).not.toContain('MCP server disabled.')
+      expect(reads).toBe(2)
+      expect(fetchMock.mock.calls.filter(([url]) => url === 'api/mcp-server/toggle')).toHaveLength(1)
+    }
+  )
+
+  it('supersedes a late poll with the valid toggle report and completes its follow-up with auto-refresh off', async () => {
+    document.cookie = 'XSRF-TOKEN=test-token'
+    let finishStale
+    let finishFresh
+    let reads = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url) => {
+        if (url === 'api/mcp-server/toggle')
+          return Promise.resolve(jsonResponse(mcpStatus({enabled: true, overridden: true})))
+        reads++
+        if (reads === 1) return Promise.resolve(jsonResponse(mcpStatus()))
+        return new Promise((resolve) => {
+          if (reads === 2) finishStale = resolve
+          else finishFresh = resolve
+        })
+      })
+    )
+    wrapper = mount(McpServer)
+    await flushPromises()
+    const header = wrapper.getComponent(PanelHeader)
+    header.vm.$emit('update:autoRefresh', false)
+    header.vm.$emit('refresh')
+    await flushPromises()
+    await wrapper.get('#mcp-enabled-toggle').trigger('change')
+    await flushPromises()
+    expect(wrapper.get('#mcp-enabled-toggle').element.checked).toBe(true)
+    finishStale(jsonResponse(mcpStatus()))
+    await flushPromises()
+    expect(wrapper.get('#mcp-enabled-toggle').element.checked).toBe(true)
+    expect(reads).toBe(3)
+    finishFresh(jsonResponse(mcpStatus({enabled: true, callCount: 99})))
+    await flushPromises()
+    expect(wrapper.get('[data-testid="mcp-call-stats"]').text()).toContain('99')
   })
 
   it('renders a copyable MCP client configuration for each supported client', async () => {

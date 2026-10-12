@@ -1,17 +1,18 @@
 # Command line
 
-BootUI's diagnostics are reachable from a terminal. The `bootui` CLI asks a running Spring Boot or Quarkus
-application one question and prints the answer — no browser, no MCP client, no hand-written `curl`.
+BootUI's diagnostics are reachable from a terminal. The `bootui` CLI works with Spring Boot and Quarkus: it asks a
+running application one question and prints the answer — no browser, no MCP client, no hand-written `curl`.
 
 ```console
 $ bootui beans --query dataSource
-$ bootui hibernate scan --json | jq '.findings[] | select(.severity == "HIGH")'
+$ bootui hibernate scan --json | jq '.topFindings[] | select(.severity == "HIGH")'
 $ bootui http exchanges --limit 20
 ```
 
-Every command is one BootUI [MCP](AI-AGENTS.md) tool, projected mechanically from the same registry. The CLI
+Every diagnostic command is one BootUI [MCP](AI-AGENTS.md) tool, projected mechanically from the same registry. The CLI
 cannot offer a diagnostic the MCP server does not, and cannot lack one it does: the command table is generated
-from the registry at build time and a test fails when the two disagree.
+from the registry at build time and a test fails when the two disagree. `tools` reads the CLI catalog, and
+`mcp status|enable|disable` call the MCP Server panel directly rather than invoking catalog tools.
 
 ## Install
 
@@ -30,11 +31,15 @@ curl -fsSL https://www.julien-dubois.com/boot-ui/install.sh | sh
 irm https://www.julien-dubois.com/boot-ui/install.ps1 | iex
 ```
 
-That asks Maven Central for the newest release, checks the download against the checksum published beside
-it, and leaves a `bootui` command in `~/.local/bin` — `%LOCALAPPDATA%\BootUI\bin` on Windows, which it adds
+That asks Maven Central for the newest release, tries its published SHA-512, SHA-256, then SHA-1 checksum, and leaves
+a `bootui` command in `~/.local/bin` — `%LOCALAPPDATA%\BootUI\bin` on Windows, which it adds
 to your user `PATH`. It needs no administrator rights, does not edit your shell profile, and contacts
 nothing but the Maven repository. Running it again upgrades in place, and `--uninstall` — `-Uninstall` in
 PowerShell — reverses it.
+
+An available checksum mismatch aborts without installing. If no checksum can be fetched or calculated, the installer
+prints a note and continues without verification; it does not verify a GPG signature. Inspect that output before
+trusting the installed jar.
 
 To pin a version or install somewhere else, pass options after `sh -s --`:
 
@@ -89,10 +94,12 @@ bootui: version 1.17.0 is available; you have 1.16.0.
         Silence this with BOOTUI_NO_UPDATE_CHECK=1.
 ```
 
-The run that prints it makes no network call of its own: it reports what a previous check left in
+The notice reads the cached result in
 `~/.bootui` — `%LOCALAPPDATA%\BootUI` on Windows, or `BOOTUI_INSTALL_DIR` wherever you pointed it. That check
 reads the same `maven-metadata.xml` the installer does, at most once a day, on a background thread that the
-command never waits for and that is abandoned rather than delayed. Nothing is written to standard output and
+command gives at most 250 ms to finish at shutdown. A still-running refresh is abandoned when the JVM exits.
+An interrupted refresh may be retried by a later run; a completed attempt is normally throttled to once a day.
+Nothing is written to standard output and
 the exit code is untouched, so a pipeline sees exactly what it saw before.
 
 A piped run says nothing and asks nothing, so CI does no unexpected network traffic. `BOOTUI_NO_UPDATE_CHECK=1`
@@ -119,7 +126,7 @@ See [Properties](PROPERTIES.md) for `bootui.cli.max-results`, `bootui.cli.execut
 | --- | --- | --- | --- |
 | `--url <url>` | `BOOTUI_URL` | `http://localhost:8080` | Where the application is listening. A bare `host:port` is accepted. |
 | `--api-path <path>` | `BOOTUI_API_PATH` | `/bootui/api` | Only needed when `bootui.api-path` is customised. |
-| `--token <token>` | `BOOTUI_TOKEN` | none | Sent as an `Authorization` header when `bootui.authentication.token` is set. |
+| `--token <token>` | `BOOTUI_TOKEN` | none | Sent as an `Authorization: Bearer <token>` header. Needed for an untrusted non-loopback caller, using the configured or generated BootUI token; loopback, trusted proxies, and trusted container gateways need none. |
 | `--timeout <seconds>` | — | `60` | How long to wait for an answer. Raise it for a slow scan. |
 | `--json` | — | auto | Print the application's JSON verbatim. Implied when output is not a terminal. |
 | `--no-color` | `NO_COLOR` | — | Disable ANSI colour. |
@@ -137,12 +144,22 @@ When output is piped, or with `--json`, the CLI prints exactly the bytes the app
 the MCP tool returns, unmodified. That is the form to parse:
 
 ```bash
-bootui security scan --json | jq -r '.results[] | "\(.severity)\t\(.name)"'
+bootui security scan --json | jq -r '.topFindings[] | "\(.severity)\t\(.title)"'
 ```
 
-Advisor scans differ in how they name that array — `pentest scan` reports `findings`, the rule-based
-advisors report `results` — so check the shape with `bootui <command> --json | jq keys` before writing a
-filter. What every scan does share is `severityCounts`, which is what the [CI](#in-ci) gate below uses.
+Every scan command answers with the same compact summary: `findingsFound`, `severityCounts`, at most ten
+`topFindings` (`id`, `title`, `severity`, `count`, most severe first), `moreFindings` for the rest, and
+`reportTool`, the MCP name of the report that holds the rest (`get_security_report`, which `bootui security report`
+prints without scanning again).
+Reports differ in how they name their finding array — `pentest report` has `findings`, the rule-based advisors
+`results` — so check the shape with `bootui <command> --json | jq keys` before filtering one. What every scan and
+report shares is `severityCounts`, which is what the [CI](#in-ci) gate below uses.
+
+The capture controls (`sql pause`, `tx clear`, `rest-client resume`, `exceptions clear`, `traces clear`, ...)
+answer with a one-line acknowledgement — `action`, `available`, `unavailableReason`, `capturing`, `retained`,
+`capacity`, and `totalCaptured`, the entries recorded since startup, which a clear does not reset — and the
+matching read command (`sql traces`, `tx list`, ...) prints the rows. See
+[Compact answers from scans and capture controls](AI-AGENTS.md#compact-answers-from-scans-and-capture-controls).
 
 Search commands such as `bootui config --query` share a `page` envelope instead, where `total` counts everything
 the panel can see *before* the query is applied and `matched` counts what the query kept. A large `total` beside
@@ -150,8 +167,18 @@ the panel can see *before* the query is applied and `matched` counts what the qu
 See [Reading a bounded result](AI-AGENTS.md#reading-a-bounded-result) for the full envelope, including the relaxed
 name matching that lets `bootui config --query bootui.mcp.enabled` find a value supplied as `BOOTUI_MCP_ENABLED`.
 
+Large reads answer with a short first page when no `--limit` is given, such as the newest 20 statements for
+`bootui sql traces`, the newest 20 calls for `bootui rest-client traces`, or 25 entries for `bootui activity`, and `page.hasMore` says when rows were left out: narrow
+`--query` or raise `--limit`. [Agent-sized defaults](AI-AGENTS.md#agent-sized-defaults) lists each command's default.
+A 1.x CLI keeps calling these commands, without the newer options, and gets the same short first page.
+
 Auto-detection is a convenience, not a contract: on a JDK 22 or later runtime a redirected stream can still
 report a console. Pass `--json` explicitly in scripts.
+
+Successful tool calls must contain JSON. An empty or whitespace-only response, including HTTP `204`, exits `1`
+without printing a fabricated result; literal JSON `null`, objects, arrays, and evolving tool payloads remain valid.
+`bootui tools` validates the BootUI catalog in both text and JSON modes, while accepting older catalogs and unknown
+extra fields.
 
 ### Retrieve more than the advisor preview
 
@@ -203,12 +230,15 @@ verify every finding before changing code.
 Such gaps remain explicit in diagnostics; increasing the retention budget does not manufacture missing identities.
 
 Only the latest completed snapshot is kept. A stale ID or no completed snapshot is HTTP 409: reread the
-cached `… report`, obtain its ID, and restart detail paging, **not** `… scan`. An unknown/non-finding rule
-is REST/MCP client error 404; the CLI facade preserves its existing mapping to HTTP 400 so an unknown rule is
-not mistaken for an unavailable command. Both exit `1` with the application's message. A missing scan ID is
+cached `… report`, obtain its ID, and restart detail paging, **not** `… scan`. A rule id outside the advisor's
+rule catalogue answers `Unknown advisor rule: ...`, and a catalogue rule without findings (passed, skipped, or failed)
+answers `Advisor rule has no findings in the current scan.`; both are REST 404 and MCP in-band `isError: true` failures,
+and the CLI facade preserves its
+existing mapping to HTTP 400 so an unknown rule is not mistaken for an unavailable command. Both exit `1` with the
+application's message. A missing scan ID is
 rejected before a detail read. Dismissal leaves the snapshot ID and its details intact.
 
-MCP also has a rendered-byte limit: `-32003` means retry the same offset and scan ID with a smaller limit,
+MCP also has a rendered-byte limit: `-32003` (legacy) or `-31003` (modern) means retry the same offset and scan ID with a smaller limit,
 not that the page was empty. The CLI's own result, timeout, and concurrency budgets still apply; do not advance
 the offset after any failure or silently rescan to recover. See [agent pagination guidance](AI-AGENTS.md#reading-retained-advisor-violations).
 
@@ -218,11 +248,23 @@ the offset after any failure or silently rescan to recover. See [agent paginatio
 | --- | --- |
 | `0` | The tool ran and answered. |
 | `1` | Usage error, a rejected argument, authentication was rejected, or the application could not be reached or did not answer. |
-| `2` | BootUI declined to run the tool: its panel is disabled, or read-only and the tool is an action. |
+| `2` | BootUI declined to run the tool: its panel is disabled, read-only and the tool is an action, or its CLI catalog confirms the endpoint is disabled. |
 | `3` | Reserved for a future severity threshold. |
 
-A tool that runs and rejects what you asked for — `bootui exceptions show` on an id that is not in the
-buffer, say — exits `1` and prints the application's own message. That is the same code as a usage error
+HTTP `503` alone is not a policy refusal. The CLI checks the target's BootUI catalog and reports endpoint disablement
+only when `enabled` is `false` and `tools` is empty. An outage, an invalid catalog, or a wrong target exits `1`, not
+the policy-skip code `2`; a catalog that still reports `enabled: true` cannot turn an outage into a skip.
+Direct MCP panel commands preserve BootUI's specific panel-policy reason on HTTP `403`, rather than suggesting an
+authentication token can bypass a disabled or read-only panel. Their existing exit codes are unchanged; actual
+authentication refusals keep the token/local-access guidance, and non-JSON error bodies are not printed.
+
+A command whose tool this application does not advertise exits `1` and says why: "This application does not expose
+'get_kafka_activity'." followed by the panel's own reason, such as a missing library or the Java agent, or the stacks
+that do offer it. It is not `2`, because no panel policy refused it; nothing here can serve it.
+
+A tool that runs and rejects what you asked for — `bootui exceptions show`, `bootui request-profile`,
+`bootui insights show`, `bootui insights compare`, or `bootui probe show` on an id that is unknown or no longer
+retained, say — exits `1` and prints the application's own message, which names where current ids come from. That is the same code as a usage error
 because it is the same kind of mistake: the command exists and BootUI was willing to run it, but the
 request was wrong, so retrying it unchanged cannot help.
 
@@ -240,6 +282,33 @@ esac
 
 ## Discovering what an application exposes
 
+`bootui --help` needs no running application and lists every command in one answer: its arguments, what it returns,
+where an `<id>` comes from, the words a `--query` understands, and one example. `bootui insights --help` lists one
+group the same way, and `bootui <command> --help` gives the whole description with the same example:
+
+```console
+$ bootui --help
+...
+  bootui insights impact <id>
+      For a route, bean, class, method (Class#method, with parameter types for
+      one overload, or a bare method...
+      <id>: A route, bean, class, Class#method or a bare method name,
+      repository, table, cache, host, or event type.
+      Example: bootui insights impact 'OrderService#total'
+...
+```
+
+Every action, a command that changes the application's state, is tagged `[action - needs approval]` in the listing and
+in its own help, so an agent asks the user before running it. A command's own help keeps the warnings the listing
+shortens, such as `memory scan` triggering a full GC or `probe start` needing separate approval and recording metadata
+only.
+
+Values in angle brackets in an example, such as `<id>` or `<scanId>`, come from the command the `<id>` line names;
+every other value is typed as shown. A command without arguments is shown as it runs, and one that only some stacks
+offer says which. The examples are generated with
+the command table and a test runs each one, so they cannot drift from the commands. `bootui tools` and the Command
+Line panel do not show them.
+
 The command table below is what this CLI was *built* with. What a *specific* application answers depends on
 its stack and its panel settings, and `bootui tools` reports that:
 
@@ -249,13 +318,36 @@ command                tool                   panel        arguments      status
 ---------------------  ---------------------  -----------  -------------  --------------
 beans                  get_beans              beans        query, limit   ready
 sql clear              clear_sql_traces       sql-trace    -              read-only
-sql traces             get_sql_traces         sql-trace    -              ready
+sql traces             get_sql_traces         sql-trace    query, limit   ready
 ```
 
 `status` is `ready` for a readable tool, `action` for one that changes state, `read-only` when the panel would
 refuse the action, and `panel disabled` when the panel is off. This is also how to see stack differences: a
 Quarkus application advertises fewer tools than Spring MVC, and some Spring tools appear only when the
 corresponding library is on the classpath.
+
+### Java agent sensor switches
+
+`bootui agent status --json` accepts `--query`, not `--limit`, and lists every matching sensor. The task and thread
+snapshot registries each retain at most 32,768 application entries across all claim generations, plus 64 reserved
+self-test markers. Inspect `overflow` and `neverApplied`: both are cumulative until the JVM exits, even after disabling
+the threads sensor. Once executor overflow has occurred, a reused task object can have run with a later submitter's
+request context; the Java Agent panel and the MCP/generated CLI help warn about this limit. Do not interpret affected
+propagation as proof of exact ownership.
+
+With the user's approval, `bootui agent sensor enable <id>` and `bootui agent sensor disable <id>` apply the same
+bounded runtime switch as `enable_agent_sensor` and `disable_agent_sensor` in MCP, on Spring MVC, Spring WebFlux,
+and Quarkus. Accepted ids are `threads`, `files`, `environment`, `thread-activity`, `thread-locals`, and `security-sinks`.
+Read `bootui agent status` and `bootui side-effects` first, explain the sensor's collection and performance trade-offs,
+and obtain approval before switching. Read status again to verify the result.
+
+The agent must be attached, armed for this application, and support runtime switches. The Java Agent panel's enabled
+and read-only policy applies. Invalid ids and switch refusals retain the panel's error message; panel policy refusals
+exit `2`, while invalid ids and unavailable-agent refusals exit `1`. Overrides last through later claims in this JVM,
+including DevTools restarts and Quarkus live reloads, but are not written to a file and disappear when the JVM exits.
+Enabling `security-sinks` cannot enable request-value matching unless `bootui.agent.security-sinks.request-values=true`
+was set at startup. See [Switching sensors at run time](features/java-agent.md#switching-sensors-at-run-time) for the
+privacy, overhead, and comparison limits.
 
 ### MySQL reads
 
@@ -292,8 +384,8 @@ See [MySQL](features/database.md#mysql).
 
 ### Investigating one request
 
-`bootui activity` lists what happened; `bootui request-profile` explains one request. List recent activity, pick a
-`REQUEST` entry whose `profileable` field is `true`, and pass its `id`:
+`bootui activity` lists what happened; `bootui request-profile` opens one request or execution. Pick a
+profileable `REQUEST`, `SCHEDULED`, or consumed `MESSAGING` entry (or a Runtime Insights exemplar) and pass its `id`:
 
 ```bash
 bootui activity --limit 50 --json \
@@ -302,11 +394,14 @@ bootui request-profile <id> --json
 bootui exceptions show <exceptionGroupId> --json
 ```
 
-The profile is the same masked document the Live Activity drawer shows and `GET /bootui/api/activity/request/{id}`
-returns: the request, its correlated SQL as normalized statement groups with N+1 flags and the call sites that issued
-them, exceptions with the `exceptionGroupId` that `bootui exceptions show` accepts, security events, REST client calls,
-cache accesses, timing, and notes. An id that is unknown or already evicted still exits `0`, with `available: false`
-and an `unavailableReason`.
+The result is a selection: `source: "journal"` has a `journal` timeline and touched resources, including scheduled and
+message executions; `source: "buffers"` has the legacy HTTP-exchange `buffers` profile, with N+1 groups, call sites,
+and exception `exceptionGroupId` values for `bootui exceptions show`. When both are retained for an HTTP request,
+`source` is `journal` and both fields are populated; read `buffers` for the richer HTTP details. The journal is consulted
+first, then the buffer. Both respect panel visibility and exposure policy. An id neither retains exits `1` with a
+message naming both windows, like any other unknown id. `source: "none"` with `available: false` and an
+`unavailableReason` (exit `0`) remains for what another id cannot fix: the runtime journal is off, the id's panel hides
+it, or the request carried nothing to correlate.
 
 The command is `request-profile`, at the top level, because `bootui activity` is itself a command and a command path
 cannot also be the parent of another. It is unavailable, and exits `2`, when the Live Activity panel is disabled. See
@@ -322,6 +417,11 @@ bootui mcp status
 bootui mcp enable
 bootui mcp disable
 ```
+
+These commands require a recognizable BootUI MCP status report with a typed `enabled` value, not an empty or generic
+JSON success. Missing, malformed, or unrecognized replies exit `1` without printing a successful result; an
+unconfirmed toggle reports an unknown outcome and is never retried automatically. This validation is specific to
+the MCP commands, not the dependency-free client's general support for bodyless panel actions.
 
 ## The Command Line panel
 
@@ -362,11 +462,12 @@ The CLI is designed for a job that starts the application, asks it something, an
 
 Three details make that work as a gate rather than as a job that merely looks green.
 
-**Gate on `severityCounts`, not on the finding array.** Every scan command reports `severityCounts` as
-`[{"severity": …, "count": …}]`, so one expression works for all of them. The array of findings themselves is
-*not* uniform — `pentest scan` calls it `findings`, the rule-based advisors call it `results` — so a filter
-written against the wrong name does not report zero findings, it aborts with `Cannot iterate over null` and
-fails the build for a reason that has nothing to do with the application.
+**Gate on `severityCounts`, not on a finding array.** Every scan command reports `severityCounts` as
+`[{"severity": …, "count": …}]`, so one expression works for all of them. A scan's `topFindings` lists at most ten
+findings, and the report commands do not name their array uniformly — `pentest report` calls it `findings`, the
+rule-based advisors call it `results` — so a filter written against the wrong name does not report zero findings,
+it aborts with `Cannot iterate over null` and fails the build for a reason that has nothing to do with the
+application.
 
 **Capture the exit code instead of letting it abort the step.** A step runs under `bash -e`, so a bare
 `bootui …` that exits non-zero skips the rest of the script, including the shutdown. The `|| status=$?` form
@@ -385,17 +486,28 @@ messages under `METADATA_ONLY`.
 
 ## Every command
 
+`bootui insights compare` respects source-panel policy and names disabled or unavailable evidence in `limitations`.
+Read these before treating an empty comparison as unchanged behavior. When HTTP Exchanges is hidden, every run
+reference retains `requests: 0` for JSON compatibility; the named limitation means that count is hidden, not zero
+traffic. Each broker's panel gates its messaging executions and edges independently.
+
 MCP tool names are listed so a mapping between an agent conversation and a shell script stays obvious. `all`
 means every stack advertises the tool; anything else names the stacks that do. Whether an application really
 exposes a tool is still what `bootui tools` says.
 
 | Command | MCP tool | Arguments | Kind | Stacks |
 | --- | --- | --- | --- | --- |
-| `bootui activity` | `get_live_activity` | `--limit` | read | all |
+| `bootui activity` | `get_live_activity` | `--query`, `--limit` | read | all |
+| `bootui agent status` | `get_agent_status` | `--query` | read | all |
+| `bootui agent sensor disable` | `disable_agent_sensor` | `<id>` (switchable sensor); needs approval | action | all |
+| `bootui agent sensor enable` | `enable_agent_sensor` | `<id>` (switchable sensor); needs approval | action | all |
 | `bootui ai overview` | `get_ai_overview` | — | read | all |
 | `bootui architecture report` | `get_architecture_report` | — | read | all |
 | `bootui architecture violations` | `get_architecture_rule_violations` | `<id> --scan-id <scanId> [--offset N] [--limit N]` | read | all |
 | `bootui architecture scan` | `architecture_scan` | — | action | all |
+| `bootui code inventory` | `get_code_inventory` | `[--query Q] [--limit N]` | read | all |
+| `bootui code paths` | `get_code_paths` | `[--query Q] [--limit N]` | read | all |
+| `bootui side-effects` | `get_side_effects` | `[--query Q] [--limit N]` | read | all |
 | `bootui beans` | `get_beans` | `--query`, `--limit` | read | all |
 | `bootui cache` | `get_cache_stats` | — | read | all |
 | `bootui conditions` | `get_conditions` | `--query`, `--limit` | read | Spring MVC, WebFlux |
@@ -426,14 +538,19 @@ exposes a tool is still what `bootui tools` says.
 | `bootui hibernate report` | `get_hibernate_report` | — | read | all |
 | `bootui hibernate violations` | `get_hibernate_rule_violations` | `<id> --scan-id <scanId> [--offset N] [--limit N]` | read | all |
 | `bootui hibernate scan` | `hibernate_scan` | — | action | all |
+| `bootui hibernate statistics` | `get_hibernate_statistics` | — | read | all |
 | `bootui http exchanges` | `get_http_exchanges` | `--limit` | read | all |
 | `bootui http routes` | `get_http_routes` | `--limit` | read | all |
 | `bootui http sessions` | `get_http_sessions` | — | read | Spring MVC |
+| `bootui insights compare` | `get_runtime_run_comparison` | `[<id>]` (defaults to `previous`, or a run id) | read | all |
+| `bootui insights impact` | `get_runtime_impact` | `<id>` | read | all |
+| `bootui insights list` | `get_runtime_insights` | `--query` (`all` adds the rows the default list leaves out), `--limit` | read | all |
+| `bootui insights show` | `get_runtime_insight` | `<id>` | read | all |
 | `bootui jms` | `get_jms_activity` | — | read | Spring MVC, WebFlux |
 | `bootui jvm tuning` | `get_jvm_tuning` | — | read | all |
 | `bootui kafka` | `get_kafka_activity` | — | read | all |
 | `bootui loggers` | `get_loggers` | `--query`, `--limit` | read | all |
-| `bootui logs tail` | `get_log_tail` | — | read | all |
+| `bootui logs tail` | `get_log_tail` | `--query`, `--limit` | read | all |
 | `bootui mail` | `get_emails` | — | read | all |
 | `bootui mappings` | `get_mappings` | `--query`, `--limit` | read | all |
 | `bootui memory heap analyze` | `analyze_heap_dump` | — | action | all |
@@ -446,6 +563,8 @@ exposes a tool is still what `bootui tools` says.
 | `bootui overview` | `get_overview` | — | read | all |
 | `bootui pentest report` | `get_pentest_report` | — | read | all |
 | `bootui pentest scan` | `pentest_scan` | — | action | all |
+| `bootui probe show` | `get_method_probe` | `<id>` | read | all |
+| `bootui probe start` | `start_method_probe` | `<id>` (the method, `binary.Class#name`); ask the user for separate approval first | action | all |
 | `bootui profile diff` | `get_profile_diff` | — | read | all |
 | `bootui rabbitmq` | `get_rabbitmq_activity` | — | read | all |
 | `bootui repositories` | `get_spring_data_repositories` | — | read | Spring MVC, WebFlux |
@@ -456,23 +575,23 @@ exposes a tool is still what `bootui tools` says.
 | `bootui rest-client clear` | `clear_rest_client_traces` | — | action | all |
 | `bootui rest-client pause` | `pause_rest_client_recording` | — | action | all |
 | `bootui rest-client resume` | `resume_rest_client_recording` | — | action | all |
-| `bootui rest-client traces` | `get_rest_client_traces` | — | read | all |
+| `bootui rest-client traces` | `get_rest_client_traces` | `--query`, `--limit` | read | all |
 | `bootui scheduled` | `get_scheduled_tasks` | — | read | all |
 | `bootui security config` | `get_spring_security` | — | read | Spring MVC, WebFlux |
 | `bootui security logs` | `get_security_logs` | `--limit` | read | all |
 | `bootui security report` | `get_security_report` | — | read | all |
 | `bootui security violations` | `get_security_rule_violations` | `<id> --scan-id <scanId> [--offset N] [--limit N]` | read | all |
 | `bootui security scan` | `security_scan` | — | action | all |
-| `bootui sessions claude` | `get_claude_code_sessions` | — | read | all |
-| `bootui sessions copilot` | `get_copilot_sessions` | — | read | all |
+| `bootui sessions claude` | `get_claude_code_sessions` | `--query`, `--limit` | read | all |
+| `bootui sessions copilot` | `get_copilot_sessions` | `--query`, `--limit` | read | all |
 | `bootui spring report` | `get_spring_report` | — | read | all |
 | `bootui spring violations` | `get_spring_rule_violations` | `<id> --scan-id <scanId> [--offset N] [--limit N]` | read | all |
 | `bootui spring scan` | `spring_scan` | — | action | all |
 | `bootui sql clear` | `clear_sql_traces` | — | action | all |
 | `bootui sql pause` | `pause_sql_trace_recording` | — | action | all |
 | `bootui sql resume` | `resume_sql_trace_recording` | — | action | all |
-| `bootui sql traces` | `get_sql_traces` | — | read | all |
-| `bootui startup` | `get_startup_timeline` | — | read | Spring MVC, WebFlux |
+| `bootui sql traces` | `get_sql_traces` | `--query`, `--limit` | read | all |
+| `bootui startup` | `get_startup_timeline` | `--query`, `--limit` | read | Spring MVC, WebFlux |
 | `bootui threads` | `get_threads` | `--query`, `--limit` | read | all |
 | `bootui traces clear` | `clear_traces` | — | action | all |
 | `bootui traces list` | `get_traces` | `--limit` | read | all |
@@ -480,12 +599,18 @@ exposes a tool is still what `bootui tools` says.
 | `bootui tx list` | `get_transactions` | — | read | Spring MVC, WebFlux |
 | `bootui tx pause` | `pause_transaction_recording` | — | action | Spring MVC, WebFlux |
 | `bootui tx resume` | `resume_transaction_recording` | — | action | Spring MVC, WebFlux |
-| `bootui vulnerabilities report` | `get_vulnerabilities_report` | — | read | all |
+| `bootui vulnerabilities report` | `get_vulnerabilities_report` | `--query`, `--limit` | read | all |
 | `bootui vulnerabilities scan` | `vulnerabilities_scan` | — | action | all |
+| `bootui websockets` | `get_websockets` | — | read | all |
 
 ## Building on it
 
-The transport lives in `bootui-client`, a small library with no dependencies at all — no Jackson, no HTTP
-client beyond the JDK's — that handles the URL, the token, the request, and the outcome mapping. It treats
-payloads as opaque JSON on purpose, so a client built against one BootUI version keeps working against an
-application running another. That is what a future Maven plugin, or your own tooling, would build on.
+The transport is the `io.github.jdubois.bootui.client` package of `bootui-cli`, a small client with no dependencies
+at all — no Jackson, no picocli, no HTTP client beyond the JDK's — that handles the URL, the token, the request, and
+the outcome mapping. It treats payloads as opaque JSON on purpose, so a client built against one BootUI version keeps
+working against an application running another. That is what a future Maven plugin, or your own tooling, would build
+on.
+
+Depend on `com.julien-dubois.bootui:bootui-cli` for it: picocli is an optional dependency, so the client brings
+nothing onto your classpath. That plain jar is a library, not a runnable CLI; to run the CLI, use the shaded
+`bootui-cli-<version>-all.jar` described above. Before BootUI 2.0, the client was its own `bootui-client` artifact.

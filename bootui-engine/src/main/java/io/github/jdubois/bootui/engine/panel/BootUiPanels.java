@@ -72,7 +72,12 @@ public final class BootUiPanels {
     public static final String REST_CLIENT_TRACE = "rest-client-trace";
     public static final String MCP_SERVER = "mcp-server";
     public static final String CLI = "cli";
+    public static final String JAVA_AGENT = "java-agent";
     public static final String ACTIVITY = "activity";
+    public static final String RUNTIME_INSIGHTS = "runtime-insights";
+    public static final String CODE_INVENTORY = "code-inventory";
+    public static final String CODE_PATHS = "code-paths";
+    public static final String SIDE_EFFECTS = "side-effects";
     public static final String EMAIL = "email";
     public static final String KAFKA = "kafka";
     public static final String RABBITMQ = "rabbitmq";
@@ -81,16 +86,16 @@ public final class BootUiPanels {
     public static final String WEBSOCKETS = "websockets";
 
     private static final List<Panel> PANELS = List.of(
-            // Overview registers no API prefix on purpose: GET /bootui/api/overview is the shell's
-            // framework-neutral chrome data source (it also primes the CSRF cookie), so it must answer
-            // regardless of the Overview dashboard panel's enabled/read-only toggle. The panel id still
-            // gates the MCP get_overview tool and drives the sidebar entry; only PanelAccessFilter's
-            // path-based gating is intentionally bypassed.
-            new Panel(OVERVIEW, "Overview", false, List.of()),
+            // The Scorecard panel keeps its original `overview` id and registers no API prefix on purpose:
+            // GET /bootui/api/overview is the shell's framework-neutral chrome data source (it also primes
+            // the CSRF cookie), so it must answer regardless of the Scorecard panel's enabled/read-only
+            // toggle. The panel id still gates the MCP get_overview tool and drives the sidebar entry; only
+            // PanelAccessFilter's path-based gating is intentionally bypassed.
+            new Panel(OVERVIEW, "Scorecard", false, List.of()),
             new Panel(HEALTH, "Health", false, "/health"),
             new Panel(HTTP_SESSIONS, "HTTP Sessions", true, "/http-sessions"),
             new Panel(METRICS, "Metrics", false, "/metrics"),
-            new Panel(LIVE_MEMORY, "Live Memory", false, "/live-memory"),
+            new Panel(LIVE_MEMORY, "Live Memory", true, "/live-memory"),
             new Panel(JVM_TUNING, "JVM Tuning", false, "/jvm-tuning"),
             new Panel(HEAP_DUMP, "Heap Dump", true, "/heap-dump"),
             new Panel(THREADS, "Threads", true, "/threads"),
@@ -138,14 +143,19 @@ public final class BootUiPanels {
             new Panel(REST_CLIENT_TRACE, "REST Client", true, "/rest-client-trace"),
             new Panel(AI, "AI Framework", false, "/ai"),
             new Panel(MCP_SERVER, "MCP Server", true, "/mcp-server"),
-            // Like Overview, the Command Line panel registers no API prefix on purpose. Its data source,
+            // Like Scorecard, the Command Line panel registers no API prefix on purpose. Its data source,
             // GET /bootui/api/cli, is the command-line client's own transport endpoint, gated by
             // bootui.cli.enabled so the `bootui` CLI keeps a single honest switch. Letting this panel's
             // prefix gate it too would mean turning off a UI panel silently breaks CI jobs, and a read-only
             // toggle here would refuse action tools whose own panel is perfectly writable. The panel id
             // therefore drives only the sidebar entry and its enable/read-only toggles.
             new Panel(CLI, "Command Line", false, List.of()),
+            new Panel(JAVA_AGENT, "Java Agent", true, "/java-agent"),
             new Panel(ACTIVITY, "Live Activity", true, "/activity"),
+            new Panel(RUNTIME_INSIGHTS, "Runtime Insights", true, "/runtime-insights"),
+            new Panel(CODE_INVENTORY, "Code Inventory", false, "/code-inventory"),
+            new Panel(CODE_PATHS, "Code Paths", true, "/code-paths"),
+            new Panel(SIDE_EFFECTS, "Side Effects", false, "/side-effects"),
             new Panel(EMAIL, "Email", true, "/email"),
             new Panel(KAFKA, "Kafka", true, "/kafka"),
             new Panel(RABBITMQ, "RabbitMQ", true, "/rabbitmq"),

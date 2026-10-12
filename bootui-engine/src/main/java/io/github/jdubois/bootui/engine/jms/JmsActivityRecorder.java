@@ -1,5 +1,14 @@
 package io.github.jdubois.bootui.engine.jms;
 
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.MessagingPayload;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -21,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><strong>Only metadata is captured, never the message body or arbitrary properties.</strong>
  * Provider-assigned message IDs are retained only as truncated SHA-256 hashes when enabled.
  */
-public final class JmsActivityRecorder {
+public final class JmsActivityRecorder implements RuntimeEventPublisher, MemoryOffloadable {
 
     private static final int MAX_METADATA_LENGTH = 200;
 
@@ -40,7 +49,68 @@ public final class JmsActivityRecorder {
             boolean success,
             String failureType,
             String subscriptionName,
-            String listenerId) {}
+            String listenerId,
+
+            String requestId,
+
+            String executionId) {
+
+        /** Without BootUI's execution identity. */
+        public CapturedMessage(
+                long id,
+                long timestamp,
+                Direction direction,
+                String destination,
+                String messageId,
+                Long durationMillis,
+                boolean success,
+                String failureType,
+                String subscriptionName,
+                String listenerId,
+                String requestId) {
+
+            this(
+                    id,
+                    timestamp,
+                    direction,
+                    destination,
+                    messageId,
+                    durationMillis,
+                    success,
+                    failureType,
+                    subscriptionName,
+                    listenerId,
+                    requestId,
+                    null);
+        }
+
+        /** Without BootUI's execution identity. */
+        public CapturedMessage(
+                long id,
+                long timestamp,
+                Direction direction,
+                String destination,
+                String messageId,
+                Long durationMillis,
+                boolean success,
+                String failureType,
+                String subscriptionName,
+                String listenerId) {
+
+            this(
+                    id,
+                    timestamp,
+                    direction,
+                    destination,
+                    messageId,
+                    durationMillis,
+                    success,
+                    failureType,
+                    subscriptionName,
+                    listenerId,
+                    null);
+        }
+    }
 
     private final boolean enabled;
     private final boolean captureMessageId;
@@ -49,6 +119,8 @@ public final class JmsActivityRecorder {
 
     private final Deque<CapturedMessage> buffer = new ArrayDeque<>();
     private final Object lock = new Object();
+    private final CorrelationSource correlation = new CorrelationSource();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
     private final AtomicLong sequence = new AtomicLong();
     private final AtomicLong totalCaptured = new AtomicLong();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
@@ -76,9 +148,36 @@ public final class JmsActivityRecorder {
         return maxMessageIdLength;
     }
 
+    /**
+     * Replaces the source of the correlation stamped on each message ({@code docs/PLAN-v2.md} §5.1): the sender's
+     * request or execution for an outgoing message, and the listener's own execution for a consumed one. Defaults to
+     * the thread's correlation scope; passing {@code null} restores it.
+     */
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded message right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
+    }
+
     public void recordProduce(
             String destination, String messageId, Long durationMillis, boolean success, String failureType) {
-        record(Direction.PRODUCE, destination, messageId, durationMillis, success, failureType, null, null);
+        record(
+                Direction.PRODUCE,
+                destination,
+                messageId,
+                RuntimeEvent.millisToNanos(durationMillis),
+                success,
+                failureType,
+                null,
+                null,
+                correlation.current());
     }
 
     public void recordConsume(
@@ -93,41 +192,103 @@ public final class JmsActivityRecorder {
                 Direction.CONSUME,
                 destination,
                 messageId,
-                durationMillis,
+                RuntimeEvent.millisToNanos(durationMillis),
                 success,
                 failureType,
                 subscriptionName,
-                listenerId);
+                listenerId,
+                correlation.current());
+    }
+
+    /**
+     * Records a send timed in nanoseconds: the panel keeps milliseconds, and the runtime journal the nanoseconds
+     * ({@code docs/PLAN-v2.md} §5.2).
+     */
+    public void recordProduceNanos(
+            String destination, String messageId, Long durationNanos, boolean success, String failureType) {
+        record(
+                Direction.PRODUCE,
+                destination,
+                messageId,
+                durationNanos,
+                success,
+                failureType,
+                null,
+                null,
+                correlation.current());
+    }
+
+    /**
+     * Records a consumed message timed in nanoseconds: the panel keeps milliseconds, and the runtime journal the
+     * nanoseconds ({@code docs/PLAN-v2.md} §5.2).
+     */
+    public void recordConsumeNanos(
+            String destination,
+            String messageId,
+            Long durationNanos,
+            boolean success,
+            String failureType,
+            String subscriptionName,
+            String listenerId) {
+        record(
+                Direction.CONSUME,
+                destination,
+                messageId,
+                durationNanos,
+                success,
+                failureType,
+                subscriptionName,
+                listenerId,
+                correlation.current());
     }
 
     private void record(
             Direction direction,
             String destination,
             String messageId,
-            Long durationMillis,
+            Long durationNanos,
             boolean success,
             String failureType,
             String subscriptionName,
-            String listenerId) {
+            String listenerId,
+            CorrelationContext context) {
         if (!enabled) {
             return;
         }
+        long nanos = durationNanos == null || durationNanos < 0 ? -1 : durationNanos;
         CapturedMessage entry = new CapturedMessage(
                 sequence.incrementAndGet(),
                 System.currentTimeMillis(),
                 direction,
                 truncate(destination),
                 captureMessageId ? hashMessageId(messageId, maxMessageIdLength) : null,
-                durationMillis == null ? null : Math.max(0, durationMillis),
+                nanos < 0 ? null : nanos / 1_000_000,
                 success,
                 success ? null : truncate(failureType),
                 truncate(subscriptionName),
-                truncate(listenerId));
+                truncate(listenerId),
+                context.requestId(),
+                context.executionId());
         synchronized (lock) {
             buffer.addLast(entry);
             if (buffer.size() > maxEntries) {
                 buffer.removeFirst();
             }
+        }
+        boolean sent = direction == Direction.PRODUCE;
+        try {
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.MESSAGING,
+                    RuntimeEvent.startMillis(entry.timestamp(), nanos),
+                    nanos,
+                    context,
+                    sent ? null : Thread.currentThread().getName(),
+                    null,
+                    !success,
+                    new MessagingPayload(
+                            "jms", sent, entry.destination(), !success, sent ? null : context.linkedTraceId())));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the message it observes.
         }
         totalCaptured.incrementAndGet();
         notifyListeners();
@@ -143,6 +304,24 @@ public final class JmsActivityRecorder {
 
     public long totalCaptured() {
         return totalCaptured.get();
+    }
+
+    @Override
+    public String offloadId() {
+        return "jms";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "JMS messages";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recent().size();
+        clear();
+        return retained;
     }
 
     public void clear() {

@@ -1,7 +1,12 @@
 <script setup>
-import {apiFetch, getJson} from '../api.js'
+import {ApiError, getJson} from '../api.js'
 import {computed, ref} from 'vue'
-import {formatLoadError} from '../utils/loadError.js'
+import {describeLoadError, formatLoadError} from '../utils/loadError.js'
+import {
+  diagnosticActionError,
+  getDiagnosticAcknowledgement,
+  isMcpServerStatus
+} from '../utils/diagnosticAcknowledgement.js'
 import {panelProps, usePanelState} from '../utils/panelState.js'
 import {useAutoRefresh} from '../utils/useAutoRefresh.js'
 import {useCopyToClipboard} from '../utils/useCopyToClipboard.js'
@@ -10,20 +15,27 @@ import {getBootUiApiPath} from '../utils/bootUiPath.js'
 import FlashBanner from './components/FlashBanner.vue'
 import PanelHeader from './components/PanelHeader.vue'
 import PanelSkeleton from './components/PanelSkeleton.vue'
+import PanelTabs from './components/PanelTabs.vue'
 import ReadOnlyNotice from './components/ReadOnlyNotice.vue'
 import UnavailableState from './components/UnavailableState.vue'
 
 const props = defineProps(panelProps)
 const {readOnly, readOnlyReason, manifestAvailable, manifestUnavailableReason} = usePanelState(props)
 const status = ref(null)
+const error = ref(null)
 const toggling = ref(false)
 const lastFetched = ref(null)
 const {message: banner, flash, clear} = useFlashMessage(8000)
 const {copiedKey, copyToClipboard} = useCopyToClipboard(2000)
+let statusVersion = 0
 
 const enabled = computed(() => status.value?.enabled === true)
 const actionTools = computed(() => (status.value?.tools ?? []).filter((tool) => tool.action))
 const readTools = computed(() => (status.value?.tools ?? []).filter((tool) => !tool.action))
+const protocolVersions = computed(() => {
+  const versions = status.value?.supportedProtocolVersions
+  return Array.isArray(versions) && versions.length ? versions : [status.value?.protocolVersion].filter(Boolean)
+})
 
 const endpointUrl = computed(() => {
   const path = getBootUiApiPath() + '/mcp'
@@ -92,30 +104,25 @@ function clientPanelId(id) {
   return `mcp-client-${id}-panel`
 }
 
-function onClientTabKeydown(event, currentId) {
-  const currentIndex = clients.findIndex((client) => client.id === currentId)
-  let targetIndex = null
-  if (event.key === 'ArrowRight') targetIndex = (currentIndex + 1) % clients.length
-  else if (event.key === 'ArrowLeft') targetIndex = (currentIndex - 1 + clients.length) % clients.length
-  else if (event.key === 'Home') targetIndex = 0
-  else if (event.key === 'End') targetIndex = clients.length - 1
-  if (targetIndex === null) return
-  event.preventDefault()
-  const target = clients[targetIndex].id
-  activeClient.value = target
-  document.getElementById(clientTabId(target))?.focus()
-}
-
-async function fetchStatus() {
+async function fetchStatus({preserveActionMessage = false} = {}) {
+  const version = statusVersion
+  error.value = null
   try {
-    status.value = await getJson('api/mcp-server')
+    const loaded = await getJson('api/mcp-server')
+    if (!isMcpServerStatus(loaded)) throw new Error('Invalid MCP server status response')
+    if (version !== statusVersion) return
+    status.value = loaded
     lastFetched.value = Date.now()
   } catch (e) {
-    flash(formatLoadError(e, 'Could not load MCP server status'), 'danger')
+    if (version !== statusVersion) return
+    error.value = describeLoadError(e, 'Could not load MCP server status')
+    if (!preserveActionMessage) flash(formatLoadError(e, 'Could not load MCP server status'), 'danger')
   }
 }
 
-async function toggle() {
+async function toggle(event) {
+  // The native switch follows the accepted report, not the click.
+  if (event?.target instanceof HTMLInputElement) event.target.checked = enabled.value
   if (readOnly.value) {
     flash(readOnlyReason.value, 'warning')
     return
@@ -123,28 +130,30 @@ async function toggle() {
   const target = !enabled.value
   toggling.value = true
   try {
-    const res = await apiFetch('api/mcp-server/toggle', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: target})
-    })
-    const result = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      flash(result.message || result.error || `HTTP ${res.status}`, 'warning')
-      await load()
-      return
-    }
+    const result = await getDiagnosticAcknowledgement(
+      'api/mcp-server/toggle',
+      {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: target})
+      },
+      isMcpServerStatus
+    )
+    statusVersion++
     status.value = result
     lastFetched.value = Date.now()
     flash(result.enabled ? 'MCP server enabled.' : 'MCP server disabled.', result.enabled ? 'success' : 'secondary')
+    await loadAfterCurrent({preserveActionMessage: true})
   } catch (e) {
-    flash(formatLoadError(e, 'Could not toggle the MCP server'), 'danger')
+    statusVersion++
+    flash(diagnosticActionError(e, 'Could not toggle the MCP server'), e instanceof ApiError ? 'warning' : 'danger')
+    await loadAfterCurrent({preserveActionMessage: true})
   } finally {
     toggling.value = false
   }
 }
 
-const {autoRefresh, loading, load} = useAutoRefresh(fetchStatus, {enabled: manifestAvailable})
+const {autoRefresh, loading, load, loadAfterCurrent} = useAutoRefresh(fetchStatus, {enabled: manifestAvailable})
 </script>
 
 <template>
@@ -154,6 +163,7 @@ const {autoRefresh, loading, load} = useAutoRefresh(fetchStatus, {enabled: manif
       title="MCP Server"
       subtitle="Expose BootUI advisors and read-only diagnostics to local AI agents over the Model Context Protocol."
       :loading="loading"
+      :error="error"
       :last-fetched="lastFetched"
       v-model:auto-refresh="autoRefresh"
       @refresh="load"
@@ -247,9 +257,16 @@ const {autoRefresh, loading, load} = useAutoRefresh(fetchStatus, {enabled: manif
                 </dd>
                 <dt class="col-5 text-muted fw-normal">Transport</dt>
                 <dd class="col-7">{{ status.transport }}</dd>
-                <dt class="col-5 text-muted fw-normal">Protocol</dt>
-                <dd class="col-7">
-                  <code>{{ status.protocolVersion }}</code>
+                <dt class="col-5 text-muted fw-normal">Protocols</dt>
+                <dd class="col-7" data-testid="mcp-protocols">
+                  <span v-for="(version, index) in protocolVersions" :key="version"
+                    ><code>{{ version }}</code
+                    ><span v-if="index < protocolVersions.length - 1">, </span></span
+                  >
+                  <div v-if="protocolVersions.length > 1" class="text-muted">
+                    Clients on <code>{{ protocolVersions[0] }}</code> can follow long scans' progress and cancel them by
+                    closing the call.
+                  </div>
                 </dd>
                 <dt class="col-5 text-muted fw-normal">Server</dt>
                 <dd class="col-7">
@@ -259,6 +276,20 @@ const {autoRefresh, loading, load} = useAutoRefresh(fetchStatus, {enabled: manif
                 <dd class="col-7">{{ status.toolCount }}</dd>
                 <dt class="col-5 text-muted fw-normal">Max results</dt>
                 <dd class="col-7">{{ status.maxResults }}</dd>
+                <dt class="col-5 text-muted fw-normal">Tool calls</dt>
+                <dd class="col-7" data-testid="mcp-call-stats">
+                  {{ status.callCount ?? 0 }}
+                  <span class="text-muted"
+                    >· {{ status.timeouts ?? 0 }} timed out · {{ status.cancellations ?? 0 }} cancelled</span
+                  >
+                </dd>
+                <template v-if="status.progressDropped > 0">
+                  <dt class="col-5 text-muted fw-normal">Progress dropped</dt>
+                  <dd class="col-7" data-testid="mcp-progress-dropped">
+                    {{ status.progressDropped }}
+                    <span class="text-muted">over <code>bootui.mcp.max-response-bytes</code></span>
+                  </dd>
+                </template>
               </dl>
             </div>
           </div>
@@ -320,24 +351,15 @@ const {autoRefresh, loading, load} = useAutoRefresh(fetchStatus, {enabled: manif
             </button>
           </div>
 
-          <ul class="nav nav-tabs mb-3" role="tablist" aria-label="MCP client">
-            <li v-for="client in clients" :key="client.id" class="nav-item">
-              <button
-                :id="clientTabId(client.id)"
-                :aria-controls="clientPanelId(client.id)"
-                :aria-selected="activeClient === client.id"
-                :class="{active: activeClient === client.id}"
-                :tabindex="activeClient === client.id ? 0 : -1"
-                class="nav-link"
-                role="tab"
-                type="button"
-                @click="activeClient = client.id"
-                @keydown="onClientTabKeydown($event, client.id)"
-              >
-                {{ client.label }}
-              </button>
-            </li>
-          </ul>
+          <PanelTabs
+            class="mb-3"
+            :tabs="clients"
+            :selected="activeClient"
+            :tab-id="clientTabId"
+            :panel-id="clientPanelId"
+            label="MCP client"
+            @select="activeClient = $event"
+          />
 
           <div
             v-for="client in clients"

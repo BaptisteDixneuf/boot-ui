@@ -27,11 +27,15 @@ import {describeLoadError} from './utils/loadError.js'
 import {
   buildDocumentTitle,
   createPanelLookup,
+  HOME_NAVIGATION_GROUP,
+  NAVIGATION_GROUPS as semanticNavigationGroups,
   panelDisabledReason,
   resolveRouteTitle,
   routeAvailabilityLabel as routeAccessibleLabel,
+  routeMovesToUnavailableGroup as movesToUnavailableGroup,
   routeStatusIcon as panelStatusIcon,
-  routeUnavailable as isRouteUnavailable
+  routeUnavailable as isRouteUnavailable,
+  UNAVAILABLE_NAVIGATION_GROUP as unavailableNavigationGroup
 } from './utils/panelNavigation.js'
 import {recordRecentPanel} from './utils/recentPanels.js'
 import {safeLocalStorage} from './utils/safeStorage.js'
@@ -310,21 +314,6 @@ function onStorageChange(event) {
   }
 }
 
-const semanticNavigationGroups = [
-  {key: 'advisors', title: 'Advisors', icon: 'bi-clipboard2-check'},
-  {key: 'runtime', title: 'Runtime', icon: 'bi-activity'},
-  {key: 'configuration', title: 'Configuration', icon: 'bi-sliders'},
-  {key: 'database', title: 'Database', icon: 'bi-database'},
-  {key: 'security', title: 'Security', icon: 'bi-shield-lock'},
-  {key: 'services', title: 'Services', icon: 'bi-hdd-network'},
-  {key: 'diagnostics', title: 'Diagnostics', icon: 'bi-search'},
-  {key: 'developer-tools', title: 'Developer tools', icon: 'bi-tools'}
-]
-const unavailableNavigationGroup = {
-  key: 'unavailable',
-  title: 'Disabled / unavailable',
-  icon: 'bi-slash-circle'
-}
 const routes = router.options.routes.filter((r) => r.name)
 const EXPANDED_GROUPS_STORAGE_KEY = 'bootui.expandedGroups'
 
@@ -420,23 +409,23 @@ function navTitle(r) {
   return resolveRouteTitle(r, panels.value?.platform)
 }
 const navigationSections = computed(() => {
+  /** @type {Array<{key: string, title: string, icon?: string, collapsible: boolean, unavailable?: boolean, routes: typeof routes}>} */
   const sections = [
     {
-      key: 'overview',
-      title: 'Overview',
+      ...HOME_NAVIGATION_GROUP,
       collapsible: false,
-      routes: routes.filter((r) => r.meta?.group === 'overview')
+      routes: routes.filter((r) => r.meta?.group === HOME_NAVIGATION_GROUP.key)
     }
   ]
 
   for (const group of semanticNavigationGroups) {
-    const groupRoutes = routes.filter((r) => r.meta?.group === group.key && !routeUnavailable(r))
+    const groupRoutes = routes.filter((r) => r.meta?.group === group.key && !routeInUnavailableGroup(r))
     if (groupRoutes.length) {
       sections.push({...group, collapsible: true, unavailable: false, routes: groupRoutes})
     }
   }
 
-  const unavailableRoutes = routes.filter((r) => r.meta?.group !== 'overview' && routeUnavailable(r))
+  const unavailableRoutes = routes.filter((r) => r.meta?.group !== 'home' && routeInUnavailableGroup(r))
   if (unavailableRoutes.length) {
     sections.push({...unavailableNavigationGroup, collapsible: true, unavailable: true, routes: unavailableRoutes})
   }
@@ -445,8 +434,8 @@ const navigationSections = computed(() => {
 })
 const activeNavigationGroupKey = computed(() => {
   const currentRoute = activeRoute.value
-  if (!currentRoute || currentRoute.meta?.group === 'overview') return null
-  return routeUnavailable(currentRoute) ? unavailableNavigationGroup.key : currentRoute.meta?.group
+  if (!currentRoute || currentRoute.meta?.group === 'home') return null
+  return routeInUnavailableGroup(currentRoute) ? unavailableNavigationGroup.key : currentRoute.meta?.group
 })
 
 async function loadOverview() {
@@ -522,6 +511,10 @@ async function authenticate() {
 
 function routeUnavailable(r) {
   return isRouteUnavailable(r, panelLookup.value)
+}
+
+function routeInUnavailableGroup(r) {
+  return movesToUnavailableGroup(r, panelLookup.value)
 }
 
 function routeStatusIcon(r) {
@@ -719,7 +712,7 @@ function onGlobalKeydown(e) {
         @keydown="onMobileNavKeydown"
       >
         <div class="brand-area">
-          <router-link v-slot="{href, navigate}" custom to="/overview">
+          <router-link v-slot="{href, navigate}" custom to="/scorecard">
             <a :href="href" class="brand-card text-decoration-none" @click="onSidebarLinkClick(navigate, $event)">
               <span class="brand-mark"><i class="bi bi-cup-hot-fill"></i></span>
               <span class="brand-text">
@@ -749,7 +742,7 @@ function onGlobalKeydown(e) {
             v-for="section in navigationSections"
             :key="section.key"
             :class="{
-              'bootui-nav-section--overview': !section.collapsible,
+              'bootui-nav-section--home': !section.collapsible,
               'bootui-nav-section--unavailable': section.unavailable
             }"
             class="bootui-nav-section"
@@ -1103,6 +1096,23 @@ function onGlobalKeydown(e) {
   --bootui-nav-group-color: var(--bootui-text-muted);
   --bootui-nav-link-color: #334155;
 
+  /* Panel tabs (PanelTabs.vue). They follow the nav link states by default, so a
+     theme that repaints its nav repaints its tabs; a skin overrides these only
+     where its own tab idiom differs, and adds geometry in its theme-<id>.css. */
+  --bootui-tab-tray-bg: var(--bootui-surface-alt);
+  --bootui-tab-tray-border: var(--bootui-border);
+  --bootui-tab-tray-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.05);
+  --bootui-tab-tray-padding: 0.22rem;
+  --bootui-tab-gap: 0.2rem;
+  --bootui-tab-bg: transparent;
+  --bootui-tab-color: var(--bootui-text-muted);
+  --bootui-tab-hover-bg: var(--bootui-nav-hover-bg);
+  --bootui-tab-hover-color: var(--bootui-nav-hover-color);
+  --bootui-tab-active-bg: var(--bootui-nav-active-bg);
+  --bootui-tab-active-color: var(--bootui-nav-active-color);
+  --bootui-tab-active-shadow: 0 0.3rem 0.75rem rgba(25, 135, 84, 0.2);
+  --bootui-tab-disabled-color: var(--bootui-text-subtle);
+
   /* Data visualization */
   --bootui-chart-grid: #dee2e6;
   --bootui-chart-axis: #56667b;
@@ -1235,6 +1245,10 @@ function onGlobalKeydown(e) {
   --bootui-nav-group-color: var(--bootui-text-muted);
   --bootui-nav-link-color: #cbd5e1;
 
+  /* Panel tabs: the light tray's hairline shadow vanishes on dark surfaces. */
+  --bootui-tab-tray-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+  --bootui-tab-active-shadow: 0 0.3rem 0.75rem rgba(0, 0, 0, 0.35);
+
   /* Data visualization */
   --bootui-chart-grid: #475569;
   --bootui-chart-axis: #a3b1c6;
@@ -1308,14 +1322,6 @@ function onGlobalKeydown(e) {
   --bs-alert-bg: rgba(96, 165, 250, 0.1);
   --bs-alert-border-color: rgba(96, 165, 250, 0.2);
   --bs-alert-color: #93c5fd;
-}
-
-:global(:root[data-bootui-theme='dark'] .btn-outline-secondary) {
-  --bs-btn-color: var(--bootui-text-muted);
-  --bs-btn-border-color: var(--bootui-border-alt);
-  --bs-btn-hover-bg: rgba(226, 232, 240, 0.08);
-  --bs-btn-hover-color: var(--bootui-text);
-  --bs-btn-active-bg: rgba(226, 232, 240, 0.15);
 }
 
 :global(:root[data-bootui-theme='dark'] .badge.bg-light) {
@@ -1420,6 +1426,7 @@ function onGlobalKeydown(e) {
 .nav-hamburger:focus-visible,
 .cp-trigger:focus-visible,
 .theme-toggle:focus-visible,
+:global(.btn:focus-visible),
 :global(.bootui-keyboard-target:focus-visible) {
   outline: 2px solid var(--bootui-blue);
   outline-offset: 2px;
@@ -1465,6 +1472,28 @@ function onGlobalKeydown(e) {
 
 :global(.btn) {
   font-weight: 600;
+}
+
+:global(a.btn) {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+:global(.btn code) {
+  color: inherit;
+}
+
+:global(.btn-outline-secondary) {
+  --bs-btn-color: var(--bootui-text-muted);
+  --bs-btn-border-color: var(--bootui-border-alt);
+  --bs-btn-hover-bg: var(--bootui-nav-hover-bg);
+  --bs-btn-hover-border-color: var(--bootui-border-alt);
+  --bs-btn-hover-color: var(--bootui-text);
+  --bs-btn-active-bg: var(--bootui-nav-hover-bg);
+  --bs-btn-active-border-color: var(--bootui-border-alt);
+  --bs-btn-active-color: var(--bootui-text);
+  --bs-btn-disabled-color: var(--bootui-text-subtle);
+  --bs-btn-disabled-border-color: var(--bootui-border-alt);
 }
 
 :global(.form-control),
@@ -1818,7 +1847,7 @@ function onGlobalKeydown(e) {
   font-size: 1.05rem;
 }
 
-.bootui-sidebar--collapsed .bootui-nav-section:not(.bootui-nav-section--overview) .bootui-nav-group__items {
+.bootui-sidebar--collapsed .bootui-nav-section:not(.bootui-nav-section--home) .bootui-nav-group__items {
   display: none;
 }
 
@@ -1918,7 +1947,7 @@ function onGlobalKeydown(e) {
   gap: 0.25rem;
 }
 
-.bootui-nav-section:not(.bootui-nav-section--overview) .bootui-nav-group__items {
+.bootui-nav-section:not(.bootui-nav-section--home) .bootui-nav-group__items {
   border-left: 1px solid var(--bootui-border-alt);
   display: flex;
   flex-direction: column;

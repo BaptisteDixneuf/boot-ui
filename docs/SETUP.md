@@ -1,19 +1,29 @@
 # Setup
 
-This page installs BootUI in a Spring Boot servlet application. On WebFlux, follow
+This page installs BootUI in a Spring Boot Spring MVC application. On WebFlux, the starter is the same; follow
 [BootUI on Spring WebFlux](setup/webflux.md). On Quarkus, follow [BootUI on Quarkus](setup/quarkus.md). All three serve
 the same console and the same JSON contract.
+
+::: tip Trying the v2 branch before publication
+This checkout documents BootUI 2.0, which is not published yet. Its source still uses version `1.21.0`, so the
+snippets below must resolve the locally built v2 artifacts, not the released artifacts of the same version.
+Follow [Try BootUI 2.0 early](V2-EARLY-ADOPTERS.md) to build and use an isolated Maven repository.
+:::
 
 ## Prerequisites
 
 - Java 17 or later
-- Spring Boot 4.x application
+- Spring Boot 4.x application on `spring-boot-starter-web` (or `spring-boot-starter-webmvc`)
 - Maven or Gradle (or their local wrappers)
 
 ## Add the starter dependency
 
 Adding the starter is the whole install. BootUI ships dormant: it activates in the `dev` and `local` profiles, or when
 `spring-boot-devtools` is on the classpath, and stays off in `prod` and `production`.
+
+The starter brings no web stack of its own. Your application's `spring-boot-starter-web` keeps it a servlet
+application on Tomcat, and BootUI binds to Spring MVC; a WebFlux application keeps `spring-boot-starter-webflux` and
+the same starter binds to WebFlux. An application with neither starts no web server, and BootUI stays off.
 
 ::: tabs#build
 
@@ -122,9 +132,11 @@ Everything below is optional.
 | Understand when BootUI turns on, or keep it out of your prod build | [Activation and safety](setup/activation.md)                     |
 | Run BootUI on WebFlux or Quarkus                                   | [Spring WebFlux](setup/webflux.md) · [Quarkus](setup/quarkus.md) |
 | Run inside Docker, or in a command-line app                        | [Non-standard runtimes](setup/environments.md)                   |
+| See which methods ran, and whether your change did                 | [Java agent](setup/java-agent.md)                                |
 | Fix something that is not working                                  | [Troubleshooting](setup/troubleshooting.md)                      |
 | Look up a property                                                 | [Property reference](PROPERTIES.md)                              |
 | See what each panel does                                           | [Features](features/README.md)                                   |
+| Know what BootUI does not do yet, per stack                        | [Known limitations](KNOWN-LIMITATIONS.md)                        |
 
 ::: tip Using the MySQL panel
 The [MySQL panel](features/database.md#mysql) reuses a configured application JDBC datasource and MySQL Connector/J. It

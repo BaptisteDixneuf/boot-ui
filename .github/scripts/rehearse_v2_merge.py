@@ -37,10 +37,17 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import date
 from pathlib import Path
 
 GROUP = "com/julien-dubois/bootui"
-PUBLISHING_MARKERS = ("actions/deploy-pages", "docker/login-action", "clean deploy", "gh release create")
+PUBLISHING_MARKERS = (
+    "actions/deploy-pages",
+    "docker/login-action",
+    "clean deploy",
+    "publish_central_bundle.py",
+    "gh release create",
+)
 GATE = ".github/scripts/release-line-gate.sh"
 POLICY = ".github/scripts/release-version-policy.sh"
 SHARED_FILES = (
@@ -190,8 +197,22 @@ def runs_on_main(triggers):
     return "push" in triggers and push_runs_on(triggers["push"], "main")
 
 
+GATE_SENTINEL = re.compile(r'"(bootui-[a-z-]+)/\$\{version\}/\1-\$\{version\}\.jar"')
+
+
+def gate_sentinels(gate_text):
+    """The artifacts release-line-gate.sh probes on Maven Central to decide that a version is released."""
+    sentinels = tuple(dict.fromkeys(GATE_SENTINEL.findall(gate_text)))
+    if not sentinels:
+        raise ValueError("release-line-gate.sh names no sentinel artifact")
+    return sentinels
+
+
 class FakeCentral:
-    def __init__(self):
+    """A local stand-in for Maven Central that publishes, for a version, the jars the gate under test probes."""
+
+    def __init__(self, sentinels):
+        self.sentinels = sentinels
         self.directory = tempfile.TemporaryDirectory()
         handler = functools.partial(_Quiet, directory=self.directory.name)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -200,11 +221,8 @@ class FakeCentral:
 
     def publish(self, version):
         root = Path(self.directory.name) / GROUP
-        for artifact, name in (
-            ("bootui-core", f"bootui-core-{version}.jar"),
-            ("bootui-spring-boot-starter", f"bootui-spring-boot-starter-{version}.jar"),
-        ):
-            path = root / artifact / version / name
+        for artifact in self.sentinels:
+            path = root / artifact / version / f"{artifact}-{version}.jar"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"published")
 
@@ -319,16 +337,63 @@ def environment_policies():
 
 def check_sign_off(candidate_tree, release_day):
     pending = "FAIL" if release_day else "PENDING"
-    report = (candidate_tree / "docs/V2-VALIDATION-REPORT.md").read_text(encoding="utf-8")
-    section = re.search(r"^## Release sign-off\n(.*?)(?=^## |\Z)", report, re.MULTILINE | re.DOTALL)
-    if not section:
-        record("FAIL", "the validation report has a release sign-off section")
+    check = "the maintainer explicitly approves release 2.0.0 with complete sign-off metadata"
+    try:
+        report = (candidate_tree / "docs/V2-VALIDATION-REPORT.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        record(pending, check, f"cannot read V2-VALIDATION-REPORT.md: {error}")
         return
-    todos = section.group(1).count("TODO")
-    if todos:
-        record(pending, "the release sign-off is complete", f"{todos} TODO left in V2-VALIDATION-REPORT.md")
-    else:
-        record("PASS", "the release sign-off is complete")
+    sections = re.findall(r"^## Release sign-off\n(.*?)(?=^## |\Z)", report, re.MULTILINE | re.DOTALL)
+    if len(sections) != 1:
+        record(pending, check, "expected exactly one Release sign-off section")
+        return
+    section = sections[0]
+    rows = [
+        [cell.strip() for cell in line.strip().split("|")[1:-1]]
+        for line in section.splitlines()
+        if line.strip().startswith("|") and line.strip().endswith("|")
+    ]
+    fields = {}
+    for label in ("Release candidate", "Decision", "Decision rationale", "Maintainer"):
+        matches = [row for row in rows if row and row[0] == label]
+        size = 3 if label == "Maintainer" else 2
+        if len(matches) != 1 or len(matches[0]) != size:
+            record(pending, check, f"expected exactly one complete {label} row")
+            return
+        fields[label] = matches[0][1:]
+    if fields["Decision"][0] != "APPROVE_RELEASE_2_0_0":
+        record(pending, check, "Decision must be exactly APPROVE_RELEASE_2_0_0; HOLD or PENDING does not authorize")
+        return
+    if re.search(r"\bTODO\b", section, re.IGNORECASE):
+        record(pending, check, "unresolved TODO in the release sign-off")
+        return
+    version = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    if not re.fullmatch(rf"`[0-9a-f]{{40}}` \(version `{version}`\)", fields["Release candidate"][0]):
+        record(pending, check, "Release candidate must name a full 40-character commit SHA and BootUI version")
+        return
+    for label, value in (
+        ("Decision rationale", fields["Decision rationale"][0]),
+        ("Maintainer name", fields["Maintainer"][0]),
+    ):
+        value = value.strip("`*_ <>[]")
+        placeholder = r"(?:TODO|TBD|PENDING|N/A|NONE|UNKNOWN|UNSIGNED|NOT PROVIDED)"
+        if label == "Maintainer name":
+            placeholder += r"(?:\b.*)?"
+        if not any(character.isalpha() for character in value) or re.fullmatch(
+            placeholder, value, re.IGNORECASE
+        ) or (label == "Maintainer name" and value.casefold() in ("name", "maintainer")):
+            record(pending, check, f"{label} is empty or a placeholder")
+            return
+    signed_date = fields["Maintainer"][1]
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", signed_date):
+            raise ValueError("expected YYYY-MM-DD")
+        if date.fromisoformat(signed_date) > date.today():
+            raise ValueError("future sign-off date")
+    except ValueError:
+        record(pending, check, "Maintainer date must be a valid, non-future calendar date in YYYY-MM-DD format")
+        return
+    record("PASS", check)
 
 
 def check_environments(release_day):
@@ -527,7 +592,7 @@ def main():
         main_tree = Path(directory) / "main"
         git("worktree", "add", "--detach", "--quiet", str(candidate_tree), candidate, cwd=repository)
         git("worktree", "add", "--detach", "--quiet", str(main_tree), main_sha, cwd=repository)
-        central = FakeCentral()
+        central = FakeCentral(gate_sentinels((candidate_tree / GATE).read_text(encoding="utf-8")))
         try:
             rehearse(repository, candidate, candidate_tree, main_tree, tags, central, arguments)
         finally:
@@ -535,7 +600,10 @@ def main():
             git("worktree", "remove", "--force", str(candidate_tree), cwd=repository, check=False)
             git("worktree", "remove", "--force", str(main_tree), cwd=repository, check=False)
     if arguments.live:
-        live(candidate, repository)
+        if any(status in ("FAIL", "PENDING") for status, _, _ in results):
+            record("FAIL", "live rehearsal is blocked", "resolve every failed or pending prerequisite before dispatch")
+        else:
+            live(candidate, repository)
     return summarize()
 
 

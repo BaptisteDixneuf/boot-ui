@@ -56,6 +56,19 @@ function report(overrides = {}) {
   }
 }
 
+function caughtReport(overrides = {}) {
+  return {
+    available: true,
+    unavailableReason: null,
+    limitations: [],
+    settling: 0,
+    occurrences: 0,
+    findings: 0,
+    rows: [],
+    ...overrides
+  }
+}
+
 function detail() {
   return {
     group: group(),
@@ -104,6 +117,21 @@ function detail() {
   }
 }
 
+function mockFetch(routes = {}) {
+  const defaults = {
+    'api/overview': {},
+    'api/exceptions': report(),
+    'api/exceptions/caught': caughtReport()
+  }
+  return vi.fn((url, init) => {
+    const key = String(url)
+    const route = Object.hasOwn(routes, key) ? routes[key] : defaults[key]
+    if (typeof route === 'function') return route(url, init)
+    if (route !== undefined) return Promise.resolve(jsonResponse(route))
+    return Promise.reject(new Error(`unexpected ${key} ${init?.method}`))
+  })
+}
+
 // The handler attribution links into the REST API panel, so a router is not needed to render the panel.
 config.global.stubs.RouterLink = {props: ['to'], template: '<a :href="JSON.stringify(to)"><slot /></a>'}
 
@@ -112,13 +140,52 @@ describe('Exceptions', () => {
     vi.unstubAllGlobals()
   })
 
+  it('keeps an acknowledged status after an older manual read finishes with auto-refresh off', async () => {
+    let reads = 0
+    let resolveStale
+    const updated = group({status: 'RESOLVED'})
+    const fetchMock = mockFetch({
+      'api/exceptions': () => {
+        reads++
+        if (reads === 2) return new Promise((resolve) => (resolveStale = resolve))
+        return Promise.resolve(jsonResponse(reads === 1 ? report() : report({groups: [updated]})))
+      },
+      'api/exceptions/abc123/status': updated
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(Exceptions)
+    try {
+      await flushPromises()
+      const header = wrapper.findComponent({name: 'PanelHeader'})
+      header.vm.$emit('update:autoRefresh', false)
+      header.vm.$emit('refresh')
+      await flushPromises()
+      expect(reads).toBe(2)
+      const row = wrapper.findAll('tbody tr')[0]
+      await row
+        .findAll('button')
+        .find((button) => button.text() === 'Resolved')
+        .trigger('click')
+      await flushPromises()
+      expect(row.findAll('td')[3].find('.badge').text()).toBe('Resolved')
+      resolveStale(jsonResponse(report()))
+      await flushPromises()
+      expect(wrapper.findAll('tbody tr')[0].findAll('td')[3].find('.badge').text()).toBe('Resolved')
+      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
   it('renders grouped exceptions with masked messages, counts, and locations', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(report())))
+    const fetchMock = mockFetch()
+    vi.stubGlobal('fetch', fetchMock)
 
     const wrapper = mount(Exceptions)
     await flushPromises()
 
-    expect(fetch).toHaveBeenCalledWith('api/exceptions', {})
+    expect(fetchMock).toHaveBeenCalledWith('api/exceptions', {})
+    expect(fetchMock).toHaveBeenCalledWith('api/exceptions/caught', {})
     expect(wrapper.text()).toContain('Exceptions')
     expect(wrapper.text()).toContain('IllegalStateException')
     expect(wrapper.text()).toContain('token=****** rejected')
@@ -128,7 +195,7 @@ describe('Exceptions', () => {
   })
 
   it('filters groups by source', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(report())))
+    vi.stubGlobal('fetch', mockFetch())
 
     const wrapper = mount(Exceptions)
     await flushPromises()
@@ -145,16 +212,14 @@ describe('Exceptions', () => {
   it('filters groups by status', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(
-        jsonResponse(
-          report({
-            groups: [
-              group({id: 'a1', exceptionClassName: 'java.lang.IllegalStateException', status: 'OPEN'}),
-              group({id: 'a2', exceptionClassName: 'java.lang.NullPointerException', status: 'RESOLVED'})
-            ]
-          })
-        )
-      )
+      mockFetch({
+        'api/exceptions': report({
+          groups: [
+            group({id: 'a1', exceptionClassName: 'java.lang.IllegalStateException', status: 'OPEN'}),
+            group({id: 'a2', exceptionClassName: 'java.lang.NullPointerException', status: 'RESOLVED'})
+          ]
+        })
+      })
     )
 
     const wrapper = mount(Exceptions)
@@ -172,9 +237,8 @@ describe('Exceptions', () => {
 
   it('renders a status badge and lets the user change status', async () => {
     const updated = group({status: 'RESOLVED'})
-    const fetchMock = vi.fn((url) => {
-      if (url === 'api/exceptions/abc123/status') return Promise.resolve(jsonResponse(updated))
-      return Promise.resolve(jsonResponse(report()))
+    const fetchMock = mockFetch({
+      'api/exceptions/abc123/status': updated
     })
     vi.stubGlobal('fetch', fetchMock)
 
@@ -196,7 +260,7 @@ describe('Exceptions', () => {
   })
 
   it('shows a reopened badge when regressionCount is greater than zero', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(report({groups: [group({regressionCount: 2})]}))))
+    vi.stubGlobal('fetch', mockFetch({'api/exceptions': report({groups: [group({regressionCount: 2})]})}))
 
     const wrapper = mount(Exceptions)
     await flushPromises()
@@ -205,10 +269,7 @@ describe('Exceptions', () => {
   })
 
   it('loads exception detail with stack trace and cause chain on open', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse(report()))
-      .mockResolvedValueOnce(jsonResponse(detail()))
+    const fetchMock = mockFetch({'api/exceptions/abc123': detail()})
     vi.stubGlobal('fetch', fetchMock)
 
     const wrapper = mount(Exceptions)
@@ -251,6 +312,7 @@ describe('Exceptions', () => {
     }
     const fetchMock = vi.fn((url, init) => {
       if (url === 'api/exceptions') return Promise.resolve(jsonResponse(report()))
+      if (url === 'api/exceptions/caught') return Promise.resolve(jsonResponse(caughtReport()))
       if (url === 'api/exceptions/abc123') return Promise.resolve(jsonResponse(detail()))
       if (url === 'api/activity') return Promise.resolve(jsonResponse(activity))
       if (url === 'api/activity/request/req-9') return Promise.resolve(jsonResponse(profile))
@@ -290,6 +352,7 @@ describe('Exceptions', () => {
       'fetch',
       vi.fn((url) => {
         if (url === 'api/exceptions') return Promise.resolve(jsonResponse(report()))
+        if (url === 'api/exceptions/caught') return Promise.resolve(jsonResponse(caughtReport()))
         if (url === 'api/exceptions/abc123') return Promise.resolve(jsonResponse(detail()))
         return Promise.resolve(jsonResponse({}, false, 404))
       })
@@ -314,26 +377,24 @@ describe('Exceptions', () => {
   it('links a retained failure to its declared handler only when the engine attributed one', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(
-        jsonResponse(
-          report({
-            groups: [
-              group({
-                errorContract: {
-                  entryId: 'com.example.GlobalAdvice#handleOrder(java.lang.IllegalStateException)',
-                  component: 'com.example.GlobalAdvice',
-                  componentSimpleName: 'GlobalAdvice',
-                  method: 'handleOrder',
-                  scope: 'GLOBAL',
-                  status: '409',
-                  bodyCategory: 'PROBLEM_DETAIL'
-                }
-              }),
-              group({id: 'def456', errorContract: null})
-            ]
-          })
-        )
-      )
+      mockFetch({
+        'api/exceptions': report({
+          groups: [
+            group({
+              errorContract: {
+                entryId: 'com.example.GlobalAdvice#handleOrder(java.lang.IllegalStateException)',
+                component: 'com.example.GlobalAdvice',
+                componentSimpleName: 'GlobalAdvice',
+                method: 'handleOrder',
+                scope: 'GLOBAL',
+                status: '409',
+                bodyCategory: 'PROBLEM_DETAIL'
+              }
+            }),
+            group({id: 'def456', errorContract: null})
+          ]
+        })
+      })
     )
 
     const wrapper = mount(Exceptions)
@@ -356,15 +417,19 @@ describe('Exceptions', () => {
   it('shows a disabled notice when capture is unavailable', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(
-        jsonResponse({
+      mockFetch({
+        'api/exceptions': {
           available: false,
           unavailableReason: 'Exception capture is disabled',
           maxGroups: 100,
           totalExceptions: 0,
           groups: []
+        },
+        'api/exceptions/caught': caughtReport({
+          available: false,
+          unavailableReason: 'The BootUI agent is not attached'
         })
-      )
+      })
     )
 
     const wrapper = mount(Exceptions)

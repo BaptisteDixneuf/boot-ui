@@ -1,0 +1,332 @@
+package io.github.jdubois.bootui.engine.insights;
+
+import io.github.jdubois.bootui.engine.journal.AiPayload;
+import io.github.jdubois.bootui.engine.journal.ConnectionPayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.JournalTextExposure;
+import io.github.jdubois.bootui.engine.journal.RestClientPayload;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.TransactionPayload;
+import io.github.jdubois.bootui.engine.web.CorrelationTier;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * {@code transaction-across-remote-call} ({@code docs/PLAN-v2.md} §5.5): a physical transaction still open when a REST
+ * client or AI call starts, per route and transactional method, with the connection it held and, as a labelled
+ * estimate, the request rate at which this route alone would exhaust the pool: pool size ÷ hold time. A method is reported only
+ * once one of its calls took 20 ms or more, since the slowest call is what holds the connection longest and more
+ * traffic would not make a faster call slow; it is insufficient below 3 transactions. A method whose calls were all
+ * faster is named in the check's reason instead.
+ */
+public final class TransactionAcrossRemoteCall implements Observation {
+
+    public static final String KIND = "transaction-across-remote-call";
+
+    static final int MIN_TRANSACTIONS = 3;
+
+    static final long MIN_CALL_NANOS = 20_000_000;
+
+    @Override
+    public String kind() {
+        return KIND;
+    }
+
+    @Override
+    public String title() {
+        return "Transactions open across remote calls";
+    }
+
+    @Override
+    public CorrelationTier minimumTier() {
+        return CorrelationTier.REQUEST_ID;
+    }
+
+    @Override
+    public Set<JournalSource> reads() {
+        return Set.of(JournalSource.TRANSACTION);
+    }
+
+    @Override
+    public Set<JournalSource> optionalReads() {
+        return Set.of(JournalSource.CONNECTION, JournalSource.REST_CLIENT, JournalSource.AI);
+    }
+
+    @Override
+    public String notApplicable(InsightsSnapshot snapshot) {
+        if (snapshot.stack() == InsightsStack.QUARKUS) {
+            return "Quarkus transactions are not recorded, so calls cannot be placed in them.";
+        }
+        return !snapshot.available(JournalSource.REST_CLIENT) && !snapshot.available(JournalSource.AI)
+                ? "Neither REST client nor AI calls are recorded and visible, so calls cannot be placed in transactions."
+                : null;
+    }
+
+    @Override
+    public Evaluation evaluate(InsightsSnapshot snapshot) {
+        List<Finding> findings = new ArrayList<>();
+        long eligible = 0;
+        long fast = 0;
+        for (Map.Entry<String, List<ProjectedRequest>> route :
+                snapshot.byRoute().entrySet()) {
+            Map<String, Method> methods = new LinkedHashMap<>();
+            long routeEligible = 0;
+            for (ProjectedRequest request : route.getValue()) {
+                List<RuntimeEvent> restCalls = snapshot.available(JournalSource.REST_CLIENT)
+                        ? request.children(JournalSource.REST_CLIENT)
+                        : List.of();
+                List<RuntimeEvent> aiCalls =
+                        snapshot.available(JournalSource.AI) ? request.children(JournalSource.AI) : List.of();
+                List<Window> windows = windows(request);
+                if (windows.isEmpty()
+                        || !(restCalls.stream().anyMatch(TransactionAcrossRemoteCall::timedRest)
+                                || aiCalls.stream().anyMatch(TransactionAcrossRemoteCall::timedAi))) {
+                    continue;
+                }
+                routeEligible++;
+                Set<String> seen = new LinkedHashSet<>();
+                List<Window> placedAi = new ArrayList<>();
+                for (RuntimeEvent call : aiCalls) {
+                    if (!timedAi(call)) {
+                        continue;
+                    }
+                    AiPayload payload = (AiPayload) call.payload();
+                    long callStart = payload.completedNanos() - Math.max(0, call.durationNanos());
+                    Window open = outermost(windows, callStart);
+                    if (open == null) {
+                        continue;
+                    }
+                    placedAi.add(new Window("", callStart, payload.completedNanos()));
+                    String method = open.method();
+                    Connection held = connection(request, callStart);
+                    methods.computeIfAbsent(method, m -> new Method())
+                            .add(request, open, call, describe(payload), held, seen.add(method));
+                }
+                for (RuntimeEvent call : restCalls) {
+                    if (!timedRest(call)) {
+                        continue;
+                    }
+                    RestClientPayload payload = (RestClientPayload) call.payload();
+                    long callStart = payload.completedNanos() - Math.max(0, call.durationNanos());
+                    Window open = outermost(windows, callStart);
+                    if (open == null
+                            || placedAi.stream()
+                                    .anyMatch(ai -> callStart >= ai.start() && payload.completedNanos() <= ai.end())) {
+                        continue;
+                    }
+                    String method = open.method();
+                    Connection held = connection(request, callStart);
+                    methods.computeIfAbsent(method, m -> new Method())
+                            .add(request, open, call, describe(payload, snapshot.exposure()), held, seen.add(method));
+                }
+            }
+            eligible += routeEligible;
+            for (Map.Entry<String, Method> method : methods.entrySet()) {
+                // Calls all under the minimum are not a finding: more traffic would not make them slower.
+                if (method.getValue().slowest >= MIN_CALL_NANOS) {
+                    findings.add(finding(route.getKey(), method.getKey(), method.getValue(), routeEligible, snapshot));
+                } else {
+                    fast++;
+                }
+            }
+        }
+        return new Evaluation(
+                eligible, findings, fast == 0 ? null : JudgedWithoutFinding.fastTransactions(fast, MIN_CALL_NANOS));
+    }
+
+    private Finding finding(String route, String method, Method found, long eligible, InsightsSnapshot snapshot) {
+        long callMedian = RouteTimeBreakdown.median(found.callNanos());
+        boolean sufficient = found.transactions >= MIN_TRANSACTIONS;
+        StringBuilder sentence = new StringBuilder("`" + route + "`: `" + method
+                + "` kept its transaction open across a call to `" + found.firstCall + "` in "
+                + found.transactions + " of " + InsightText.counted(eligible, InsightText.unit(route))
+                + " that both called out and opened a transaction; its calls took a median "
+                + InsightText.millis(callMedian)
+                + " ms");
+        if (found.slowest > callMedian) {
+            sentence.append(", the slowest ")
+                    .append(InsightText.millis(found.slowest))
+                    .append(" ms");
+            if (!found.slowestCall.equals(found.firstCall)) {
+                sentence.append(" (`").append(found.slowestCall).append("`)");
+            }
+        }
+        long[] holds = found.holdNanos();
+        long holdMedian = RouteTimeBreakdown.median(holds);
+        if (holds.length > 0) {
+            sentence.append(", and its connection was held a median ")
+                    .append(InsightText.millis(holdMedian))
+                    .append(" ms");
+        }
+        sentence.append('.');
+        List<String> limitations = new ArrayList<>();
+        if (sufficient && holds.length > 0 && holdMedian > 0) {
+            Optional<Integer> pool = snapshot.poolSize(found.dataSource);
+            if (pool.isPresent()) {
+                long perSecond = Math.max(1, Math.round(pool.get() * 1_000_000_000.0 / holdMedian));
+                sentence.append(" Estimate: at about ")
+                        .append(perSecond)
+                        .append(" requests per second, this route alone would hold all ")
+                        .append(pool.get())
+                        .append(" connections of `")
+                        .append(found.dataSource)
+                        .append("` (pool size ÷ hold time).");
+            } else {
+                limitations.add("The pool size of the data source is unknown, so no exhaustion rate is estimated.");
+            }
+        }
+        if (!sufficient) {
+            sentence.append(" Reported from " + MIN_TRANSACTIONS + " transactions.");
+        }
+        limitations.add("A call is placed in a transaction by time within its request; parallel work of the same"
+                + " request on another thread could be placed too.");
+        if (snapshot.stack() == InsightsStack.SPRING_WEBFLUX) {
+            limitations.add("A reactive transaction belongs to a request only when its pipeline carried the request's"
+                    + " context to the thread it began on.");
+        }
+        return new Finding(
+                route + ":" + InsightText.stableHash(method),
+                route,
+                sufficient,
+                sentence.toString(),
+                eligible,
+                found.transactions,
+                List.of(
+                        "Make the remote call before the transaction begins or after it commits, so no connection"
+                                + " waits on the network.",
+                        "If the call belongs to the unit of work, consider an outbox or a compensating action"
+                                + " instead."),
+                found.rows.stream().map(row -> row.get(0)).distinct().limit(3).toList(),
+                List.of("Request", "Call", "Call (ms)", "Transaction open (ms)", "Connection held (ms)"),
+                found.rows,
+                limitations);
+    }
+
+    private static List<Window> windows(ProjectedRequest request) {
+        List<Window> windows = new ArrayList<>();
+        for (RuntimeEvent event : request.children(JournalSource.TRANSACTION)) {
+            if (event.payload() instanceof TransactionPayload transaction
+                    && transaction.independent()
+                    && transaction.startNanos() >= 0
+                    && event.durationNanos() >= 0) {
+                windows.add(new Window(
+                        transaction.method() == null ? "transaction" : transaction.method(),
+                        transaction.startNanos(),
+                        transaction.startNanos() + event.durationNanos()));
+            }
+        }
+        return windows;
+    }
+
+    private static boolean timedAi(RuntimeEvent event) {
+        return event.payload() instanceof AiPayload payload
+                && payload.completedNanos() >= 0
+                && event.durationNanos() >= 0;
+    }
+
+    private static boolean timedRest(RuntimeEvent event) {
+        return event.payload() instanceof RestClientPayload payload
+                && payload.completedNanos() >= 0
+                && event.durationNanos() >= 0;
+    }
+
+    private static Window outermost(List<Window> windows, long at) {
+        Window found = null;
+        for (Window window : windows) {
+            if (at >= window.start() && at < window.end() && (found == null || window.span() > found.span())) {
+                found = window;
+            }
+        }
+        return found;
+    }
+
+    private static Connection connection(ProjectedRequest request, long at) {
+        for (RuntimeEvent event : request.children(JournalSource.CONNECTION)) {
+            if (event.payload() instanceof ConnectionPayload connection
+                    && connection.checkoutNanos() >= 0
+                    && at >= connection.checkoutNanos()
+                    && at < connection.checkoutNanos() + Math.max(0, event.durationNanos())) {
+                return new Connection(connection.dataSource(), Math.max(0, event.durationNanos()));
+            }
+        }
+        return null;
+    }
+
+    private record Window(String method, long start, long end) {
+
+        long span() {
+            return end - start;
+        }
+    }
+
+    private record Connection(String dataSource, long heldNanos) {}
+
+    private static String describe(AiPayload payload) {
+        String operation = payload.operation() == null ? "AI call" : "AI " + payload.operation();
+        return payload.model() == null ? operation : operation + " (" + payload.model() + ")";
+    }
+
+    private static String describe(RestClientPayload payload, JournalTextExposure text) {
+        return ((payload.method() == null ? "" : payload.method() + " ")
+                        + (payload.authority() == null ? "" : payload.authority())
+                        + (payload.path() == null ? "" : text.path(payload.path())))
+                .trim();
+    }
+
+    private static final class Method {
+
+        private final List<List<String>> rows = new ArrayList<>();
+        private final List<Long> calls = new ArrayList<>();
+        private final List<Long> holds = new ArrayList<>();
+        private long transactions;
+        private long slowest;
+        private String slowestCall;
+        private String firstCall;
+        private String dataSource;
+
+        void add(
+                ProjectedRequest request,
+                Window open,
+                RuntimeEvent call,
+                String described,
+                Connection held,
+                boolean newTransaction) {
+            if (newTransaction) {
+                transactions++;
+                if (held != null) {
+                    holds.add(held.heldNanos());
+                    if (dataSource == null) {
+                        dataSource = held.dataSource();
+                    }
+                }
+            }
+            if (firstCall == null) {
+                firstCall = described;
+            }
+            calls.add(Math.max(0, call.durationNanos()));
+            if (slowestCall == null || call.durationNanos() > slowest) {
+                slowest = Math.max(0, call.durationNanos());
+                slowestCall = described;
+            }
+            rows.add(List.of(
+                    request.requestId(),
+                    described,
+                    InsightText.millis(Math.max(0, call.durationNanos())),
+                    InsightText.millis(open.span()),
+                    held == null ? "" : InsightText.millis(held.heldNanos())));
+        }
+
+        long[] callNanos() {
+            return calls.stream().mapToLong(Long::longValue).toArray();
+        }
+
+        long[] holdNanos() {
+            return holds.stream().mapToLong(Long::longValue).toArray();
+        }
+    }
+}

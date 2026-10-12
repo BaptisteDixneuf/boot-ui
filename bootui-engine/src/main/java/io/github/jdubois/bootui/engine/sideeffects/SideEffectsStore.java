@@ -1,0 +1,1635 @@
+package io.github.jdubois.bootui.engine.sideeffects;
+
+import io.github.jdubois.bootui.core.dto.SideEffectsRowDto;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+
+/**
+ * One run's Side Effects rows ({@code docs/PLAN-v2.md} §5.16, M5-5a), kept outside the runtime journal under the agent
+ * evidence contract ({@code AgentEvidence}, M5-11): <b>Clear recording</b> clears them, their memory is accounted, and
+ * their bounds shrink with a configured agent evidence bound.
+ *
+ * <p>Each observation is attributed, in this order, to its request's route, to its execution by kind (a scheduled run,
+ * a consumed message, a WebSocket message), to startup, or to its thread's family, else it is unattributed. A request's
+ * route comes from the runtime journal's HTTP exchange of that request, and an execution's label from its own event,
+ * both recorded once the work is over, so observations wait, at most {@value #MAX_PENDING} of them, until named or
+ * {@value #PENDING_MILLIS} ms passed, when a request's count under {@value #UNKNOWN_ROUTE} and an execution's under
+ * {@value #BACKGROUND}. Rows are keyed by attribution, sensor, kind, normalized target, call site, and the bean method
+ * it happened inside; a sensor keeps at most {@value #MAX_ROWS_PER_SENSOR} rows and the store {@value #MAX_ROWS} by
+ * default, and what does not fit is counted in the sensor's one Other row. Route attribution is HTTP Exchanges
+ * evidence: while that panel is hidden, reads show every
+ * route row under {@value #ROUTE_HIDDEN}, without exemplar request ids.
+ *
+ * <p>A network connect or datagram (M5-5b) is also keyed by its client and how a panel captures it. A client whose
+ * work SQL Trace, a messaging panel, or Email shows is keyed by that category, and whether that panel captured it is
+ * decided on read, from whether that panel is visible, as a pool opens its connections before its first statement. Any other connect waits until a REST client call of the same owner, or, unowned, at the same time, names
+ * its host and port, or until it no longer can: {@value #CAPTURE_GRACE_MILLIS} ms after its owner was named (its
+ * request ended, or since the connect when later), or, for an execution, {@value #UNOWNED_HTTP_CAPTURE_MILLIS} ms, since
+ * any of its events names it while it runs; an unowned one waits {@value #UNOWNED_CAPTURE_MILLIS} ms, or {@value
+ * #UNOWNED_HTTP_CAPTURE_MILLIS} ms for a recognized HTTP client; then it is not captured. Not thread-safe:
+ * its service serializes it.
+ */
+final class SideEffectsStore {
+
+    static final int MAX_ROWS_PER_SENSOR = 500;
+    static final int MAX_ROWS = 2_000;
+    static final int MAX_PENDING = 10_000;
+    static final long PENDING_MILLIS = 30_000L;
+    static final int EXEMPLARS = 3;
+    static final int ROUTE_CACHE = 4_096;
+
+    static final String UNKNOWN_ROUTE = "(unknown route)";
+    static final String ROUTE_HIDDEN = "(route hidden: HTTP Exchanges is disabled)";
+    static final String BACKGROUND = "work no request owns";
+    static final String STARTUP = "startup";
+    static final String UNATTRIBUTED = "(unattributed)";
+    static final String OTHER = "Other";
+
+    /** Approximate bytes of one row and of one waiting observation, for the memory accounting. */
+    static final long ROW_BYTES = 640L;
+
+    static final long PENDING_BYTES = 320L;
+
+    /** Approximate bytes of one cached request route. */
+    static final long ROUTE_BYTES = 96L;
+
+    /** How long an owned connect whose owner was named still waits for a REST client call to name it. */
+    static final long CAPTURE_GRACE_MILLIS = 2_000L;
+
+    /** How long an unowned connect waits for a REST client call at the same time. */
+    static final long UNOWNED_CAPTURE_MILLIS = 10_000L;
+
+    /** How a network row is captured, as rows are keyed: decided now, by category on read, or waiting. */
+    static final String CAPTURE_INFRASTRUCTURE = "infrastructure";
+
+    static final String CAPTURE_SQL = "sql";
+    static final String CAPTURE_MAIL = "mail";
+    static final String CAPTURE_MESSAGING = "messaging:";
+    static final String REST_CAPTURED = "rest:captured";
+    static final String REST_NOT_CAPTURED = "rest:not-captured";
+    static final String REST_WAITING = "rest:waiting";
+
+    /** An HTTP client's connection waiting for a REST client call, which may take long to be recorded. */
+    static final String REST_WAITING_HTTP = "rest:waiting-http";
+
+    /** How long an unowned HTTP client's connect waits: its call is recorded once it completes. */
+    static final long UNOWNED_HTTP_CAPTURE_MILLIS = 60_000L;
+
+    /** The distinct requests a thread-activity row remembers, to count each request once. */
+    static final int RECENT_REQUESTS = 64;
+
+    /** Approximate bytes of one remembered request id. */
+    static final long REQUEST_ID_BYTES = 72L;
+
+    /**
+     * The routes of requests that started a thread, created an executor, or left a resource open, kept apart from the
+     * route cache, so a
+     * shutdown or a reclaim minutes later still lands on its creation's row.
+     */
+    static final int THREAD_ROUTES = 1_024;
+
+    /** The connect decisions kept for their finish records at most. */
+    static final int MAX_CONNECT_DECISIONS = 4_096;
+
+    /**
+     * What a store observes: a record, its strings resolved and its target normalized; for a network record, its
+     * recognized client, how it is captured ({@code captureKey}), and its host and port.
+     */
+    record Observation(
+            SideEffectRecord record,
+            String sensor,
+            String kind,
+            String target,
+            String callSite,
+            String insideMethod,
+            String threadFamily,
+            String client,
+            String captureKey,
+            String host,
+            int port,
+            String origin,
+            String location,
+            String parameter,
+            String classes) {
+
+        /** An observation without a parameter: every sensor but security sinks. */
+        Observation(
+                SideEffectRecord record,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String threadFamily,
+                String client,
+                String captureKey,
+                String host,
+                int port,
+                String origin,
+                String location) {
+            this(
+                    record,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    threadFamily,
+                    client,
+                    captureKey,
+                    host,
+                    port,
+                    origin,
+                    location,
+                    null,
+                    null);
+        }
+
+        /**
+         * A security-sinks observation (M5-6b): the sink request input reached, its redacted target, where in it the
+         * value sat ({@code location}), and the parameter's name.
+         */
+        static Observation sink(
+                SideEffectRecord record,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String threadFamily,
+                String location,
+                String parameter) {
+            return new Observation(
+                    record,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    threadFamily,
+                    null,
+                    null,
+                    null,
+                    -1,
+                    null,
+                    location,
+                    parameter,
+                    null);
+        }
+
+        /**
+         * A security-sinks JDK check's observation (M5-6b2): what was asked for or installed, who asked ({@code origin},
+         * the library frame as {@code location} when a library did), and, for a deserialization, the other classes it
+         * read, merged per row rather than keying it.
+         */
+        static Observation check(
+                SideEffectRecord record,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String threadFamily,
+                String origin,
+                String location,
+                String classes) {
+            return new Observation(
+                    record,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    threadFamily,
+                    null,
+                    null,
+                    null,
+                    -1,
+                    origin,
+                    location,
+                    null,
+                    classes);
+        }
+
+        /** A network observation: no origin or location. */
+        Observation(
+                SideEffectRecord record,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String threadFamily,
+                String client,
+                String captureKey,
+                String host,
+                int port) {
+            this(
+                    record,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    threadFamily,
+                    client,
+                    captureKey,
+                    host,
+                    port,
+                    null,
+                    null);
+        }
+
+        /** A files or environment observation, with its origin and, for a file, its location. */
+        Observation(
+                SideEffectRecord record,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String threadFamily,
+                String origin,
+                String location) {
+            this(
+                    record,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    threadFamily,
+                    null,
+                    null,
+                    null,
+                    -1,
+                    origin,
+                    location);
+        }
+
+        /** An observation of a sensor that is not captured by a panel. */
+        Observation(
+                SideEffectRecord record,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String threadFamily) {
+            this(record, sensor, kind, target, callSite, insideMethod, threadFamily, null, null, null, -1, null, null);
+        }
+
+        Observation withCapture(String decided) {
+            return new Observation(
+                    record,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    threadFamily,
+                    client,
+                    decided,
+                    host,
+                    port,
+                    origin,
+                    location,
+                    parameter,
+                    classes);
+        }
+
+        boolean waiting() {
+            return REST_WAITING.equals(captureKey) || REST_WAITING_HTTP.equals(captureKey);
+        }
+    }
+
+    private record Key(
+            String scope,
+            String attribution,
+            String sensor,
+            String kind,
+            String target,
+            String callSite,
+            String insideMethod,
+            String client,
+            String captureKey,
+            String origin,
+            String location,
+            String parameter,
+            boolean startupThread) {
+
+        /** A row's key without a parameter or whether startup's own thread did it, which only side-effect keys read. */
+        Key(
+                String scope,
+                String attribution,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String client,
+                String captureKey,
+                String origin,
+                String location) {
+            this(
+                    scope,
+                    attribution,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    client,
+                    captureKey,
+                    origin,
+                    location,
+                    null);
+        }
+
+        /** A row's key with its security-sinks parameter, without whether startup's own thread did it. */
+        Key(
+                String scope,
+                String attribution,
+                String sensor,
+                String kind,
+                String target,
+                String callSite,
+                String insideMethod,
+                String client,
+                String captureKey,
+                String origin,
+                String location,
+                String parameter) {
+            this(
+                    scope,
+                    attribution,
+                    sensor,
+                    kind,
+                    target,
+                    callSite,
+                    insideMethod,
+                    client,
+                    captureKey,
+                    origin,
+                    location,
+                    parameter,
+                    false);
+        }
+    }
+
+    /** The distinct raw sink texts a security-sinks row remembers to confirm it (M5-6 design Important 11). */
+    static final int CONFIRMATIONS = 4;
+
+    /** The other classes a deserialization row names at most. */
+    static final int CLASSES = 16;
+
+    /**
+     * Whether a security-sinks observation is shown from one request: a value not made of digits only, inside a quoted
+     * SQL literal, across a literal's bounds, or in another sink; never one outside a literal, inside a number, true, or
+     * false, or whose place in the text is not known.
+     */
+    static boolean standsAlone(SideEffectRecord record) {
+        if (SideEffectsCatalog.check(record.sensor(), record.kind())) {
+            // A JDK check is a fact, not a match: never waits for a confirmation.
+            return true;
+        }
+        int flags = record.outcome();
+        int position = flags & 0x3;
+        if ((flags & (SideEffectsCatalog.SINK_NUMERIC | SideEffectsCatalog.SINK_BARE_LITERAL)) != 0) {
+            return false;
+        }
+        if ((flags & SideEffectsCatalog.SINK_CROSSES_LITERAL) != 0) {
+            return true;
+        }
+        return position != SideEffectsCatalog.SINK_OUTSIDE_LITERAL
+                && position != SideEffectsCatalog.SINK_POSITION_UNKNOWN;
+    }
+
+    private static final class Row {
+        final Key key;
+        long count;
+        long failed;
+        long completed;
+        long nonZeroExits;
+        Integer lastExitStatus;
+        long nanos;
+        long maxNanos;
+        long firstSeen = Long.MAX_VALUE;
+        long lastSeen;
+        long leftRunning;
+        long requests;
+        final List<String> exemplars = new ArrayList<>(EXEMPLARS);
+        /** The latest distinct requests a thread-activity row counted, at most {@value #RECENT_REQUESTS}. */
+        LinkedHashSet<String> recentRequests;
+
+        /**
+         * Security sinks only: up to {@value #CONFIRMATIONS} keyed hashes of distinct raw sink texts with the request
+         * that produced each, never a text; and whether one observation stands alone, a value that is not digits only,
+         * inside an SQL literal or in another sink, which is shown from one request.
+         */
+        long[] rawHashes;
+
+        long[] redactedHashes;
+        String[] rawRequests;
+        int raw;
+        boolean standalone;
+
+        /** A deserialization row's other classes read, merged across its records, at most {@value #CLASSES}. */
+        java.util.TreeSet<String> classes;
+
+        boolean moreClasses;
+
+        Row(Key key) {
+            this.key = key;
+        }
+
+        void add(Observation observation, String requestId) {
+            SideEffectRecord record = observation.record();
+            if (record.sensor() == SideEffectsCatalog.RECORD_SECURITY_SINKS) {
+                count += record.count();
+                if (SideEffectsCatalog.check(record.sensor(), record.kind())) {
+                    standalone = true;
+                    if ((record.outcome() & SideEffectsCatalog.CHECK_ERROR) != 0) {
+                        failed += record.count();
+                    }
+                    classes(observation.classes());
+                } else {
+                    sink(record, requestId);
+                }
+                firstSeen = Math.min(firstSeen, record.firstMillis());
+                lastSeen = Math.max(lastSeen, record.lastMillis());
+                if (requestId != null && exemplars.size() < EXEMPLARS && !exemplars.contains(requestId)) {
+                    exemplars.add(requestId);
+                }
+                return;
+            }
+            if (record.sensor() == SideEffectsCatalog.RECORD_NETWORK) {
+                network(record);
+            } else if (record.sensor() == SideEffectsCatalog.RECORD_THREADS) {
+                threads(record, requestId);
+            } else if (record.sensor() == SideEffectsCatalog.RECORD_THREAD_LOCALS) {
+                // A scope that left it set: counted, with its distinct request.
+                count += record.count();
+                countRequest(record);
+            } else if (record.sensor() == SideEffectsCatalog.RECORD_RESOURCES) {
+                resources(record, requestId);
+            } else if (SideEffectsCatalog.processExit(record.sensor(), record.kind())) {
+                completed += record.count();
+                if (record.outcome() == SideEffectsCatalog.OUTCOME_EXITED) {
+                    if (record.exitStatus() != 0) {
+                        nonZeroExits += record.count();
+                    }
+                    lastExitStatus = record.exitStatus();
+                }
+                nanos += record.nanos();
+                maxNanos = Math.max(maxNanos, record.maxNanos());
+            } else {
+                count += record.count();
+                if (SideEffectsCatalog.failed(record.outcome())) {
+                    // For blocking, an interrupted call too.
+                    failed += record.count();
+                }
+                if (record.sensor() == SideEffectsCatalog.RECORD_FILES
+                        || record.sensor() == SideEffectsCatalog.RECORD_BLOCKING) {
+                    // A file operation's own time, never reading what it opened; or how long the event loop was
+                    // blocked, in all and at most.
+                    nanos += record.nanos();
+                    maxNanos = Math.max(maxNanos, record.maxNanos());
+                }
+            }
+            firstSeen = Math.min(firstSeen, record.firstMillis());
+            lastSeen = Math.max(lastSeen, record.lastMillis());
+            if (requestId != null && exemplars.size() < EXEMPLARS && !exemplars.contains(requestId)) {
+                exemplars.add(requestId);
+            }
+        }
+
+        /**
+         * A network record: a connect counts an attempt, established or failed, with its time when it was blocking;
+         * a non-blocking connect's finish, established or failed, with its time; a datagram or a lookup counts with
+         * its time.
+         */
+        private void network(SideEffectRecord record) {
+            boolean failure = SideEffectsCatalog.failed(record.outcome());
+            if (record.kind() != SideEffectsCatalog.KIND_CONNECT_FINISH) {
+                count += record.count();
+            }
+            if (failure) {
+                failed += record.count();
+            } else if (record.outcome() == SideEffectsCatalog.OUTCOME_CONNECTED) {
+                completed += record.count();
+            }
+            if (record.outcome() != SideEffectsCatalog.OUTCOME_PENDING) {
+                nanos += record.nanos();
+                maxNanos = Math.max(maxNanos, record.maxNanos());
+            }
+        }
+
+        /** Merges a deserialization's other classes, as the agent listed them, comma-separated. */
+        private void classes(String list) {
+            if (list == null || list.isEmpty()) {
+                return;
+            }
+            if (classes == null) {
+                classes = new java.util.TreeSet<>();
+            }
+            for (String name : list.split(", ")) {
+                if (name.equals(SideEffectsCatalog.MORE_CLASSES)) {
+                    moreClasses = true;
+                } else if (classes.size() < CLASSES || classes.contains(name)) {
+                    classes.add(name);
+                } else {
+                    moreClasses = true;
+                }
+            }
+        }
+
+        /** A security-sinks record: its raw text's keyed hash, carried in its duration's place, and its position. */
+        private void sink(SideEffectRecord record, String requestId) {
+            standalone |= standsAlone(record);
+            // The raw text's keyed hash rides in the duration's place, the redacted text's in the longest's.
+            remember(record.nanos(), record.maxNanos(), requestId);
+        }
+
+        private void remember(long rawHash, long redactedHash, String requestId) {
+            if (rawHash == 0L || redactedHash == 0L || requestId == null) {
+                // No redacted text was kept: such a match is never confirmed.
+                return;
+            }
+            if (rawHashes == null) {
+                rawHashes = new long[CONFIRMATIONS];
+                redactedHashes = new long[CONFIRMATIONS];
+                rawRequests = new String[CONFIRMATIONS];
+            }
+            for (int i = 0; i < raw; i++) {
+                if (rawHashes[i] == rawHash && redactedHashes[i] == redactedHash) {
+                    // A raw text already remembered, from this request or another: it confirms nothing more.
+                    return;
+                }
+            }
+            if (raw < CONFIRMATIONS) {
+                rawHashes[raw] = rawHash;
+                redactedHashes[raw] = redactedHash;
+                rawRequests[raw] = requestId;
+                raw++;
+            }
+        }
+
+        /**
+         * Whether the row's text varies with the value: two requests produced different raw texts with the same redacted
+         * text, before any masking or normalization, so the value is part of the text, not a word it always holds.
+         */
+        boolean confirmed() {
+            for (int i = 0; i < raw; i++) {
+                for (int j = i + 1; j < raw; j++) {
+                    if (redactedHashes[i] == redactedHashes[j]
+                            && rawHashes[i] != rawHashes[j]
+                            && !rawRequests[i].equals(rawRequests[j])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /** Whether a security-sinks row is shown: standing alone, or confirmed. */
+        boolean shown() {
+            return standalone || confirmed();
+        }
+
+        /**
+         * A thread-activity record: a start or a creation counts, with its distinct request; a follow-up lands on its
+         * creation's row: left running when its request ended, an executor shut down with its lifetime, or reclaimed by
+         * the collector without a shutdown.
+         */
+        private void threads(SideEffectRecord record, String requestId) {
+            switch (record.kind()) {
+                case SideEffectsCatalog.KIND_THREAD_START, SideEffectsCatalog.KIND_EXECUTOR_CREATE -> {
+                    count += record.count();
+                    countRequest(record);
+                }
+                case SideEffectsCatalog.KIND_THREAD_LEFT_RUNNING, SideEffectsCatalog.KIND_EXECUTOR_LEFT_RUNNING ->
+                    leftRunning += record.count();
+                case SideEffectsCatalog.KIND_EXECUTOR_SHUTDOWN -> {
+                    completed += record.count();
+                    nanos += record.nanos();
+                    maxNanos = Math.max(maxNanos, record.maxNanos());
+                }
+                case SideEffectsCatalog.KIND_EXECUTOR_RECLAIMED -> failed += record.count();
+                default -> {
+                    // A kind of a later bridge: counted nowhere.
+                }
+            }
+        }
+
+        /**
+         * A resources record: its first report counts the resource, with its distinct request; still open after its
+         * request ({@code leftRunning}), closed after it, handed off ({@code completed}, with how long it stayed open),
+         * or reclaimed by the collector never closed ({@code failed}).
+         */
+        private void resources(SideEffectRecord record, String requestId) {
+            if ((record.exitStatus() & SideEffectsCatalog.DETAIL_FIRST_REPORT) != 0) {
+                count += record.count();
+                countRequest(record);
+            }
+            switch (record.kind()) {
+                case SideEffectsCatalog.KIND_RESOURCE_LEFT_OPEN -> leftRunning += record.count();
+                case SideEffectsCatalog.KIND_RESOURCE_CLOSED_LATE -> {
+                    completed += record.count();
+                    nanos += record.nanos();
+                    maxNanos = Math.max(maxNanos, record.maxNanos());
+                }
+                case SideEffectsCatalog.KIND_RESOURCE_RECLAIMED -> {
+                    failed += record.count();
+                    maxNanos = Math.max(maxNanos, record.maxNanos());
+                }
+                default -> {
+                    // A kind of a later bridge: counted nowhere.
+                }
+            }
+            // A first report the agent's ring dropped, or that Clear recording removed: the resource still counts once.
+            count = Math.max(count, Math.max(failed, leftRunning));
+        }
+
+        /** Counts the record's request once among the latest {@value #RECENT_REQUESTS} distinct ones. */
+        private void countRequest(SideEffectRecord record) {
+            String request = record.requestId();
+            if (request == null) {
+                return;
+            }
+            if (recentRequests == null) {
+                recentRequests = new LinkedHashSet<>();
+            }
+            if (recentRequests.add(request)) {
+                requests++;
+                if (recentRequests.size() > RECENT_REQUESTS) {
+                    Iterator<String> oldest = recentRequests.iterator();
+                    oldest.next();
+                    oldest.remove();
+                }
+            }
+        }
+
+        void merge(Row other, boolean withExemplars) {
+            standalone |= other.standalone;
+            if (other.classes != null) {
+                classes(String.join(", ", other.classes));
+            }
+            moreClasses |= other.moreClasses;
+            for (int i = 0; i < other.raw; i++) {
+                remember(other.rawHashes[i], other.redactedHashes[i], other.rawRequests[i]);
+            }
+            count += other.count;
+            leftRunning += other.leftRunning;
+            requests += other.requests;
+            failed += other.failed;
+            completed += other.completed;
+            nonZeroExits += other.nonZeroExits;
+            if (other.lastExitStatus != null && (lastExitStatus == null || other.lastSeen >= lastSeen)) {
+                lastExitStatus = other.lastExitStatus;
+            }
+            nanos += other.nanos;
+            maxNanos = Math.max(maxNanos, other.maxNanos);
+            firstSeen = Math.min(firstSeen, other.firstSeen);
+            lastSeen = Math.max(lastSeen, other.lastSeen);
+            if (withExemplars) {
+                for (String id : other.exemplars) {
+                    if (exemplars.size() < EXEMPLARS && !exemplars.contains(id)) {
+                        exemplars.add(id);
+                    }
+                }
+            }
+        }
+
+        SideEffectsRowDto dto(String[] capture) {
+            return new SideEffectsRowDto(
+                    key.scope(),
+                    key.attribution(),
+                    key.sensor(),
+                    key.kind(),
+                    key.target(),
+                    key.callSite(),
+                    key.insideMethod(),
+                    key.origin(),
+                    key.location(),
+                    count,
+                    failed,
+                    completed,
+                    nonZeroExits,
+                    lastExitStatus,
+                    nanos / 1_000_000L,
+                    maxNanos / 1_000_000L,
+                    firstSeen == Long.MAX_VALUE ? 0L : firstSeen,
+                    lastSeen,
+                    exemplars,
+                    key.client(),
+                    capture == null ? null : capture[0],
+                    capture == null ? null : capture[1],
+                    leftRunning,
+                    requests,
+                    key.parameter(),
+                    detail());
+        }
+
+        /** A security-sinks row's sentence: a JDK check's fact, or what request input reached. */
+        private String detail() {
+            if (!SideEffectsCatalog.SECURITY_SINKS_ID.equals(key.sensor())) {
+                return null;
+            }
+            boolean other = SideEffectsRowDto.OTHER.equals(key.scope());
+            if (CheckWording.isCheck(key.kind())) {
+                return other
+                        ? CheckWording.OTHER
+                        : CheckWording.detail(
+                                key.kind(),
+                                key.target(),
+                                key.callSite(),
+                                key.origin(),
+                                key.location(),
+                                classes == null ? List.of() : List.copyOf(classes),
+                                moreClasses);
+            }
+            return other
+                    ? SinkWording.OTHER
+                    : SinkWording.detail(key.kind(), key.location(), key.parameter(), key.target(), confirmed());
+        }
+    }
+
+    /**
+     * An observation waiting for its owner's name: a request's route, or an execution's label, under {@code key}, the
+     * request id, or {@value #EXECUTION_KEY} and the execution id; or, with no key, an unowned connect waiting only to
+     * know whether a REST client call captured it.
+     */
+    private record Pending(Observation observation, String key, long since) {
+
+        boolean execution() {
+            return key != null && key.startsWith(EXECUTION_KEY);
+        }
+    }
+
+    /** The key prefix of an execution no request owns, among the names the store waits for. */
+    static final String EXECUTION_KEY = "execution:";
+
+    private final long readyAt;
+    private final int maxRows;
+    private final int maxRowsPerSensor;
+    private final int maxPending;
+    private final Map<Key, Row> rows = new LinkedHashMap<>();
+    private final Map<String, Integer> rowsPerSensor = new HashMap<>();
+    private final Map<String, Long> droppedPerSensor = new HashMap<>();
+    private final Map<String, Long> foldedPerSensor = new HashMap<>();
+    private final ArrayDeque<Pending> pending = new ArrayDeque<>();
+    /** The request ids thread-activity rows remember, for the memory accounting. */
+    private long recentRequestEntries;
+
+    private final LinkedHashMap<String, String> threadRoutes = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > THREAD_ROUTES;
+        }
+    };
+    private final LinkedHashMap<String, String> routes = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > ROUTE_CACHE;
+        }
+    };
+
+    /**
+     * When each waiting key was first named, by key: a waiting connect's grace runs from then, or from its own time when
+     * later, never from before its owner was named.
+     */
+    private final Map<String, Long> namedAt = new HashMap<>();
+
+    /** When the reader last did not name a waiting request, by request id: asked again only after a while. */
+    private final Map<String, Long> misses = new HashMap<>();
+
+    private long observations;
+    private long folded;
+    private long version;
+
+    /**
+     * How each waiting connect was decided, by its owner, target, call site, and start, so the finish record of a
+     * non-blocking connect is decided as its connect was, never into a row of its own.
+     */
+    private final LinkedHashMap<String, String> connectDecisions = new LinkedHashMap<>(16, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > MAX_CONNECT_DECISIONS;
+        }
+    };
+
+    private NetworkCapture capture = NetworkCapture.NONE;
+
+    /** The family of the thread that finished starting, whose startup observations alone are keys (M5-7b). */
+    private String startupThread;
+
+    /** @param readyAt when the application finished starting, in epoch milliseconds: earlier observations are startup's */
+    SideEffectsStore(long readyAt) {
+        this(readyAt, MAX_ROWS, MAX_ROWS_PER_SENSOR, MAX_PENDING);
+    }
+
+    /** With the bounds a configured agent evidence bound scaled (M5-11). */
+    SideEffectsStore(long readyAt, int maxRows, int maxRowsPerSensor, int maxPending) {
+        this.readyAt = readyAt;
+        this.maxRows = maxRows;
+        this.maxRowsPerSensor = Math.min(maxRowsPerSensor, maxRows);
+        this.maxPending = maxPending;
+    }
+
+    /** Installs what decides whether a REST client call captured a network observation. */
+    void setCapture(NetworkCapture capture) {
+        this.capture = capture == null ? NetworkCapture.NONE : capture;
+    }
+
+    /** The rows retained, Other rows included. */
+    int rowCount() {
+        return rows.size();
+    }
+
+    /**
+     * The estimated bytes retained: rows, the distinct requests thread-activity rows remember, waiting observations, and
+     * the route caches.
+     */
+    long retainedBytes() {
+        return rows.size() * ROW_BYTES
+                + recentRequestEntries * REQUEST_ID_BYTES
+                + pending.size() * PENDING_BYTES
+                + (routes.size() + threadRoutes.size()) * ROUTE_BYTES;
+    }
+
+    /** The most bytes this store holds under its bounds. */
+    long maxBytes() {
+        return (maxRows + SideEffectsCatalog.SENSORS.size()) * ROW_BYTES
+                + (long) maxRowsPerSensor * RECENT_REQUESTS * REQUEST_ID_BYTES
+                + (long) maxPending * PENDING_BYTES
+                + (ROUTE_CACHE + THREAD_ROUTES) * ROUTE_BYTES;
+    }
+
+    /** Drops every row and waiting observation, and the routes it named: <b>Clear recording</b>. */
+    void clear() {
+        rows.clear();
+        rowsPerSensor.clear();
+        pending.clear();
+        routes.clear();
+        threadRoutes.clear();
+        recentRequestEntries = 0;
+        misses.clear();
+        namedAt.clear();
+        connectDecisions.clear();
+        folded = 0;
+        foldedPerSensor.clear();
+        version++;
+    }
+
+    /** Names the thread that finished starting: only its startup observations are side-effect keys. */
+    void setStartupThread(String family) {
+        this.startupThread = family;
+    }
+
+    private boolean startupThread(Observation observation) {
+        return startupThread == null || startupThread.equals(observation.threadFamily());
+    }
+
+    /** When the application finished starting: earlier observations are startup's. */
+    long readyAt() {
+        return readyAt;
+    }
+
+    /** Changes whenever a row is added to or the store is cleared: a cheap fingerprint of its rows. */
+    long version() {
+        return version;
+    }
+
+    /**
+     * Whether {@code record} follows up an earlier record's row: a thread-activity shutdown or left-running, or a
+     * resource's report after its first, which may come minutes later, its request's route since evicted.
+     */
+    private static boolean followUp(SideEffectRecord record) {
+        if (record.sensor() == SideEffectsCatalog.RECORD_THREADS) {
+            return !SideEffectsCatalog.threadCreation(record.kind());
+        }
+        return record.sensor() == SideEffectsCatalog.RECORD_RESOURCES
+                && (record.exitStatus() & SideEffectsCatalog.DETAIL_FIRST_REPORT) == 0;
+    }
+
+    /** Whether {@code record} opens a row its follow-ups land on: a thread start or executor creation, or a first report. */
+    private static boolean firstOfItsRow(SideEffectRecord record) {
+        if (record.sensor() == SideEffectsCatalog.RECORD_THREADS) {
+            return SideEffectsCatalog.threadCreation(record.kind());
+        }
+        return record.sensor() == SideEffectsCatalog.RECORD_RESOURCES
+                && (record.exitStatus() & SideEffectsCatalog.DETAIL_FIRST_REPORT) != 0;
+    }
+
+    /** Adds one observation: a request's waits for its route, any other is attributed now. */
+    void add(Observation observation) {
+        observations++;
+        SideEffectRecord record = observation.record();
+        String requestId = record.requestId();
+        String executionId = requestId == null ? record.executionId() : null;
+        String key = requestId != null ? requestId : executionId == null ? null : EXECUTION_KEY + executionId;
+        if (key != null) {
+            String name;
+            if (followUp(record)) {
+                // A follow-up lands where its creation did: a creation a long request made before its route was named
+                // counted under the unknown route, and so does its follow-up.
+                name = threadRoutes.get(key);
+                if (name == null) {
+                    name = routes.get(key);
+                }
+            } else {
+                name = routes.get(key);
+            }
+            if (name != null && !observation.waiting()) {
+                attribute(observation, key, name);
+                return;
+            }
+            if (pending.size() >= maxPending) {
+                if (name != null) {
+                    // Full: decided now rather than dropped.
+                    attribute(decide(observation, true), key, name);
+                } else {
+                    drop(observation.sensor(), record.count());
+                }
+                return;
+            }
+            pending.add(new Pending(observation, key, record.lastMillis()));
+            return;
+        }
+        if (observation.waiting()) {
+            if (pending.size() >= maxPending) {
+                attributeUnowned(decide(observation, true));
+            } else {
+                pending.add(new Pending(observation, null, record.lastMillis()));
+            }
+            return;
+        }
+        attributeUnowned(observation);
+    }
+
+    /**
+     * {@code observation} with its capture decided: captured when a REST client call names it, else not captured when
+     * {@code force}; {@code null} while it still waits.
+     */
+    private Observation decide(Observation observation, boolean force) {
+        if (!observation.waiting()) {
+            return observation;
+        }
+        SideEffectRecord record = observation.record();
+        String connect = connectKey(observation);
+        if (record.kind() == SideEffectsCatalog.KIND_CONNECT_FINISH) {
+            String decided = connectDecisions.get(connect);
+            if (decided != null) {
+                return observation.withCapture(decided);
+            }
+            if (!force) {
+                // Its connect, published first, is decided first.
+                return null;
+            }
+        }
+        boolean matched;
+        try {
+            matched = capture.restClient(
+                    observation.host(),
+                    observation.port(),
+                    record.requestId(),
+                    record.executionId(),
+                    record.firstMillis(),
+                    record.lastMillis());
+        } catch (RuntimeException ex) {
+            matched = false;
+        }
+        String decided = matched ? REST_CAPTURED : force ? REST_NOT_CAPTURED : null;
+        if (decided != null && record.kind() == SideEffectsCatalog.KIND_CONNECT) {
+            connectDecisions.put(connect, decided);
+        }
+        return decided == null ? null : observation.withCapture(decided);
+    }
+
+    /** What a connect and its finish record share: owner, target, call site, and start. */
+    private static String connectKey(Observation observation) {
+        SideEffectRecord record = observation.record();
+        return record.request() + "|" + record.execution() + "|" + observation.target() + "|" + observation.callSite()
+                + "|" + record.firstMillis();
+    }
+
+    /** An unowned observation: startup's, its thread family's, or unattributed. */
+    private void attributeUnowned(Observation observation) {
+        SideEffectRecord record = observation.record();
+        if (record.firstMillis() < readyAt) {
+            aggregate(observation, SideEffectsRowDto.STARTUP, STARTUP, null);
+        } else if (observation.threadFamily() != null) {
+            aggregate(observation, SideEffectsRowDto.THREAD, observation.threadFamily(), null);
+        } else {
+            aggregate(observation, SideEffectsRowDto.UNATTRIBUTED, UNATTRIBUTED, null);
+        }
+    }
+
+    /** The observations waiting for their request's route. */
+    int pendingCount() {
+        return pending.size();
+    }
+
+    /** The keys waiting for a name: request ids, and {@value #EXECUTION_KEY} execution ids. */
+    Set<String> pendingRequests() {
+        Set<String> ids = new HashSet<>();
+        for (Pending waiting : pending) {
+            if (waiting.key() != null) {
+                ids.add(waiting.key());
+            }
+        }
+        return ids;
+    }
+
+    /** A named observation: a request's under its route, an execution's under its label. */
+    private void attribute(Observation observation, String key, String name) {
+        if (firstOfItsRow(observation.record())) {
+            // The first name a creation of this request landed under, kept for its follow-ups.
+            threadRoutes.putIfAbsent(key, name);
+        }
+        if (key.startsWith(EXECUTION_KEY)) {
+            aggregate(observation, SideEffectsRowDto.EXECUTION, name, null);
+        } else {
+            aggregate(observation, SideEffectsRowDto.ROUTE, name, key);
+        }
+    }
+
+    /**
+     * Attributes the waiting observations whose route or execution label {@code named} names, and those waiting since
+     * before {@code now - PENDING_MILLIS} to {@value #UNKNOWN_ROUTE} or {@value #BACKGROUND}.
+     */
+    void resolve(Map<String, String> named, long now) {
+        if (named != null) {
+            for (Map.Entry<String, String> entry : named.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null) {
+                    routes.put(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+        boolean refreshed = false;
+        Iterator<Pending> iterator = pending.iterator();
+        while (iterator.hasNext()) {
+            Pending waiting = iterator.next();
+            Observation observation = waiting.observation();
+            if (observation.waiting() && !refreshed) {
+                refreshCapture();
+                refreshed = true;
+            }
+            long age = now - waiting.since();
+            if (waiting.key() == null) {
+                long wait = REST_WAITING_HTTP.equals(observation.captureKey())
+                        ? UNOWNED_HTTP_CAPTURE_MILLIS
+                        : UNOWNED_CAPTURE_MILLIS;
+                Observation decided = decide(observation, age >= wait);
+                if (decided != null) {
+                    attributeUnowned(decided);
+                    iterator.remove();
+                }
+                continue;
+            }
+            String name = routes.get(waiting.key());
+            if (name != null) {
+                // A request is named once it ended, so its REST calls are recorded: a short grace. An execution may be
+                // named by any of its events while it still runs, so its calls may be recorded much later.
+                long namedSince = namedAt.computeIfAbsent(waiting.key(), key -> now);
+                long grace = waiting.execution() ? UNOWNED_HTTP_CAPTURE_MILLIS : CAPTURE_GRACE_MILLIS;
+                Observation decided = decide(observation, now - Math.max(namedSince, waiting.since()) >= grace);
+                if (decided != null) {
+                    attribute(decided, waiting.key(), name);
+                    iterator.remove();
+                }
+            } else if (age >= PENDING_MILLIS) {
+                attribute(decide(observation, true), waiting.key(), waiting.execution() ? BACKGROUND : UNKNOWN_ROUTE);
+                iterator.remove();
+            }
+        }
+    }
+
+    private void refreshCapture() {
+        try {
+            capture.refresh();
+        } catch (RuntimeException ex) {
+            // Decided from what was indexed before.
+        }
+    }
+
+    /**
+     * {@link #resolve(Map, long)} with the routes {@code reader} names for the waiting requests: a request is asked for
+     * when it first waits, and again only once {@code retryMillis} passed since the reader last did not name it.
+     */
+    void resolve(Function<Set<String>, Map<String, String>> reader, long now, long retryMillis) {
+        if (pending.isEmpty()) {
+            return;
+        }
+        Set<String> ids = new HashSet<>();
+        for (String id : pendingRequests()) {
+            Long missed = misses.get(id);
+            if (!routes.containsKey(id) && (missed == null || now - missed >= retryMillis)) {
+                ids.add(id);
+            }
+        }
+        Map<String, String> named = Map.of();
+        if (!ids.isEmpty() && reader != null) {
+            try {
+                Map<String, String> read = reader.apply(ids);
+                named = read == null ? Map.of() : read;
+            } catch (RuntimeException ex) {
+                named = Map.of();
+            }
+            for (String id : ids) {
+                if (!named.containsKey(id)) {
+                    misses.put(id, now);
+                }
+            }
+        }
+        resolve(named, now);
+        Set<String> waiting = pendingRequests();
+        misses.keySet().retainAll(waiting);
+        namedAt.keySet().retainAll(waiting);
+    }
+
+    private void aggregate(Observation observation, String scope, String attribution, String requestId) {
+        version++;
+        String sensor = observation.sensor();
+        Key key = new Key(
+                scope,
+                attribution,
+                sensor,
+                observation.kind(),
+                observation.target(),
+                observation.callSite(),
+                observation.insideMethod(),
+                observation.client(),
+                observation.captureKey(),
+                observation.origin(),
+                observation.location(),
+                observation.parameter(),
+                SideEffectsRowDto.STARTUP.equals(scope) && startupThread(observation));
+        Row row = rows.get(key);
+        if (row == null) {
+            int perSensor = rowsPerSensor.getOrDefault(sensor, 0);
+            if ((perSensor >= maxRowsPerSensor || rows.size() >= maxRows)
+                    && observation.record().sensor() == SideEffectsCatalog.RECORD_SECURITY_SINKS
+                    && !standsAlone(observation.record())) {
+                // A match no request confirmed yet never reaches the Other row, which is shown: counted as not shown.
+                unconfirmedPastCap += observation.record().count();
+                return;
+            }
+            if (perSensor >= maxRowsPerSensor || rows.size() >= maxRows) {
+                Key other = new Key(
+                        SideEffectsRowDto.OTHER,
+                        OTHER,
+                        sensor,
+                        observation.kind(),
+                        OTHER,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null);
+                row = rows.get(other);
+                if (row == null) {
+                    if (rows.size() >= maxRows + SideEffectsCatalog.SENSORS.size()) {
+                        drop(sensor, observation.record().count());
+                        return;
+                    }
+                    row = new Row(other);
+                    rows.put(other, row);
+                }
+                folded += observation.record().count();
+                foldedPerSensor.merge(sensor, observation.record().count(), Long::sum);
+                row.add(observation, null);
+                return;
+            }
+            row = new Row(key);
+            rows.put(key, row);
+            rowsPerSensor.put(sensor, perSensor + 1);
+        }
+        int remembered = row.recentRequests == null ? 0 : row.recentRequests.size();
+        row.add(observation, requestId);
+        recentRequestEntries += (row.recentRequests == null ? 0 : row.recentRequests.size()) - remembered;
+    }
+
+    /** The prefix of the key that marks a thread local's rows while its holder is not resolved. */
+    static final String UNRESOLVED_THREAD_LOCAL = "thread-local-unresolved:";
+
+    /** The key marking the rows of the thread local the bridge registered as {@code id} with hash code {@code hash}. */
+    static String unresolvedThreadLocal(int id, int hash) {
+        return UNRESOLVED_THREAD_LOCAL + id + ':' + hash;
+    }
+
+    private static boolean unresolvedThreadLocal(String captureKey) {
+        return captureKey != null && captureKey.startsWith(UNRESOLVED_THREAD_LOCAL);
+    }
+
+    /**
+     * The thread local whose rows {@code marker} marks while its holder was not resolved is resolved after all: its rows
+     * and waiting observations move to {@code target}, {@code kind}, and {@code origin}, merged with what they already
+     * hold, or are removed when {@code drop}, as a framework's or a per-thread cache's. How often it was left set in what
+     * was removed.
+     */
+    long resolveThreadLocal(String marker, String kind, String target, String origin, boolean drop) {
+        long removed = 0;
+        List<Row> moved = new ArrayList<>();
+        Iterator<Map.Entry<Key, Row>> iterator = rows.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Row row = iterator.next().getValue();
+            if (!marker.equals(row.key.captureKey())) {
+                continue;
+            }
+            iterator.remove();
+            rowsPerSensor.merge(row.key.sensor(), -1, Integer::sum);
+            removed += row.count;
+            if (!drop) {
+                moved.add(row);
+            }
+        }
+        for (Row row : moved) {
+            Key key = new Key(
+                    row.key.scope(),
+                    row.key.attribution(),
+                    row.key.sensor(),
+                    kind,
+                    target,
+                    row.key.callSite(),
+                    row.key.insideMethod(),
+                    row.key.client(),
+                    null,
+                    origin,
+                    row.key.location(),
+                    row.key.parameter(),
+                    row.key.startupThread());
+            Row existing = rows.get(key);
+            if (existing == null) {
+                existing = new Row(key);
+                rows.put(key, existing);
+                rowsPerSensor.merge(key.sensor(), 1, Integer::sum);
+            }
+            existing.merge(row, true);
+        }
+        int size = pending.size();
+        for (int i = 0; i < size; i++) {
+            Pending waiting = pending.poll();
+            Observation observation = waiting.observation();
+            if (!marker.equals(observation.captureKey())) {
+                pending.add(waiting);
+                continue;
+            }
+            if (drop) {
+                removed += observation.record().count();
+                continue;
+            }
+            pending.add(new Pending(
+                    new Observation(
+                            observation.record(),
+                            observation.sensor(),
+                            kind,
+                            target,
+                            observation.callSite(),
+                            observation.insideMethod(),
+                            observation.threadFamily(),
+                            observation.client(),
+                            null,
+                            observation.host(),
+                            observation.port(),
+                            origin,
+                            observation.location()),
+                    waiting.key(),
+                    waiting.since()));
+        }
+        version++;
+        return drop ? removed : 0L;
+    }
+
+    private void drop(String sensor, long count) {
+        droppedPerSensor.merge(sensor, count, Long::sum);
+    }
+
+    /**
+     * {@code sensor}'s rows, most frequent first, the Other row last. While {@code routesVisible} is false, route rows
+     * are merged under {@value #ROUTE_HIDDEN} and lose their exemplar request ids; while {@code codePathsVisible} is
+     * false, rows lose the bean method they happened inside, which is Code Paths' evidence, and merge without it.
+     */
+    List<SideEffectsRowDto> rows(String sensor, boolean routesVisible, boolean codePathsVisible) {
+        return rows(sensor, routesVisible, codePathsVisible, captureKey -> null);
+    }
+
+    /**
+     * {@link #rows(String, boolean, boolean)}, a network row's capture key read through {@code captures} as {@code
+     * {capture, capturedBy}}, which says on read whether a visible panel shows it.
+     */
+    List<SideEffectsRowDto> rows(
+            String sensor, boolean routesVisible, boolean codePathsVisible, Function<String, String[]> captures) {
+        Map<Key, Row> merged = new LinkedHashMap<>();
+        for (Row row : rows.values()) {
+            if (!row.key.sensor().equals(sensor)) {
+                continue;
+            }
+            boolean hideRoute = !routesVisible && SideEffectsRowDto.ROUTE.equals(row.key.scope());
+            boolean hideMethod = !codePathsVisible && row.key.insideMethod() != null;
+            Key shown = new Key(
+                    row.key.scope(),
+                    hideRoute ? ROUTE_HIDDEN : row.key.attribution(),
+                    row.key.sensor(),
+                    row.key.kind(),
+                    row.key.target(),
+                    row.key.callSite(),
+                    hideMethod ? null : row.key.insideMethod(),
+                    row.key.client(),
+                    unresolvedThreadLocal(row.key.captureKey()) ? null : row.key.captureKey(),
+                    row.key.origin(),
+                    row.key.location(),
+                    row.key.parameter());
+            // Always a copy: a read never changes the store's own rows.
+            Row target = merged.get(shown);
+            if (target == null) {
+                target = new Row(shown);
+                merged.put(shown, target);
+            }
+            target.merge(row, !hideRoute);
+        }
+        List<SideEffectsRowDto> list = new ArrayList<>();
+        for (Row row : merged.values()) {
+            if (!visible(row)) {
+                // A match that may be coincidental, as a value equal to a column the statement always names: counted
+                // until a second request confirms the text varies with the value.
+                continue;
+            }
+            list.add(row.dto(row.key.captureKey() == null ? null : captures.apply(row.key.captureKey())));
+        }
+        list.sort(Comparator.comparing((SideEffectsRowDto row) -> SideEffectsRowDto.OTHER.equals(row.scope()))
+                .thenComparing(Comparator.comparingLong((SideEffectsRowDto row) -> row.count() + row.completed())
+                        .reversed())
+                .thenComparing(SideEffectsRowDto::lastSeen, Comparator.reverseOrder()));
+        return list;
+    }
+
+    /**
+     * One network row an execution or a call site opened: its scope and attribution, its target, its call site, and its
+     * count; for the runtime model's {@code OPENS} edges.
+     */
+    record Opened(String scope, String attribution, String target, String callSite, long count) {}
+
+    /** The connects and datagrams of {@code sensor}'s rows, route rows only while {@code routesVisible}. */
+    List<Opened> opened(String sensor, boolean routesVisible) {
+        List<Opened> opened = new ArrayList<>();
+        for (Row row : rows.values()) {
+            Key key = row.key;
+            if (!key.sensor().equals(sensor)
+                    || SideEffectsRowDto.OTHER.equals(key.scope())
+                    || SideEffectsCatalog.LOOKUP.equals(key.kind())
+                    || row.count + row.completed == 0) {
+                continue;
+            }
+            if (SideEffectsRowDto.ROUTE.equals(key.scope()) && !routesVisible) {
+                continue;
+            }
+            opened.add(new Opened(key.scope(), key.attribution(), key.target(), key.callSite(), row.count));
+        }
+        return opened;
+    }
+
+    /**
+     * This run's side-effect keys ({@code docs/PLAN-v2.md} M5-7b): its rows and the waiting observations whose owner is
+     * already named, merged by sensor, kind, target, scope, and owner, for route, execution, and startup owners only. A
+     * thread family's or an unattributed row is no key, as a thread's records may stay buffered in the agent; an owner
+     * not named yet ({@value #UNKNOWN_ROUTE}, {@value #BACKGROUND}, or still waiting) and an Other row count as
+     * omitted, as do the rows a sensor's quota marker hides. Infrastructure connections and files the JDK, logging, or
+     * class loading opened are left out, and so is a security-sinks match no second request confirmed.
+     */
+    Keys keys() {
+        Map<String, KeyCount> merged = new LinkedHashMap<>();
+        Map<String, Long> omitted = new HashMap<>();
+        Set<String> foldedCounted = new HashSet<>();
+        for (Row row : rows.values()) {
+            Key key = row.key;
+            if (!visible(row)) {
+                // A security-sinks match no second request confirmed: never a key, as it is never a row.
+                continue;
+            }
+            if (SideEffectsRowDto.OTHER.equals(key.scope())) {
+                // One Other row per kind: the sensor's folded operations are counted once.
+                if (foldedCounted.add(key.sensor())) {
+                    omitted.merge(
+                            key.sensor(), Math.max(1L, foldedPerSensor.getOrDefault(key.sensor(), 1L)), Long::sum);
+                }
+                continue;
+            }
+            if (SideEffectsRowDto.STARTUP.equals(key.scope()) && !key.startupThread()) {
+                // Another thread's early work may land on either side of the end of startup from run to run.
+                continue;
+            }
+            if (SideEffectsCatalog.RESOURCES_ID.equals(key.sensor()) && row.failed == 0) {
+                // Only a resource reclaimed never closed is a key: one still open after its request, or closed after
+                // it, is a pool's or a cache's, handed off on purpose.
+                continue;
+            }
+            addKey(
+                    merged,
+                    omitted,
+                    key.sensor(),
+                    key.kind(),
+                    key.target(),
+                    key.scope(),
+                    key.attribution(),
+                    key.client(),
+                    key.captureKey(),
+                    key.origin(),
+                    SideEffectsCatalog.RESOURCES_ID.equals(key.sensor())
+                            ? row.failed
+                            : row.count > 0 ? row.count : row.completed);
+        }
+        for (Pending waiting : pending) {
+            Observation observation = waiting.observation();
+            if (SideEffectsCatalog.SECURITY_SINKS_ID.equals(observation.sensor())) {
+                // Not confirmed until its row is: never a key while it waits.
+                continue;
+            }
+            if (observation.record().sensor() == SideEffectsCatalog.RECORD_RESOURCES
+                    && observation.record().kind() != SideEffectsCatalog.KIND_RESOURCE_RECLAIMED) {
+                continue;
+            }
+            String scope;
+            String owner;
+            if (waiting.key() == null) {
+                if (observation.record().firstMillis() >= readyAt || !startupThread(observation)) {
+                    continue;
+                }
+                scope = SideEffectsRowDto.STARTUP;
+                owner = STARTUP;
+            } else {
+                owner = routes.get(waiting.key());
+                if (owner == null) {
+                    omitted.merge(observation.sensor(), 1L, Long::sum);
+                    continue;
+                }
+                scope = waiting.execution() ? SideEffectsRowDto.EXECUTION : SideEffectsRowDto.ROUTE;
+            }
+            addKey(
+                    merged,
+                    omitted,
+                    observation.sensor(),
+                    observation.kind(),
+                    observation.target(),
+                    scope,
+                    owner,
+                    observation.client(),
+                    observation.captureKey(),
+                    observation.origin(),
+                    observation.record().kind() == SideEffectsCatalog.KIND_CONNECT_FINISH
+                            ? 0L
+                            : observation.record().count());
+        }
+        List<KeyCount> keys = new ArrayList<>(merged.values());
+        return new Keys(keys, omitted);
+    }
+
+    private static void addKey(
+            Map<String, KeyCount> merged,
+            Map<String, Long> omitted,
+            String sensor,
+            String kind,
+            String target,
+            String scope,
+            String owner,
+            String client,
+            String captureKey,
+            String origin,
+            long count) {
+        if (!SideEffectsRowDto.ROUTE.equals(scope)
+                && !SideEffectsRowDto.EXECUTION.equals(scope)
+                && !SideEffectsRowDto.STARTUP.equals(scope)) {
+            return;
+        }
+        if (CAPTURE_INFRASTRUCTURE.equals(captureKey)
+                || (origin != null
+                        && (SideEffectOrigins.groupedApart(origin) || SideEffectOrigins.BOOTUI.equals(origin)))) {
+            return;
+        }
+        if (owner == null
+                || target == null
+                || UNKNOWN_ROUTE.equals(owner)
+                || BACKGROUND.equals(owner)
+                || unknownTarget(target)) {
+            omitted.merge(sensor, 1L, Long::sum);
+            return;
+        }
+        String identity = sensor + '\u0000' + kind + '\u0000' + target + '\u0000' + scope + '\u0000' + owner;
+        KeyCount existing = merged.get(identity);
+        if (existing == null) {
+            merged.put(identity, new KeyCount(sensor, kind, target, scope, owner, client, count));
+        } else {
+            merged.put(
+                    identity,
+                    new KeyCount(
+                            sensor,
+                            kind,
+                            target,
+                            scope,
+                            owner,
+                            existing.client() != null ? existing.client() : client,
+                            existing.count() + count));
+        }
+    }
+
+    /** Whether a target is a marker standing for targets the agent could not keep, not a target. */
+    static boolean unknownTarget(String target) {
+        return target == null
+                || SideEffectsService.OTHER_HOSTS.equals(target)
+                || SideEffectsService.TOO_MANY_PATHS.equals(target)
+                || SideEffectsService.TOO_MANY_NAMES.equals(target)
+                || SideEffectsService.UNKNOWN_TARGET.equals(target);
+    }
+
+    /** One side-effect key with its count. */
+    record KeyCount(String sensor, String kind, String target, String scope, String owner, String client, long count) {}
+
+    /**
+     * A run's side-effect keys.
+     *
+     * @param keys the keys, merged
+     * @param omitted the keys or observations left out per sensor, as their owner or target is not known
+     */
+    record Keys(List<KeyCount> keys, Map<String, Long> omitted) {}
+
+    /** {@code sensor}'s rows, the Other row included. */
+    /** Security-sinks matches not confirmed yet that arrived past the row caps, never kept as rows. */
+    private long unconfirmedPastCap;
+
+    /** The security-sinks rows not shown yet: matches no second request confirmed, which may be coincidental. */
+    long unconfirmed() {
+        long hidden = unconfirmedPastCap;
+        for (Row row : rows.values()) {
+            if (!visible(row)) {
+                hidden++;
+            }
+        }
+        return hidden;
+    }
+
+    long rowCount(String sensor) {
+        long count = 0;
+        for (Row row : rows.values()) {
+            if (row.key.sensor().equals(sensor) && visible(row)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** The operations {@code sensor}'s shown rows count: starts, for processes. */
+    long occurrences(String sensor) {
+        long count = 0;
+        for (Row row : rows.values()) {
+            if (row.key.sensor().equals(sensor) && visible(row)) {
+                count += row.count;
+            }
+        }
+        return count;
+    }
+
+    /** Whether a row is shown: every row but a security-sinks match not confirmed yet. */
+    private static boolean visible(Row row) {
+        return !SideEffectsCatalog.SECURITY_SINKS_ID.equals(row.key.sensor())
+                || SideEffectsRowDto.OTHER.equals(row.key.scope())
+                || row.shown();
+    }
+
+    /** What {@code sensor} saw that no row counts. */
+    long dropped(String sensor) {
+        return droppedPerSensor.getOrDefault(sensor, 0L);
+    }
+
+    /** The rows a sensor keeps apart before its Other row. */
+    int maxRowsPerSensor() {
+        return maxRowsPerSensor;
+    }
+
+    /** The rows the run keeps apart before Other rows. */
+    int maxRows() {
+        return maxRows;
+    }
+
+    /** Observations added since the run started. */
+    long observations() {
+        return observations;
+    }
+
+    /** Operations counted in an Other row because their sensor or the store was at its cap, since the last clear. */
+    long folded() {
+        return folded;
+    }
+}

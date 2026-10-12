@@ -3,12 +3,20 @@ package io.github.jdubois.bootui.engine.sqltrace;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.journal.ConnectionPayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.engine.journal.SqlPayload;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder.CapturedStatement;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder.Category;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder.StatementType;
+import io.github.jdubois.bootui.spi.CorrelationContext;
 import java.io.Closeable;
 import java.lang.reflect.Proxy;
 import java.sql.CallableStatement;
@@ -17,6 +25,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
@@ -55,11 +64,119 @@ class SqlTracingProxiesTests {
         CapturedStatement entry = recorder.recent().get(0);
         assertThat(entry.sql()).isEqualTo(sql);
         assertThat(entry.statementType()).isEqualTo(StatementType.PREPARED);
+        assertThat(entry.executed()).isTrue();
         assertThat(entry.category()).isEqualTo(Category.SELECT);
         assertThat(entry.success()).isTrue();
         assertThat(entry.connectionId()).startsWith("conn-");
         assertThat(entry.thread()).isEqualTo(Thread.currentThread().getName());
         assertThat(entry.parameters()).containsExactly("42");
+    }
+
+    @Test
+    void publishesEachLogicalConnectionOnceWithItsWaitHoldStatementsAndCheckoutRequest() throws Exception {
+        SqlTraceRecorder recorder = recorder();
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        DataSource ds = mock(DataSource.class);
+        Connection conn = mock(Connection.class);
+        PreparedStatement ps = mock(PreparedStatement.class);
+        when(ds.getConnection()).thenAnswer(invocation -> {
+            Thread.sleep(5);
+            return conn;
+        });
+        when(conn.prepareStatement("select 1")).thenReturn(ps);
+        when(ps.executeQuery()).thenReturn(mock(ResultSet.class));
+        DataSource traced = SqlTracingProxies.wrapNamed(ds, recorder, "ordersDataSource");
+
+        Connection connection;
+        long before = System.nanoTime();
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forRequest("0123456789abcdef"))) {
+            connection = traced.getConnection();
+            connection.prepareStatement("select 1").executeQuery();
+            connection.prepareStatement("select 1").executeQuery();
+        }
+
+        connection.close();
+        connection.close();
+
+        List<RuntimeEvent> connections = published.stream()
+                .filter(event -> event.source() == JournalSource.CONNECTION)
+                .toList();
+        assertThat(connections).singleElement().satisfies(event -> {
+            assertThat(event.requestId()).as("the request that checked it out").isEqualTo("0123456789abcdef");
+            assertThat(event.thread()).isEqualTo(Thread.currentThread().getName());
+            assertThat(event.durationNanos()).isNotNegative();
+            ConnectionPayload payload = (ConnectionPayload) event.payload();
+            assertThat(payload.dataSource()).isEqualTo("ordersDataSource");
+            assertThat(payload.statements()).isEqualTo(2);
+            assertThat(payload.waitNanos()).isGreaterThanOrEqualTo(4_000_000L);
+            assertThat(payload.checkoutNanos())
+                    .as("the monotonic time it was obtained, after the wait")
+                    .isGreaterThanOrEqualTo(before + payload.waitNanos());
+        });
+        verify(conn, times(2)).close();
+    }
+
+    @Test
+    void namedSqlEventsKeepTheirPoolEvenWhenConnectionsAreNotRecorded() throws Exception {
+        SqlTraceRecorder recorder = recorder();
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(new RuntimeEventSink() {
+            @Override
+            public boolean offer(RuntimeEvent event) {
+                published.add(event);
+                return true;
+            }
+
+            @Override
+            public boolean records(JournalSource source) {
+                return source == JournalSource.SQL;
+            }
+        });
+        DataSource ds = mock(DataSource.class);
+        Connection connection = mock(Connection.class);
+        PreparedStatement statement = mock(PreparedStatement.class);
+        when(ds.getConnection()).thenReturn(connection);
+        when(connection.prepareStatement("select 1")).thenReturn(statement);
+        when(statement.executeQuery()).thenReturn(mock(ResultSet.class));
+
+        SqlTracingProxies.wrapNamed(ds, recorder, "ordersDataSource")
+                .getConnection()
+                .prepareStatement("select 1")
+                .executeQuery();
+
+        assertThat(published).singleElement().satisfies(event -> {
+            assertThat(event.source()).isEqualTo(JournalSource.SQL);
+            assertThat(((SqlPayload) event.payload()).dataSource()).isEqualTo("ordersDataSource");
+            assertThat(((SqlPayload) event.payload()).executed()).isTrue();
+        });
+    }
+
+    @Test
+    void keepsFollowingConnectionsForTheJournalWhileThePanelIsPaused() throws Exception {
+        SqlTraceRecorder recorder = recorder();
+        List<RuntimeEvent> published = new ArrayList<>();
+        recorder.setRuntimeEventSink(published::add);
+        recorder.setRecording(false);
+        DataSource ds = mock(DataSource.class);
+        when(ds.getConnection()).thenReturn(mock(Connection.class));
+
+        SqlTracingProxies.wrap(ds, recorder).getConnection().close();
+
+        assertThat(recorder.recent()).isEmpty();
+        assertThat(published).singleElement().extracting(RuntimeEvent::source).isEqualTo(JournalSource.CONNECTION);
+    }
+
+    @Test
+    void followsNoConnectionWhenTheJournalDoesNotRecordConnections() throws Exception {
+        SqlTraceRecorder recorder = recorder();
+        DataSource ds = mock(DataSource.class);
+        when(ds.getConnection()).thenReturn(mock(Connection.class));
+
+        SqlTracingProxies.wrap(ds, recorder).getConnection().close();
+
+        assertThat(recorder.checkoutConnection("primary", 0)).isNull();
     }
 
     @Test

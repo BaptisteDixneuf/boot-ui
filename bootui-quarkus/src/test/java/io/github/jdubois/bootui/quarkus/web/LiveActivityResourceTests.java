@@ -1,6 +1,10 @@
 package io.github.jdubois.bootui.quarkus.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
 import io.github.jdubois.bootui.core.dto.ActivityPageInfo;
@@ -8,7 +12,7 @@ import io.github.jdubois.bootui.core.dto.ActivityPersistenceOptionDto;
 import io.github.jdubois.bootui.core.dto.ActivitySwitchRequest;
 import io.github.jdubois.bootui.core.dto.ActivitySwitchResult;
 import io.github.jdubois.bootui.core.dto.LiveActivityReport;
-import io.github.jdubois.bootui.engine.activity.ActivityCapturePoller;
+import io.github.jdubois.bootui.engine.activity.ActivityCapture;
 import io.github.jdubois.bootui.engine.activity.ActivityPage;
 import io.github.jdubois.bootui.engine.activity.ActivityPersistenceSettings;
 import io.github.jdubois.bootui.engine.activity.ActivityQuery;
@@ -17,13 +21,23 @@ import io.github.jdubois.bootui.engine.activity.BufferedActivityStore;
 import io.github.jdubois.bootui.engine.activity.InMemoryActivityStore;
 import io.github.jdubois.bootui.engine.activity.StoredActivityEntry;
 import io.github.jdubois.bootui.engine.activity.SwitchableActivityStore;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.correlation.RunIdentity;
 import io.github.jdubois.bootui.engine.email.CapturedEmail;
 import io.github.jdubois.bootui.engine.email.EmailCaptureService;
 import io.github.jdubois.bootui.engine.email.EmailStore;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionsService;
 import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder;
+import io.github.jdubois.bootui.engine.journal.HttpPayload;
+import io.github.jdubois.bootui.engine.journal.JournalActivityCapture;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournal;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournalSettings;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
 import io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder;
 import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
 import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
@@ -33,6 +47,7 @@ import io.github.jdubois.bootui.engine.web.CapturedHttpExchange;
 import io.github.jdubois.bootui.engine.web.HttpExchangeBuffer;
 import io.github.jdubois.bootui.quarkus.QuarkusExposurePolicy;
 import io.github.jdubois.bootui.quarkus.QuarkusPanelAvailability;
+import io.github.jdubois.bootui.spi.CorrelationContext;
 import io.smallrye.config.PropertiesConfigSource;
 import io.smallrye.config.SmallRyeConfig;
 import io.smallrye.config.SmallRyeConfigBuilder;
@@ -104,13 +119,150 @@ class LiveActivityResourceTests {
     }
 
     @Test
+    void aPersistedRowIsHiddenOnceItsPanelIsDisabled() {
+        SwitchableActivityStore store = persistentStore(new RecordingActivityStore(ActivityPage.EMPTY), "instance-a");
+        LiveActivityResource resource = resourceWith(
+                store,
+                enabledSettings("instance-a"),
+                unsatisfiedDataSource(),
+                new HttpExchangeBuffer(50),
+                unsatisfiedEmailCaptureService(),
+                new KafkaActivityRecorder(true, true, 200, 16),
+                config(Map.of("bootui.panels." + BootUiPanels.SQL_TRACE + ".enabled", "false")));
+        try {
+            store.appendBatch(List.of(
+                    new StoredActivityEntry("instance-a", 1L, storedRow("marker-1", "MARKER", "Application started")),
+                    new StoredActivityEntry("instance-a", 2L, storedRow("req-1", "REQUEST", "GET /orders → 200")),
+                    new StoredActivityEntry("instance-a", 3L, storedRow("sql-1", "SQL", "select * from audit"))));
+
+            // Rows written while SQL Trace was enabled stay in bootui_activity, but are not read once it is off.
+            LiveActivityReport first = resource.activity(0, null, null, null, null, null, null, 1);
+            assertThat(first.entries()).extracting(ActivityEntryDto::id).containsExactly("req-1");
+            assertThat(first.pageInfo().hasMore()).isTrue();
+            LiveActivityReport second = resource.activity(
+                    0, null, null, null, null, null, first.pageInfo().nextCursor(), 1);
+            assertThat(second.entries()).extracting(ActivityEntryDto::id).containsExactly("marker-1");
+            assertThat(second.pageInfo().hasMore()).isFalse();
+        } finally {
+            cleanup(resource, store);
+        }
+    }
+
+    @Test
+    void underMetadataOnlyAPersistedRowKeepsNoPrincipalAndIsNotFoundByItsWithheldText() {
+        SwitchableActivityStore store = persistentStore(new RecordingActivityStore(ActivityPage.EMPTY), "instance-a");
+        LiveActivityResource resource = resourceWith(
+                store,
+                enabledSettings("instance-a"),
+                unsatisfiedDataSource(),
+                new HttpExchangeBuffer(50),
+                unsatisfiedEmailCaptureService(),
+                new KafkaActivityRecorder(true, true, 200, 16),
+                config(Map.of("bootui.expose-values", "metadata-only")));
+        try {
+            store.appendBatch(List.of(
+                    new StoredActivityEntry("instance-a", 1L, storedRow("log-1", "LOG", "card alice-4111 declined")),
+                    new StoredActivityEntry(
+                            "instance-a",
+                            2L,
+                            new ActivityEntryDto(
+                                    "req-1",
+                                    "REQUEST",
+                                    1_000L,
+                                    "OK",
+                                    "GET /orders → 200",
+                                    null,
+                                    null,
+                                    null,
+                                    "GET",
+                                    "/orders",
+                                    200,
+                                    null,
+                                    false,
+                                    null,
+                                    "alice",
+                                    false))));
+
+            assertThat(resource.activity(0, null, null, "alice", null, null, null, 10)
+                            .entries())
+                    .isEmpty();
+            LiveActivityReport orders = resource.activity(0, null, null, "orders", null, null, null, 10);
+            assertThat(orders.entries()).extracting(ActivityEntryDto::id).containsExactly("req-1");
+            assertThat(orders.entries().get(0).securedPrincipal()).isNull();
+        } finally {
+            cleanup(resource, store);
+        }
+    }
+
+    @Test
+    void aSecretARawStoredRowStillHoldsIsNeitherShownNorSearchableUnderMasked() {
+        SwitchableActivityStore store = persistentStore(new RecordingActivityStore(ActivityPage.EMPTY), "instance-a");
+        LiveActivityResource resource = resourceWith(
+                store,
+                enabledSettings("instance-a"),
+                unsatisfiedDataSource(),
+                new HttpExchangeBuffer(50),
+                unsatisfiedEmailCaptureService(),
+                new KafkaActivityRecorder(true, true, 200, 16),
+                config(Map.of("bootui.expose-values", "full")));
+        try {
+            store.appendBatch(
+                    List.of(new StoredActivityEntry("instance-a", 1L, storedRow("log-1", "LOG", "password=hunter2"))));
+
+            assertThat(resource.activity(0, null, null, "hunter2", null, null, null, 10)
+                            .entries())
+                    .isEmpty();
+            assertThat(resource.activity(0, null, null, "password", null, null, null, 10)
+                            .entries())
+                    .singleElement()
+                    .extracting(ActivityEntryDto::summary)
+                    .asString()
+                    .doesNotContain("hunter2");
+        } finally {
+            cleanup(resource, store);
+        }
+    }
+
+    @Test
+    void theBufferedFeedWithholdsRequestsWhileHttpExchangesIsDisabled() {
+        HttpExchangeBuffer buffer = new HttpExchangeBuffer(50);
+        buffer.record(new CapturedHttpExchange(
+                Instant.ofEpochMilli(1_000L),
+                "GET",
+                URI.create("http://localhost:8080/orders"),
+                200,
+                7L,
+                "127.0.0.1",
+                null,
+                null,
+                Map.of(),
+                Map.of(),
+                null));
+        LiveActivityResource resource = resourceWith(
+                new SwitchableActivityStore(new InMemoryActivityStore(10)),
+                disabledSettings(),
+                unsatisfiedDataSource(),
+                buffer,
+                unsatisfiedEmailCaptureService(),
+                new KafkaActivityRecorder(true, true, 200, 16),
+                config(Map.of("bootui.panels." + BootUiPanels.HTTP_EXCHANGES + ".enabled", "false")));
+
+        assertThat(resource.mergedReport(0).entries()).noneMatch(entry -> "REQUEST".equals(entry.type()));
+    }
+
+    private static ActivityEntryDto storedRow(String id, String type, String summary) {
+        return new ActivityEntryDto(
+                id, type, 1_000L, "OK", summary, null, null, null, null, null, null, null, false, null, null, false);
+    }
+
+    @Test
     void activityDelegatesEntriesAndPageInfoToStoreWhenPersistenceEnabled() {
         ActivityEntryDto storedEntry = new ActivityEntryDto(
                 "sql-1",
                 "SQL",
                 1_000L,
                 "OK",
-                "select 1",
+                "select * from audit where owner = 'alice'",
                 null,
                 null,
                 null,
@@ -123,14 +275,19 @@ class LiveActivityResourceTests {
                 null,
                 false);
         SwitchableActivityStore store = persistentStore(new RecordingActivityStore(ActivityPage.EMPTY), "instance-a");
-        LiveActivityResource resource = resourceWith(store, enabledSettings("instance-a"));
+        // SQL rows are read only while SQL Trace is available, which on Quarkus means a connection pool is present.
+        LiveActivityResource resource = resourceWithSqlTrace(store, enabledSettings("instance-a"));
         try {
             store.appendBatch(List.of(new StoredActivityEntry("instance-a", 1L, storedEntry)));
             LiveActivityReport expectedLive = resource.mergedReport(0);
 
             LiveActivityReport result = resource.activity(0, "SQL", "OK", "select", 999L, 1_001L, null, 50);
 
-            assertThat(result.entries()).containsExactly(storedEntry);
+            // A stored row is masked again under the live policy (MASKED by default) when it is read (§8).
+            assertThat(result.entries()).singleElement().satisfies(entry -> {
+                assertThat(entry.id()).isEqualTo(storedEntry.id());
+                assertThat(entry.summary()).isEqualTo("select * from audit where owner = ?");
+            });
             assertThat(result.pageInfo()).isEqualTo(new ActivityPageInfo(true, null, false));
             assertThat(result.persistenceOption())
                     .isEqualTo(new ActivityPersistenceOptionDto(true, false, "bootui_activity"));
@@ -177,7 +334,8 @@ class LiveActivityResourceTests {
                 null,
                 false);
         SwitchableActivityStore store = persistentStore(new RecordingActivityStore(ActivityPage.EMPTY), "instance-a");
-        LiveActivityResource resource = resourceWith(store, enabledSettings("instance-a"));
+        // SQL rows are read only while SQL Trace is available, which on Quarkus means a connection pool is present.
+        LiveActivityResource resource = resourceWithSqlTrace(store, enabledSettings("instance-a"));
         try {
             store.appendBatch(List.of(new StoredActivityEntry("instance-a", 1L, storedEntry)));
 
@@ -217,7 +375,8 @@ class LiveActivityResourceTests {
                 "trace-a"));
         EmailCaptureService emailService =
                 new EmailCaptureService(new EmailStore(10), new QuarkusExposurePolicy(config(Map.of())), false, false);
-        emailService.setTraceIdProvider(() -> "trace-a");
+        emailService.setCorrelationContextProvider(
+                () -> BootUiCorrelation.current().withTrace("trace-a", null));
         emailService.capture(CapturedEmail.builder()
                 .from("noreply@example.com")
                 .to(List.of("user@example.com"))
@@ -257,27 +416,7 @@ class LiveActivityResourceTests {
     }
 
     @Test
-    void captureRemembersASlowClientErrorThatTheExchangeBufferReserves() {
-        // A 404 that took 1.5 s is WARN in the stream, but at the default 1,000 ms threshold the buffer keeps it in
-        // its reserved share, so the feed can show it again after the first capture window forgot it.
-        assertThat(capturesOfAHiddenSlowClientError(new HttpExchangeBuffer(50))).isEqualTo(1);
-    }
-
-    @Test
-    void captureClassifiesRequestsWithTheExchangeBufferThreshold() {
-        // Neither threshold makes the buffer reserve that request, so it is routine and captured again.
-        assertThat(capturesOfAHiddenSlowClientError(new HttpExchangeBuffer(50, 25, 2_000L)))
-                .isEqualTo(2);
-        assertThat(capturesOfAHiddenSlowClientError(new HttpExchangeBuffer(50, 25, 0L)))
-                .isEqualTo(2);
-    }
-
-    /**
-     * Drives this resource's own capture wiring one poll at a time: the feed shows a slow 404, then only 20 newer
-     * exchanges (more than the smallest capture window holds), then the same slow 404 again, as a feed does when a
-     * source that dropped out of it returns.
-     */
-    private static long capturesOfAHiddenSlowClientError(HttpExchangeBuffer buffer) {
+    void withTheJournalAsFeedSourcePersistenceIsWrittenByAJournalSubscriber() throws Exception {
         List<StoredActivityEntry> captured = new CopyOnWriteArrayList<>();
         SwitchableActivityStore store = new SwitchableActivityStore(new ActivityStore() {
             @Override
@@ -290,15 +429,18 @@ class LiveActivityResourceTests {
                 return ActivityPage.EMPTY;
             }
         });
+        SmallRyeConfig config = config(Map.of("bootui.activity.feed-source", "journal"));
         LiveActivityResource resource = resourceWith(
                 store,
                 disabledSettings(),
                 unsatisfiedDataSource(),
-                buffer,
+                new HttpExchangeBuffer(10),
                 unsatisfiedEmailCaptureService(),
                 new KafkaActivityRecorder(true, true, 200, 16),
-                config(Map.of()));
-        CapturedHttpExchange slowNotFound = timedExchange(1_000L, "/api/orders/42", 404, 1_500L);
+                config);
+        resource.setFeedSource(config);
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        resource.setRuntimeJournal(new SatisfiedInstance<>(journal), new SatisfiedInstance<>(new JournalAggregates()));
         ActivityPersistenceSettings settings = new ActivityPersistenceSettings(
                 true,
                 ActivityPersistenceSettings.DataSourceMode.SHARED,
@@ -308,26 +450,29 @@ class LiveActivityResourceTests {
                 null,
                 "bootui_activity",
                 Duration.ofSeconds(5),
-                1,
+                16,
                 Duration.ofDays(7),
-                "instance-r",
-                Duration.ofHours(1));
-        try (ActivityCapturePoller poller = resource.startCapture(store, settings)) {
-            buffer.record(slowNotFound);
-            poller.captureNow();
-            clear(buffer);
-            for (int i = 0; i < 20; i++) {
-                buffer.record(timedExchange(2_000L + i, "/api/health", 200, 5L));
-            }
-            poller.captureNow();
-            clear(buffer);
-            buffer.record(slowNotFound);
-            poller.captureNow();
+                "instance-q");
+        try (ActivityCapture capture = resource.startPersistence(store, settings)) {
+            assertThat(capture).isInstanceOf(JournalActivityCapture.class);
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.HTTP,
+                    1_000,
+                    2_000_000,
+                    CorrelationContext.forRequest("r1"),
+                    "vert.x-eventloop-thread-0",
+                    null,
+                    false,
+                    new HttpPayload("GET", "/a", null, null, 200)));
+            assertThat(journal.awaitDrained(Duration.ofSeconds(5))).isTrue();
+        } finally {
+            journal.close();
         }
-        String slowNotFoundId = captured.get(0).entry().id();
-        return captured.stream()
-                .filter(stored -> slowNotFoundId.equals(stored.entry().id()))
-                .count();
+
+        assertThat(captured).singleElement().satisfies(stored -> {
+            assertThat(stored.entry().id()).isEqualTo("r1");
+            assertThat(stored.instanceId()).isEqualTo("instance-q");
+        });
     }
 
     private static void clear(HttpExchangeBuffer buffer) {
@@ -395,7 +540,7 @@ class LiveActivityResourceTests {
                 "trace-rest"));
         RestClientTraceRecorder recorder = restClientRecorder(true);
         recorder.registerClientCustomization("Quarkus REST Client Reactive");
-        recorder.setTraceIdProvider(() -> "trace-rest");
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-rest", null));
         recorder.record(
                 "GET",
                 "https://api.example.test/inventory",
@@ -650,11 +795,103 @@ class LiveActivityResourceTests {
     }
 
     @Test
-    void useExistingDatasourceSwitchesTheStoreAndStartsCapturingOnSuccess() throws Exception {
+    void runtimeSwitchRejectsDisabledJournalBeforeCreatingTheTable() throws Exception {
+        DataSource dataSource = newH2DataSource();
+        SwitchableActivityStore store = new SwitchableActivityStore(new InMemoryActivityStore(200));
+        LiveActivityResource resource = resourceWith(store, disabledSettings(), satisfiedDataSource(dataSource));
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.disabled(), RunIdentity.start());
+        try {
+            resource.setRuntimeJournal(
+                    new SatisfiedInstance<>(journal), new SatisfiedInstance<>(new JournalAggregates()));
+            assertUnavailableSwitch(resource, store, dataSource);
+        } finally {
+            cleanup(resource, store);
+            journal.close();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsAClosedJournalBeforeCreatingTheTable() throws Exception {
+        DataSource dataSource = newH2DataSource();
+        SwitchableActivityStore store = new SwitchableActivityStore(new InMemoryActivityStore(200));
+        LiveActivityResource resource = resourceWith(store, disabledSettings(), satisfiedDataSource(dataSource));
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            resource.setRuntimeJournal(
+                    new SatisfiedInstance<>(journal), new SatisfiedInstance<>(new JournalAggregates()));
+            journal.close();
+            assertThat(journal.settings().enabled()).isTrue();
+            assertUnavailableSwitch(resource, store, dataSource);
+        } finally {
+            cleanup(resource, store);
+            journal.close();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsMissingJournalBeforeCreatingTheTable() throws Exception {
         DataSource dataSource = newH2DataSource();
         SwitchableActivityStore store = new SwitchableActivityStore(new InMemoryActivityStore(200));
         LiveActivityResource resource = resourceWith(store, disabledSettings(), satisfiedDataSource(dataSource));
         try {
+            assertUnavailableSwitch(resource, store, dataSource);
+        } finally {
+            cleanup(resource, store);
+        }
+    }
+
+    private static void assertUnavailableSwitch(
+            LiveActivityResource resource, SwitchableActivityStore store, DataSource dataSource) throws Exception {
+        Response response = resource.useExistingDatasource(new ActivitySwitchRequest(true));
+        try (var connection = dataSource.getConnection();
+                var tables = connection.getMetaData().getTables(null, null, "BOOTUI_ACTIVITY", null)) {
+            assertThat(tables.next())
+                    .as(
+                            "journal unavailable: response %s must not create an application database table",
+                            response.getStatus())
+                    .isFalse();
+        }
+        assertThat(response.getStatus()).isEqualTo(409);
+        ActivitySwitchResult body = (ActivitySwitchResult) response.getEntity();
+        assertThat(body.status()).isEqualTo("unavailable");
+        assertThat(body.message()).contains("runtime journal");
+        assertThat(store.persistent()).isFalse();
+    }
+
+    @Test
+    void runtimeSwitchReportsCaptureRegistrationFailureWithoutPublishingTheDurableStore() {
+        DataSource dataSource = newH2DataSource();
+        SwitchableActivityStore store = new SwitchableActivityStore(new InMemoryActivityStore(200));
+        LiveActivityResource resource = resourceWith(store, disabledSettings(), satisfiedDataSource(dataSource));
+        RuntimeJournal journal = mock(RuntimeJournal.class);
+        when(journal.settings()).thenReturn(RuntimeJournalSettings.defaults());
+        when(journal.isOpen()).thenReturn(true);
+        doThrow(new IllegalStateException("capture registration failed"))
+                .when(journal)
+                .addListener(any());
+        try {
+            resource.setRuntimeJournal(
+                    new SatisfiedInstance<>(journal), new SatisfiedInstance<>(new JournalAggregates()));
+            Response response = resource.useExistingDatasource(new ActivitySwitchRequest(true));
+            assertThat(response.getStatus()).isEqualTo(500);
+            ActivitySwitchResult body = (ActivitySwitchResult) response.getEntity();
+            assertThat(body.status()).isEqualTo("failed");
+            assertThat(body.message()).contains("capture", "table");
+            assertThat(store.persistent()).isFalse();
+        } finally {
+            cleanup(resource, store);
+        }
+    }
+
+    @Test
+    void useExistingDatasourceSwitchesTheStoreAndStartsCapturingOnSuccess() throws Exception {
+        DataSource dataSource = newH2DataSource();
+        SwitchableActivityStore store = new SwitchableActivityStore(new InMemoryActivityStore(200));
+        LiveActivityResource resource = resourceWith(store, disabledSettings(), satisfiedDataSource(dataSource));
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            resource.setRuntimeJournal(
+                    new SatisfiedInstance<>(journal), new SatisfiedInstance<>(new JournalAggregates()));
             Response response = resource.useExistingDatasource(new ActivitySwitchRequest(true));
 
             assertThat(response.getStatus()).isEqualTo(200);
@@ -668,16 +905,28 @@ class LiveActivityResourceTests {
             assertThat(afterSwitch.persistenceOption())
                     .isEqualTo(new ActivityPersistenceOptionDto(true, true, "bootui_activity"));
             assertThat(afterSwitch.pageInfo()).isNotNull();
-
-            // The capture poller this switch starts must be this resource's own, closeable on shutdown
-            // exactly as QuarkusActivityCapture's own startup poller would have been had persistence been
-            // enabled from the start.
-            Thread captureThread = awaitThreadNamed("bootui-activity-capture");
-            assertThat(captureThread)
-                    .as("capture poller thread should have started after the switch")
-                    .isNotNull();
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.HTTP,
+                    1_000,
+                    2_000_000,
+                    CorrelationContext.forRequest("persisted-request"),
+                    "t",
+                    null,
+                    false,
+                    new HttpPayload("GET", "/persisted", "/persisted", null, 200)));
+            assertThat(journal.awaitDrained(Duration.ofSeconds(5))).isTrue();
+            assertThat(store.query(ActivityQuery.firstPage("instance-a")).entryDtos())
+                    .extracting(ActivityEntryDto::type)
+                    .contains("REQUEST");
         } finally {
             cleanup(resource, store);
+            journal.close();
+        }
+        try (var connection = dataSource.getConnection();
+                var statement = connection.createStatement();
+                var rows = statement.executeQuery("SELECT COUNT(*) FROM bootui_activity")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getInt(1)).isEqualTo(1);
         }
     }
 
@@ -693,8 +942,7 @@ class LiveActivityResourceTests {
                 Duration.ofSeconds(5),
                 500,
                 Duration.ofDays(7),
-                "instance-a",
-                Duration.ofSeconds(2));
+                "instance-a");
     }
 
     private static ActivityPersistenceSettings enabledSettings(String instanceId) {
@@ -709,8 +957,7 @@ class LiveActivityResourceTests {
                 Duration.ofSeconds(5),
                 500,
                 Duration.ofDays(7),
-                instanceId,
-                Duration.ofSeconds(2));
+                instanceId);
     }
 
     /**
@@ -749,6 +996,18 @@ class LiveActivityResourceTests {
                 unsatisfiedEmailCaptureService(),
                 new KafkaActivityRecorder(true, true, 200, 16),
                 config(Map.of()));
+    }
+
+    private static LiveActivityResource resourceWithSqlTrace(
+            SwitchableActivityStore activityStore, ActivityPersistenceSettings settings) {
+        return resourceWith(
+                activityStore,
+                settings,
+                unsatisfiedDataSource(),
+                new HttpExchangeBuffer(50),
+                unsatisfiedEmailCaptureService(),
+                new KafkaActivityRecorder(true, true, 200, 16),
+                config(Map.of(QuarkusPanelAvailability.CONNECTION_POOLS_PRESENT_KEY, "true")));
     }
 
     private static LiveActivityResource resourceWithKafka(KafkaActivityRecorder kafkaRecorder) {

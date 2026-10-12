@@ -93,8 +93,7 @@ public class LiveServiceMapResource {
         List<HikariPoolDto> pools = jdbcPools();
         SqlTraceRecorder sql = sqlTraceRecorder();
         // Parameter bindings are never requested: the map only carries the coarse statement category.
-        List<SqlTraceEntryDto> statements =
-                sql == null ? List.of() : sql.report(false).entries();
+        List<SqlTraceEntryDto> statements = sql == null ? List.of() : sql.entries(false);
         List<String> tracedDataSources = sql == null ? List.of() : sql.dataSourceNames();
         boolean kafkaAvailable = messagingAvailable(BootUiPanels.KAFKA) && kafkaRecorder.isEnabled();
         boolean rabbitAvailable = messagingAvailable(BootUiPanels.RABBITMQ) && rabbitRecorder.isEnabled();
@@ -153,7 +152,7 @@ public class LiveServiceMapResource {
             return null;
         }
         HikariPoolsReport report = connectionPools.report();
-        return report.hikariPresent() ? report.pools() : null;
+        return report.poolLibraryPresent() ? report.pools() : null;
     }
 
     private SqlTraceRecorder sqlTraceRecorder() {

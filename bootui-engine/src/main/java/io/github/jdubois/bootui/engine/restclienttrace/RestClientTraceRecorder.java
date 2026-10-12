@@ -7,14 +7,26 @@ import io.github.jdubois.bootui.core.dto.RestClientTraceEntryDto;
 import io.github.jdubois.bootui.core.dto.RestClientTraceGroupDto;
 import io.github.jdubois.bootui.core.dto.RestClientTraceReport;
 import io.github.jdubois.bootui.core.dto.RestClientTraceStatsDto;
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.correlation.ThreadKinds;
+import io.github.jdubois.bootui.engine.javaagent.AgentCodePaths;
+import io.github.jdubois.bootui.engine.journal.ApplicationFrames;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RestClientPayload;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
 import io.github.jdubois.bootui.engine.retention.TieredCaptureBuffer;
 import io.github.jdubois.bootui.engine.support.CredentialRedaction;
 import io.github.jdubois.bootui.engine.support.DetailText;
 import io.github.jdubois.bootui.engine.support.SensitiveNames;
-import io.github.jdubois.bootui.engine.support.StackFramePrefixes;
 import io.github.jdubois.bootui.engine.support.UriMasking;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
 import io.github.jdubois.bootui.spi.IdleReclaimable;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
+import io.github.jdubois.bootui.spi.ThreadKind;
+import io.github.jdubois.bootui.spi.ThreadKindClassifier;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -51,7 +63,7 @@ import java.util.stream.Stream;
  * reveals them: URI authority user-info credentials, and the client {@code errorMessage}, which is flattened,
  * credential-redacted, and length-bounded since a transport exception can quote a whole request URL.</p>
  */
-public final class RestClientTraceRecorder implements IdleReclaimable {
+public final class RestClientTraceRecorder implements IdleReclaimable, RuntimeEventPublisher, MemoryOffloadable {
 
     static final int TOP_CALLS_LIMIT = 20;
 
@@ -77,10 +89,126 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
             Map<String, String> requestHeaders,
             String thread,
             String traceId,
-            String callSite) {
+            String callSite,
+            String requestId,
+            String executionId,
+            String threadKind) {
+        /** Without the thread kind. */
+        public CapturedCall(
+                long id,
+                long timestamp,
+                String method,
+                String uri,
+                String host,
+                String path,
+                Integer status,
+                long durationMillis,
+                boolean success,
+                String errorMessage,
+                String clientType,
+                Map<String, String> requestHeaders,
+                String thread,
+                String traceId,
+                String callSite,
+                String requestId,
+                String executionId) {
+            this(
+                    id,
+                    timestamp,
+                    method,
+                    uri,
+                    host,
+                    path,
+                    status,
+                    durationMillis,
+                    success,
+                    errorMessage,
+                    clientType,
+                    requestHeaders,
+                    thread,
+                    traceId,
+                    callSite,
+                    requestId,
+                    executionId,
+                    null);
+        }
+
+        /** Without the thread kind. */
+        public CapturedCall(
+                long id,
+                long timestamp,
+                String method,
+                String uri,
+                String host,
+                String path,
+                Integer status,
+                long durationMillis,
+                boolean success,
+                String errorMessage,
+                String clientType,
+                Map<String, String> requestHeaders,
+                String thread,
+                String traceId,
+                String callSite,
+                String requestId) {
+            this(
+                    id,
+                    timestamp,
+                    method,
+                    uri,
+                    host,
+                    path,
+                    status,
+                    durationMillis,
+                    success,
+                    errorMessage,
+                    clientType,
+                    requestHeaders,
+                    thread,
+                    traceId,
+                    callSite,
+                    requestId,
+                    null);
+        }
 
         public CapturedCall {
             requestHeaders = requestHeaders == null ? Map.of() : Map.copyOf(requestHeaders);
+        }
+
+        /** Without BootUI's request identity. */
+        public CapturedCall(
+                long id,
+                long timestamp,
+                String method,
+                String uri,
+                String host,
+                String path,
+                Integer status,
+                long durationMillis,
+                boolean success,
+                String errorMessage,
+                String clientType,
+                Map<String, String> requestHeaders,
+                String thread,
+                String traceId,
+                String callSite) {
+            this(
+                    id,
+                    timestamp,
+                    method,
+                    uri,
+                    host,
+                    path,
+                    status,
+                    durationMillis,
+                    success,
+                    errorMessage,
+                    clientType,
+                    requestHeaders,
+                    thread,
+                    traceId,
+                    callSite,
+                    null);
         }
     }
 
@@ -100,7 +228,9 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
     private volatile boolean idleSuspended = false;
     private final Set<String> clientTypes = new ConcurrentSkipListSet<>();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
-    private volatile TraceIdProvider traceIdProvider = RestClientTraceRecorder::mdcTraceId;
+    private final CorrelationSource correlation = new CorrelationSource();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
+    private final ThreadKinds threadKinds = new ThreadKinds();
 
     /** A recorder reserving the default share of its buffer for failed, error-response, and slow calls. */
     public RestClientTraceRecorder(
@@ -177,13 +307,34 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
     }
 
     /**
-     * Replaces the trace-id source used to stamp each captured call. Defaults to the SLF4J MDC {@code
-     * traceId} key that Micrometer Tracing publishes on Spring, which works because Spring MVC serves a
-     * request start-to-finish on one thread for {@code RestClient}/{@code RestTemplate}. Passing {@code
-     * null} restores the default MDC lookup.
+     * Replaces the source of the request id stamped on each capture ({@code docs/PLAN-v2.md} §5.1). Defaults to the
+     * thread's correlation scope; the Quarkus adapter installs one that reads the request's Vert.x context. Passing
+     * {@code null} restores the default.
      */
-    public void setTraceIdProvider(TraceIdProvider traceIdProvider) {
-        this.traceIdProvider = traceIdProvider == null ? RestClientTraceRecorder::mdcTraceId : traceIdProvider;
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded call right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
+    }
+
+    /**
+     * Replaces the classifier of the thread kind stamped on each capture ({@code docs/PLAN-v2.md} §5.1): each adapter
+     * installs one that knows its own threads. Defaults to classifying virtual threads only; {@code null} restores it.
+     */
+    public void setThreadKindClassifier(ThreadKindClassifier classifier) {
+        threadKinds.set(classifier);
+    }
+
+    /** The kind of the calling thread, for a client that records a call later, on another thread. */
+    public ThreadKind currentThreadKind() {
+        return threadKinds.current();
     }
 
     public int getMaxEntries() {
@@ -258,13 +409,16 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
                 host,
                 path,
                 status,
-                durationMillis,
+                Math.max(0, durationMillis) * 1_000_000,
                 success,
                 errorMessage,
                 clientType,
                 headers,
                 thread,
-                currentTraceId());
+                currentTraceId(),
+                correlation.current(),
+                null,
+                STAMP_HERE);
     }
 
     /**
@@ -285,10 +439,7 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
             Map<String, String> headers,
             String thread,
             String traceId) {
-        if (!shouldRecord()) {
-            return;
-        }
-        append(
+        record(
                 method,
                 uri,
                 host,
@@ -300,14 +451,15 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
                 clientType,
                 headers,
                 thread,
-                normalizeTraceId(traceId));
+                traceId,
+                correlation.current());
     }
 
-    private boolean shouldRecord() {
-        return enabled && !idleSuspended && recording.get();
-    }
-
-    private void append(
+    /**
+     * Records one outbound call with the trace id and BootUI request id captured explicitly at the interception
+     * boundary, for clients whose response callback may run where the request's context is no longer current.
+     */
+    public void record(
             String method,
             String uri,
             String host,
@@ -319,26 +471,278 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
             String clientType,
             Map<String, String> headers,
             String thread,
-            String traceId) {
-        CapturedCall entry = new CapturedCall(
-                sequence.incrementAndGet(),
-                System.currentTimeMillis(),
+            String traceId,
+            String requestId) {
+        record(
                 method,
-                truncate(UriMasking.maskUserInfo(uri), maxUriLength),
+                uri,
                 host,
-                truncate(path, maxUriLength),
+                path,
                 status,
-                Math.max(0, durationMillis),
+                durationMillis,
                 success,
-                sanitizeErrorMessage(errorMessage),
+                errorMessage,
                 clientType,
-                captureHeaders ? truncateHeaderValues(headers) : Map.of(),
+                headers,
                 thread,
                 traceId,
-                captureCallSite ? currentCallSite() : null);
-        buffer.add(entry, isFailedOrSlow(entry.success(), entry.status(), isSlow(entry.durationMillis())));
-        totalCaptured.incrementAndGet();
-        notifyListeners();
+                CorrelationContext.forRequest(normalizeTraceId(requestId)));
+    }
+
+    /**
+     * Records one outbound call with the trace id and BootUI correlation captured explicitly at the interception
+     * boundary, classifying the recording thread's kind.
+     */
+    public void record(
+            String method,
+            String uri,
+            String host,
+            String path,
+            Integer status,
+            long durationMillis,
+            boolean success,
+            String errorMessage,
+            String clientType,
+            Map<String, String> headers,
+            String thread,
+            String traceId,
+            CorrelationContext caller) {
+        record(
+                method,
+                uri,
+                host,
+                path,
+                status,
+                durationMillis,
+                success,
+                errorMessage,
+                clientType,
+                headers,
+                thread,
+                traceId,
+                caller,
+                null);
+    }
+
+    /**
+     * Records one outbound call with the trace id and BootUI correlation captured explicitly at the interception
+     * boundary, for clients whose response callback may run where the caller's context is no longer current.
+     */
+    public void record(
+            String method,
+            String uri,
+            String host,
+            String path,
+            Integer status,
+            long durationMillis,
+            boolean success,
+            String errorMessage,
+            String clientType,
+            Map<String, String> headers,
+            String thread,
+            String traceId,
+            CorrelationContext caller,
+            ThreadKind threadKind) {
+        // Its context was captured at the interception boundary, so it may be recorded on another thread: unstamped.
+        recordNanos(
+                method,
+                uri,
+                host,
+                path,
+                status,
+                Math.max(0, durationMillis) * 1_000_000,
+                success,
+                errorMessage,
+                clientType,
+                headers,
+                thread,
+                traceId,
+                caller,
+                threadKind,
+                0L);
+    }
+
+    /**
+     * Records one outbound call timed in nanoseconds, with the trace id and BootUI correlation captured explicitly at
+     * the interception boundary: the panel keeps milliseconds, and the runtime journal the nanoseconds
+     * ({@code docs/PLAN-v2.md} §5.2). A {@code null} thread kind is classified on the recording thread, which then
+     * issued the call: the call is stamped with the innermost instrumented method open on it, when the BootUI agent
+     * records code paths (§5.14). A call whose thread kind was captured elsewhere was recorded on another thread, and is
+     * not stamped.
+     */
+    public void recordNanos(
+            String method,
+            String uri,
+            String host,
+            String path,
+            Integer status,
+            long durationNanos,
+            boolean success,
+            String errorMessage,
+            String clientType,
+            Map<String, String> headers,
+            String thread,
+            String traceId,
+            CorrelationContext caller,
+            ThreadKind threadKind) {
+        recordNanos(
+                method,
+                uri,
+                host,
+                path,
+                status,
+                durationNanos,
+                success,
+                errorMessage,
+                clientType,
+                headers,
+                thread,
+                traceId,
+                caller,
+                threadKind,
+                threadKind == null ? STAMP_HERE : 0L);
+    }
+
+    /**
+     * Records one outbound call as {@link #recordNanos(String, String, String, String, Integer, long, boolean, String,
+     * String, Map, String, String, CorrelationContext, ThreadKind)} does, with the code-paths stamp its client took on the
+     * thread that issued it ({@code AgentCodePaths.stamp()}, 0 when unknown), for a client whose response arrives on
+     * another thread.
+     */
+    public void recordNanos(
+            String method,
+            String uri,
+            String host,
+            String path,
+            Integer status,
+            long durationNanos,
+            boolean success,
+            String errorMessage,
+            String clientType,
+            Map<String, String> headers,
+            String thread,
+            String traceId,
+            CorrelationContext caller,
+            ThreadKind threadKind,
+            long codePathStamp) {
+        if (!shouldRecord()) {
+            return;
+        }
+        append(
+                method,
+                uri,
+                host,
+                path,
+                status,
+                durationNanos,
+                success,
+                errorMessage,
+                clientType,
+                headers,
+                thread,
+                normalizeTraceId(traceId),
+                caller == null ? CorrelationContext.NONE : caller,
+                threadKind,
+                codePathStamp);
+    }
+
+    /** Asks {@link #append} to stamp the call on the recording thread, which issued it. */
+    private static final long STAMP_HERE = Long.MIN_VALUE;
+
+    /**
+     * Whether a call is worth observing: the panel captures now, or, while it is paused or idle-suspended, the runtime
+     * journal still records outbound calls ({@code docs/PLAN-v2.md} §5.2).
+     */
+    private boolean shouldRecord() {
+        return enabled && (capturesForPanel() || journal.records(JournalSource.REST_CLIENT));
+    }
+
+    /** Whether the REST Client Trace panel captures calls now: enabled, recording, and not suspended while idle. */
+    private boolean capturesForPanel() {
+        return enabled && !idleSuspended && recording.get();
+    }
+
+    private void append(
+            String method,
+            String uri,
+            String host,
+            String path,
+            Integer status,
+            long durationNanos,
+            boolean success,
+            String errorMessage,
+            String clientType,
+            Map<String, String> headers,
+            String thread,
+            String traceId,
+            CorrelationContext caller,
+            ThreadKind threadKind,
+            long codePathStamp) {
+        boolean panel = capturesForPanel();
+        boolean toJournal = journal.records(JournalSource.REST_CLIENT);
+        // The stack is walked only for what keeps it: the panel's call sites, or the journal's application frames.
+        ApplicationFrames frames =
+                ApplicationFrames.wanted(panel, captureCallSite, toJournal) ? ApplicationFrames.capture() : null;
+        // The issuing thread's innermost instrumented method, when the BootUI agent records code paths (§5.14).
+        long stamp = !toJournal ? 0L : codePathStamp == STAMP_HERE ? AgentCodePaths.stamp() : codePathStamp;
+        long timestamp = System.currentTimeMillis();
+        long nanos = Math.max(0, durationNanos);
+        long duration = nanos / 1_000_000;
+        String maskedUri = truncate(UriMasking.maskUserInfo(uri), maxUriLength);
+        String truncatedPath = truncate(path, maxUriLength);
+        ThreadKind kind = threadKind == null ? threadKinds.current() : threadKind;
+        boolean failedOrSlow = isFailedOrSlow(success, status, isSlow(duration));
+        if (panel) {
+            CapturedCall entry = new CapturedCall(
+                    sequence.incrementAndGet(),
+                    timestamp,
+                    method,
+                    maskedUri,
+                    host,
+                    truncatedPath,
+                    status,
+                    duration,
+                    success,
+                    sanitizeErrorMessage(errorMessage),
+                    clientType,
+                    captureHeaders ? truncateHeaderValues(headers) : Map.of(),
+                    thread,
+                    traceId,
+                    captureCallSite && frames != null ? frames.callSite() : null,
+                    caller.requestId(),
+                    caller.executionId(),
+                    kind.name());
+            buffer.add(entry, failedOrSlow);
+        }
+        if (toJournal) {
+            try {
+                journal.offer(RuntimeEvent.of(
+                        JournalSource.REST_CLIENT,
+                        RuntimeEvent.startMillis(timestamp, nanos),
+                        nanos,
+                        caller,
+                        traceId,
+                        thread,
+                        kind,
+                        failedOrSlow,
+                        new RestClientPayload(
+                                method,
+                                RestClientAuthority.of(host, maskedUri),
+                                truncatedPath,
+                                status,
+                                clientType,
+                                !success,
+                                frames,
+                                System.nanoTime(),
+                                stamp)));
+            } catch (RuntimeException ex) {
+                // Publishing never disturbs the call it observes.
+            }
+        }
+        if (panel) {
+            totalCaptured.incrementAndGet();
+            notifyListeners();
+        }
     }
 
     /** Returns the retained calls, most recent first, across both retention tiers. */
@@ -357,6 +761,24 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
     /** The buffer's retention counts: capacity, reserved share, retained and reserved calls, and evictions. */
     public CaptureRetentionDto retention() {
         return buffer.snapshot().retention(slowCallThresholdMillis);
+    }
+
+    @Override
+    public String offloadId() {
+        return "rest-client-trace";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "REST client calls";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recent().size();
+        clear();
+        return retained;
     }
 
     public void clear() {
@@ -536,7 +958,10 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
                 displayHeaders(entry.requestHeaders(), maskSecrets, exposure),
                 entry.traceId(),
                 entry.thread(),
-                entry.callSite());
+                entry.callSite(),
+                entry.requestId(),
+                entry.executionId(),
+                entry.threadKind());
     }
 
     /**
@@ -639,14 +1064,24 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
         return stripped.substring(0, max) + "…";
     }
 
+    /** BootUI's request id for the next captured call, or {@code null} when no request owns it; fully guarded. */
+    public String currentRequestId() {
+        return correlation.requestId();
+    }
+
+    /** BootUI's correlation for the next captured call, {@link CorrelationContext#NONE} when nothing owns it. */
+    public CorrelationContext currentCorrelation() {
+        return correlation.current();
+    }
+
     /**
-     * The trace id to stamp on the next captured call, taken from the configured {@link TraceIdProvider}
+     * The trace id to stamp on the next captured call, taken from the configured correlation source
      * and fully guarded so an outbound call is never disrupted by a missing or misbehaving provider.
      * Returns {@code null} (no correlation) when blank or on any failure.
      */
     public String currentTraceId() {
         try {
-            return normalizeTraceId(traceIdProvider.currentTraceId());
+            return normalizeTraceId(correlation.traceId());
         } catch (RuntimeException ex) {
             return null;
         }
@@ -656,60 +1091,15 @@ public final class RestClientTraceRecorder implements IdleReclaimable {
         return traceId == null || traceId.isBlank() ? null : traceId;
     }
 
-    /**
-     * Default trace-id source: the SLF4J MDC where Micrometer Tracing publishes it (the {@code traceId}
-     * correlation key). Returns {@code null} when no tracer is active or the key is absent, in which case
-     * downstream correlation falls back to its time-window heuristic. The lookup is fully guarded so an
-     * outbound call is never disrupted by a missing or misbehaving MDC.
-     */
-    private static String mdcTraceId() {
-        try {
-            String traceId = org.slf4j.MDC.get("traceId");
-            return traceId == null || traceId.isBlank() ? null : traceId;
-        } catch (RuntimeException ex) {
-            return null;
-        }
-    }
-
     /** Bound on how many stack frames are inspected before giving up on finding an application frame. */
     private static final int MAX_CALL_SITE_FRAMES = 128;
-
-    private static final StackWalker STACK_WALKER = StackWalker.getInstance();
-
-    /**
-     * Best-effort location of the first application stack frame above the HTTP client call — i.e. the
-     * first frame that isn't the JDK, Spring's own client plumbing, or BootUI's own instrumentation (see
-     * {@link StackFramePrefixes}) — formatted the same way as {@code SqlTraceRecorder}'s call site: {@code
-     * ClassName.methodName(File.java:42)}. Walks at most {@link #MAX_CALL_SITE_FRAMES} frames of the
-     * current thread's stack, short-circuiting at the first match. Fully guarded so a stack-walking
-     * failure can never disrupt the outbound call; returns {@code null} when no application frame is found
-     * within the bound, or on any failure.
-     */
-    private static String currentCallSite() {
-        try {
-            return STACK_WALKER.walk(RestClientTraceRecorder::selectCallSite);
-        } catch (RuntimeException ex) {
-            return null;
-        }
-    }
 
     /**
      * Pure frame-selection logic factored out of {@link #currentCallSite()} so it can be unit-tested with a
      * synthetic frame stream. Package-private for tests.
      */
     static String selectCallSite(Stream<StackWalker.StackFrame> frames) {
-        return frames.limit(MAX_CALL_SITE_FRAMES)
-                .filter(frame -> !StackFramePrefixes.isFrameworkClass(frame.getClassName()))
-                .findFirst()
-                .map(RestClientTraceRecorder::formatFrame)
-                .orElse(null);
-    }
-
-    private static String formatFrame(StackWalker.StackFrame frame) {
-        String file = frame.getFileName();
-        String position = file == null
-                ? "Unknown Source"
-                : (frame.getLineNumber() >= 0 ? file + ":" + frame.getLineNumber() : file);
-        return frame.getClassName() + "." + frame.getMethodName() + "(" + position + ")";
+        ApplicationFrames selected = ApplicationFrames.select(frames);
+        return selected == null ? null : selected.callSite();
     }
 }

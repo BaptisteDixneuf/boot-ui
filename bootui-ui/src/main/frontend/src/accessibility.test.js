@@ -228,6 +228,10 @@ function inspectTemplate(template, lineOffset = 0) {
         modifierNames(click).includes('self') ||
         staticAttribute(node, 'aria-hidden') === 'true' ||
         staticAttribute(node, 'role') === 'option' ||
+        // A treegrid row is the focusable item: its own keydown handler gives Enter and Space the click's action.
+        (staticAttribute(node, 'role') === 'row' &&
+          eventDirective(node, 'keydown') &&
+          node.props.some((property) => property.type === 7 && property.arg?.content === 'tabindex')) ||
         hasKeyboardDelegate(node) ||
         (node.tag === 'dialog' && (eventDirective(node, 'keydown', 'esc') || eventDirective(node, 'cancel')))
       ) {
@@ -241,6 +245,34 @@ function inspectTemplate(template, lineOffset = 0) {
 }
 
 describe('frontend accessibility', () => {
+  // Tab strips are PanelTabs (see designSystem.test.js), which owns the tablist
+  // semantics and keyboard model. What it cannot own is the other half of the
+  // contract: each strip needs an accessible name, and each panel it switches must
+  // be named by its tab, or a screen reader lands in an anonymous region.
+  it('names every tab strip and labels every tab panel by its tab', () => {
+    const issues = vueFiles(sourceRoot).flatMap((file) => {
+      const {descriptor} = parseSfc(fs.readFileSync(file, 'utf8'), {filename: file})
+      if (!descriptor.template) return []
+      const found = []
+      const visit = (node) => {
+        if (node.type === 1) {
+          const line = descriptor.template.loc.start.line - 1 + node.loc.start.line
+          if (node.tag === 'PanelTabs' && !hasNonEmptyAttribute(node, 'label')) {
+            found.push(`line ${line}: unnamed <PanelTabs>`)
+          }
+          if (staticAttribute(node, 'role') === 'tabpanel' && !hasNonEmptyAttribute(node, 'aria-labelledby')) {
+            found.push(`line ${line}: tabpanel without aria-labelledby`)
+          }
+        }
+        node.children?.forEach(visit)
+      }
+      visit(parseTemplate(descriptor.template.content))
+      return found.map((issue) => `${path.relative(sourceRoot, file)}:${issue}`)
+    })
+
+    expect(issues).toEqual([])
+  })
+
   it('gives every native form control an accessible name', () => {
     const unnamedControls = vueFiles(sourceRoot).flatMap((file) => {
       const {descriptor} = parseSfc(fs.readFileSync(file, 'utf8'), {filename: file})

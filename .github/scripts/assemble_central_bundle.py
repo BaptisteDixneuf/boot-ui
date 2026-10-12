@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Assemble the Maven Central upload bundle from a local Maven repository.
 
-Usage: assemble_central_bundle.py LOCAL_REPOSITORY VERSION OUTPUT_ZIP
+Usage: assemble_central_bundle.py [--unsigned] LOCAL_REPOSITORY VERSION OUTPUT_ZIP
 
 The release workflow installs the publication reactor and then bundles only the files each published
-module's version directory holds for that version. Resolver bookkeeping (``_remote.repositories``,
+module's version directory holds for that version. The coordinates are check-central-bundle.py's PUBLISHED, an
+allow-list: bootui-agent-bridge, which bootui-agent shades, and the two parent POMs are installed with the
+reactor but never bundled, and every bundled module carries the flattened, parentless POM flatten-maven-plugin
+installed. check-central-bundle.py then checks the bundle's coordinates and POMs.
+
+--unsigned is for stage-release-candidate.sh only, which builds without signing; release.yml never passes it. Resolver bookkeeping (``_remote.repositories``,
 ``maven-metadata-local.xml``, ``*.lastUpdated``) never reaches the bundle: Maven Central rejects any bundle
 directory without a POM, which is exactly what the central-publishing-maven-plugin produced under Maven
 3.10, whose installer writes that bookkeeping into the plugin's staging directory.
@@ -15,28 +20,27 @@ Only the md5 and sha1 checksums Central requires are generated; signatures get n
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import sys
 import zipfile
 from pathlib import Path
 
 GROUP_PATH = "com/julien-dubois/bootui"
 
-# Every published artifact. Keep in sync with the release workflow's publication reactor and its Maven
-# Central availability poll list; check-release-integrity.sh enforces the latter.
-ARTIFACT_IDS = (
-    "bootui-parent",
-    "bootui-core",
-    "bootui-engine",
-    "bootui-spring-autoconfigure",
-    "bootui-spring-boot-starter",
-    "bootui-spring-boot-starter-reactive",
-    "bootui-ui",
-    "bootui-quarkus-parent",
-    "bootui-quarkus",
-    "bootui-quarkus-deployment",
-    "bootui-client",
-    "bootui-cli",
-)
+
+
+def _load_bundle_check():
+    path = Path(__file__).resolve().with_name("check-central-bundle.py")
+    spec = importlib.util.spec_from_file_location("check_central_bundle", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Every published artifact: the bundle checker's list, the one the assembler, the checker and their tests read.
+# check-release-integrity.sh keeps it equal to its PUBLISHED_ARTIFACTS, the availability poll list, and
+# consumer-smoke-tests.sh.
+ARTIFACT_IDS = _load_bundle_check().PUBLISHED
 
 CHECKSUM_SUFFIXES = (".md5", ".sha1", ".sha256", ".sha512")
 RESOLVER_BOOKKEEPING = ("_remote.repositories", "maven-metadata")
@@ -63,7 +67,7 @@ def _publishable_files(version_dir: Path, artifact_id: str, version: str) -> lis
     return files
 
 
-def _check_module(artifact_id: str, version: str, names: set[str]) -> None:
+def _check_module(artifact_id: str, version: str, names: set[str], signed: bool = True) -> None:
     prefix = f"{artifact_id}-{version}"
     if f"{prefix}.pom" not in names:
         raise BundleError(f"{artifact_id} {version} has no POM")
@@ -72,11 +76,13 @@ def _check_module(artifact_id: str, version: str, names: set[str]) -> None:
             if f"{prefix}-{classifier}.jar" not in names:
                 raise BundleError(f"{artifact_id} {version} has no {classifier} jar")
     for name in names:
-        if not name.endswith(".asc") and f"{name}.asc" not in names:
+        if signed and not name.endswith(".asc") and f"{name}.asc" not in names:
             raise BundleError(f"{artifact_id} {version} has an unsigned file: {name}")
+        if not signed and name.endswith(".asc"):
+            raise BundleError(f"{artifact_id} {version} is signed, but the bundle was assembled as unsigned: {name}")
 
 
-def assemble(local_repository: Path, version: str, output: Path) -> list[str]:
+def assemble(local_repository: Path, version: str, output: Path, signed: bool = True) -> list[str]:
     entries: list[tuple[str, bytes]] = []
     for artifact_id in ARTIFACT_IDS:
         relative_dir = f"{GROUP_PATH}/{artifact_id}/{version}"
@@ -84,7 +90,7 @@ def assemble(local_repository: Path, version: str, output: Path) -> list[str]:
         if not version_dir.is_dir():
             raise BundleError(f"{artifact_id} {version} is not installed in {local_repository}")
         files = _publishable_files(version_dir, artifact_id, version)
-        _check_module(artifact_id, version, {path.name for path in files})
+        _check_module(artifact_id, version, {path.name for path in files}, signed)
         for path in files:
             content = path.read_bytes()
             entry = f"{relative_dir}/{path.name}"
@@ -101,12 +107,17 @@ def assemble(local_repository: Path, version: str, output: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 4:
+    arguments = argv[1:]
+    signed = True
+    if arguments and arguments[0] == "--unsigned":
+        signed = False
+        arguments = arguments[1:]
+    if len(arguments) != 3:
         print(__doc__.splitlines()[2], file=sys.stderr)
         return 2
-    local_repository, version, output = Path(argv[1]), argv[2], Path(argv[3])
+    local_repository, version, output = Path(arguments[0]), arguments[1], Path(arguments[2])
     try:
-        entries = assemble(local_repository, version, output)
+        entries = assemble(local_repository, version, output, signed)
     except BundleError as error:
         print(f"::error::Cannot assemble the Maven Central bundle: {error}", file=sys.stderr)
         return 1

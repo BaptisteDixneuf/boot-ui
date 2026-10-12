@@ -24,7 +24,7 @@ import org.eclipse.microprofile.config.ConfigProvider;
  * prefix contributed only by {@code @ApplicationPath} is not known at runtime; such paths fall back to masked
  * paths.</p>
  */
-final class DeclaredRouteTemplates {
+public final class DeclaredRouteTemplates {
 
     private static final String ROOT_PATH_KEY = "quarkus.http.root-path";
 
@@ -43,11 +43,26 @@ final class DeclaredRouteTemplates {
      * Resolvers that share one index of the declared routes, read once, the first time a path needs it. The
      * build-time mappings never change at runtime, so a panel polled every few seconds indexes them once.
      */
-    static Supplier<RouteTemplateResolver> caching(Instance<? extends MappingProvider> mappings) {
+    public static Supplier<RouteTemplateResolver> caching(Instance<? extends MappingProvider> mappings) {
         if (mappings == null) {
             return RouteTemplateResolver::empty;
         }
         return RouteTemplateResolver.caching(() -> mappings(mappings));
+    }
+
+    /**
+     * The declared routes themselves, under the application's mount, read on each call, or {@code null} when they
+     * cannot be read: without the build-time mappings provider, or with one that is unavailable. Runtime Insights then
+     * says that the routes no request reached are unknown, instead of listing none.
+     */
+    public static Supplier<List<MappingDto>> declared(Instance<? extends MappingProvider> mappings) {
+        return () -> {
+            if (mappings == null || !mappings.isResolvable()) {
+                return null;
+            }
+            MappingProvider provider = mappings.get();
+            return provider.available() ? mounted(provider.mappings(), mountPrefix()) : null;
+        };
     }
 
     private static List<MappingDto> mappings(Instance<? extends MappingProvider> mappings) {

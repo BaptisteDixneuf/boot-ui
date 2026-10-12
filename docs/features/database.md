@@ -11,7 +11,11 @@ The Database Connection Pools panel inspects supported JDBC pool beans. It is re
 borrows a connection, or resizes a pool, and it fails closed when no supported pool implementation or pool bean is
 present.
 
-For each pool it shows the pool identity, the masked JDBC URL and username, the driver, the minimum and maximum
+The connections each request held at once, from the runtime journal, are in [Runtime Insights](overview.md#runtime-insights)
+(`connections-per-request`), which does not list them by default; this panel links to them, and the link opens Runtime Insights with
+every row shown.
+
+For each pool it shows the pool identity and library, the masked JDBC URL and username, the driver, the minimum and maximum
 sizing, and the timeout and lifetime settings. Closed and uninitialized pools carry a clear unavailable reason. A live
 chart polls bounded snapshots of active, idle, total, and pending connections every two seconds, so you can watch
 saturation trends without leaving the console.
@@ -21,9 +25,10 @@ saturation trends without leaving the console.
 The panel is served over **Agroal** (Quarkus' pool library) instead of HikariCP. A Quarkus provider maps the live Agroal
 pool configuration and `AgroalDataSourceMetrics` (active/available/awaiting counts) into the same DTO shape, so the panel
 looks and behaves identically. Pool metrics require `quarkus.datasource.jdbc.metrics.enabled=true`; with metrics disabled
-the pool configuration still renders but the live snapshot is marked unavailable. A few Hikari-specific fields have no
-faithful Agroal equivalent and are reported as neutral defaults (per-call validation timeout, keepalive interval, and
-read-only flag).
+the pool configuration still renders but the live snapshot is marked unavailable. Each pool's **Pool library** reads
+`Agroal` (`implementation` in the JSON, `HikariCP` on Spring). Settings Agroal does not expose, the per-call validation
+timeout, the keepalive interval and the read-only flag, are `null` and render as "—"; a maximum lifetime of `0` is
+Agroal's default and means no limit.
 
 :::
 
@@ -198,7 +203,7 @@ the retained rows, and a section that could not be read names its reason, so inc
 server.
 
 Reads are explicit. Opening the panel shows the last in-memory report; MySQL is queried when you choose **Run MySQL
-read**. There are no grades, severities, recommendations, or contributions to Overview scores.
+read**. There are no grades, severities, recommendations, or contributions to Scorecard scores.
 
 | Section | What it shows |
 | --- | --- |
@@ -286,6 +291,11 @@ These paths use the default API mount; custom `bootui.api-path` and application 
 | REST | `GET /bootui/api/mysql` | `POST /bootui/api/mysql/read` |
 | MCP | `get_mysql_report` | `mysql_read` |
 | CLI | `bootui db mysql report` | `bootui db mysql read` |
+
+Over MCP and the CLI, the explicit read answers with a
+[summary](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls) — the read's status and each datasource's
+section coverage, without rows — and the cached report returns the rows. `postgresql_read` answers the same way for
+the PostgreSQL panel.
 
 Neither operation accepts SQL, a schema selector, or a server address. Collection uses the application's existing
 datasources and credentials. Global `bootui.read-only` or `bootui.panels.mysql.read-only` blocks the action even though
@@ -485,7 +495,12 @@ third-party database-proxy library.
 Executions are retained in a bounded buffer, most recent first, alongside aggregate stats: total, average, and
 maximum time, slow-query and failure counts, per-category counters, and evictions. A configurable slow-query threshold
 highlights expensive statements, and local-only **Pause**, **Resume**, and **Clear** actions stop recording or empty
-the buffer without unwrapping the data source.
+the buffer without unwrapping the data source. Pausing stops only this panel's buffer: the
+[runtime journal](overview.md#runtime-journal) keeps recording statements and connections.
+**Clear** empties the retained window — the entries, the aggregate stats, and the top statements — and resets nothing
+else: the header's "captured since startup" count and the evictions are lifetime counts. Over MCP and the CLI, the
+controls answer with a [compact acknowledgement](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls)
+instead of the panel.
 
 The buffer keeps failure evidence longer than routine traffic: a share of it, 25% by default
 (`bootui.sql-trace.reserved-share-percent`), is reserved for the most recent failed and slow executions, so a burst of
@@ -511,8 +526,14 @@ the repetition.
 BootUI transparently wraps each `DataSource` bean and intercepts statement execution on the resulting
 `Connection`/`Statement`/`PreparedStatement`/`CallableStatement` objects, recording the SQL text, statement type, SQL
 category (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`DDL`/`OTHER`), wall-clock duration in microseconds, affected-row counts, batch size,
-originating connection, executing thread, the call site that triggered it (when call-site capture is enabled), and any
-failure. A Spring `DataSource` wrapper is never replaced, because its concrete type is part of your application's
+originating connection, executing thread and its kind, the call site that triggered it (when call-site capture is
+enabled), and any failure. The thread kind — `WORKER`, `VIRTUAL_THREAD`, `EVENT_LOOP`, `REACTOR_SCHEDULER`, or `OTHER`
+— comes from the adapter that owns the thread, from its type rather than its name, so JDBC run on a Reactor Netty or
+Vert.x event loop reads `EVENT_LOOP`. REST client calls carry the kind of the thread they started on. On Spring MVC and
+Quarkus, each statement also records the phase of its request it ran in: `FILTERS` before the handler, `HANDLER` inside
+it, and `RESPONSE` once it has returned, while the body is serialized or a view renders, which is where lazy loading
+surfaces. Spring WebFlux exposes no hook between an annotated handler and its result writing, so its statements carry
+no phase rather than a guessed one. A Spring `DataSource` wrapper is never replaced, because its concrete type is part of your application's
 contract: instead, when it owns the only reference to a pool — as `spring.datasource.connection-fetch=lazy` does with
 `LazyConnectionDataSourceProxy` — the pool inside it is traced in place, and when its target is a bean that was traced
 on its own it is left alone so executions are not double-counted. Wrapping
@@ -618,10 +639,9 @@ keep using the fixed, pre-registered set above.
 
 :::
 
-::: details On Quarkus: two feeders reach Spring parity
+::: details On Quarkus: JDBC executions and ORM preparations
 
-The panel is identical, running over the same engine recorder (buffer, grouping, stats, N+1 detection, and call-site
-capture are byte-identical to Spring). Capture comes from two complementary feeders:
+The panel uses the same engine recorder and DTO contract as Spring. Capture comes from two complementary feeders:
 
 - an `@Alternative` Agroal `DataSource` that wraps the default pool with the same JDK-proxy tracer. It handles manual
   JDBC access and is gated on a datasource being present.
@@ -629,13 +649,100 @@ capture are byte-identical to Spring). Capture comes from two complementary feed
   unit (gated on `quarkus-hibernate-orm`; SQL from a named persistence unit is not traced). This is needed because
   Hibernate ORM resolves its pool from Agroal's own registry and so bypasses the CDI `DataSource`.
 
-Between them the panel reaches parity with Spring whether SQL originates from raw JDBC or the ORM. Statement text, type,
-category, execution count, and N+1 detection are full-fidelity; for ORM SQL the per-statement duration, affected-row
-count, and bound parameters are not available (the `StatementInspector` SPI exposes only the SQL text at prepare time,
-with no execution-end hook), so those degrade cleanly while never leaking ORM parameter values. Both feeders are wired in
-dev/test only and never in production.
+The inspector observes **preparation only**, not JDBC execution: text, type, category, and call site are known, but
+whether that particular statement ran, succeeded, or changed rows is not. Preparation rows remain visible in the
+capture list and `totalCaptured`, with a report warning; their compatibility fields (`durationMicros: 0`, `success:
+true`) do not establish an execution or outcome. They are excluded from execution statistics, rankings, N+1 badges,
+request database-access claims, and Runtime Insights' confirmed event-loop blocking. ORM session metrics can measure
+aggregate statement time but cannot prove which preparation executed. Manual JDBC executions, including a measured
+zero duration, still count normally beside ORM preparations. Both feeders are wired in dev/test only and never in
+production, and the inspector never captures bound parameter values.
 
 :::
+
+## Transactions
+
+![BootUI Transactions panel](../images/bootui-transactions.webp)
+
+The Transactions panel shows the `@Transactional` boundaries your application recently ran: begin, commit, and
+rollback events, captured by BootUI's own listener wiring rather than a third-party observability library.
+
+On Spring MVC and WebFlux, BootUI contributes a `TransactionExecutionListener`, available since Spring Framework 6.1,
+through Spring Boot's standard transaction-manager customization, completing registration for user-defined
+`ConfigurableTransactionManager` beans after singleton initialization. It composes with your own transaction management
+and listeners rather than replacing them. Managers that do not implement the configurable listener SPI stay
+unobserved. On WebFlux this observes both the blocking transaction managers a reactive application still uses, such as
+`@Transactional` JDBC work run on a Reactor `boundedElastic` worker, which the WebFlux sample's
+`GET /api/sample/transaction-samples` generates, and a `ReactiveTransactionManager` such as R2DBC's, whose transactions
+may begin and complete on different threads and are recorded without a thread-bound parent or isolation
+([WebFlux support](../WEBFLUX-SUPPORT.md)).
+
+Reactive capture records physical begin/commit/rollback callbacks, not a full reactive parent or savepoint hierarchy.
+SQL and connection counts describe JDBC work on the begin thread within its time window: R2DBC statements and JDBC
+work moved to another thread are not counted, so zero counts are not evidence that no database work occurred.
+
+Transactions are retained in a bounded ring buffer, most recently completed first, with aggregate stats: total,
+average, and maximum duration, slow and connection-held counts, commit, rollback, and unknown outcome counts, and a
+nested-transaction count.
+
+The panel renders a parent and child tree, so a root transaction's nested calls sit directly underneath it, and each
+row expands to its thread, trace id, read-only flag, and any error. Configurable slow-transaction and
+connection-hold-time thresholds flag transactions worth a closer look, and local-only **Pause**, **Resume**, and
+**Clear** actions stop recording or empty the buffer without deregistering the listener. Pausing stops only this
+panel's buffer: the [runtime journal](overview.md#runtime-journal) keeps recording transactions.
+**Clear** empties the retained window — the entries and the aggregate stats — and resets nothing else: the header's
+"captured since startup" count and the evictions are lifetime counts. Over MCP and the CLI, the controls answer with a
+[compact acknowledgement](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls) instead of the panel.
+
+::: details What each captured transaction records
+
+Each captured transaction records:
+
+- the declared boundary name, typically `ClassName.methodName`.
+- a best-effort `propagation` classification. `NEW` means the manager actually started a transaction; `PARTICIPATING`
+  means it joined one already active on the same thread. Spring's listener SPI does not expose the declared `Propagation`
+  enum value itself.
+- the JDBC isolation level active at begin time.
+- the outcome — `COMMITTED`, `ROLLED_BACK`, or `UNKNOWN` when a begin/commit/rollback threw.
+- start/end timestamps and wall-clock duration.
+- the enclosing transaction's id, so nested transactions form a call tree.
+- the executing thread and, when present, the active Micrometer/W3C trace id.
+
+Each entry is also correlated, by thread and time window, to the executions already captured by the SQL Trace panel,
+surfacing the number of SQL statements and distinct JDBC connections a transaction touched without instrumenting anything
+twice.
+
+:::
+
+Transaction metadata — method names, propagation, isolation, thread names, trace ids — is not sensitive application
+data the way bound SQL parameters are, so none of it is masked or gated behind exposure settings.
+
+The panel fails closed and reports unavailable with a reason when no configurable transaction manager bean exists. A
+`ReactiveTransactionManager` over R2DBC is configurable too, so a WebFlux application that uses only R2DBC has its
+transactions recorded. Capture, the initial recording state, buffer size, and the slow-transaction and connection-hold
+thresholds are configurable under `bootui.transactions.*`.
+
+The panel refreshes over Server-Sent Events. The browser subscribes to `/bootui/api/transactions/stream`, and the
+server pushes a coalesced notification whenever a transaction completes, the buffer is cleared, or recording is paused
+or resumed. When the auto-refresh toggle is off or the tab is hidden, the stream is closed, and the panel falls back to
+its initial load when Server-Sent Events are unavailable.
+
+::: details Sample app scenarios and MCP exposure
+
+The Spring sample's product list and uncached product-search operations use explicit read-only service transactions, so
+loading or checking products produces representative entries here as well as in SQL Trace. Its sample action lab has a
+one-click transaction scenario set that generates committed, slow, rolled-back, and nested boundaries, plus a Hibernate
+second-level cache action that loads one entity through two persistence contexts to produce visible miss, put, and hit
+counters in Hibernate Statistics. When the opt-in MCP Server is enabled on Spring MVC or WebFlux, `get_transactions`
+exposes the same bounded, local-only report to an agent; it is not advertised on Quarkus because transaction capture is
+not available there.
+
+:::
+
+This panel is not applicable on Quarkus. Its transaction management goes through Narayana's JTA `TransactionManager`
+and `Synchronization` or the CDI `@Transactional` interceptor, neither of which exposes a comparable per-boundary
+listener hook without far more invasive instrumentation than Spring's opt-in registration. The Quarkus endpoint reports
+unavailable with that reason rather than forcing false parity.
 
 ## Hibernate Statistics
 
@@ -671,78 +778,6 @@ than an enforced filter.
 :::
 
 The panel is identical on Quarkus, gated on the same Hibernate ORM capability as the Hibernate advisor.
-
-## Transactions
-
-![BootUI Transactions panel](../images/bootui-transactions.webp)
-
-The Transactions panel shows the `@Transactional` boundaries your application recently ran: begin, commit, and
-rollback events, captured by BootUI's own listener wiring rather than a third-party observability library.
-
-On Spring MVC and WebFlux, BootUI contributes a `TransactionExecutionListener`, available since Spring Framework 6.1,
-through Spring Boot's standard transaction-manager customization, completing registration for user-defined
-`ConfigurableTransactionManager` beans after singleton initialization. It composes with your own transaction management
-and listeners rather than replacing them. Managers that do not implement the configurable listener SPI stay
-unobserved.
-
-Transactions are retained in a bounded ring buffer, most recently completed first, with aggregate stats: total,
-average, and maximum duration, slow and connection-held counts, commit, rollback, and unknown outcome counts, and a
-nested-transaction count.
-
-The panel renders a parent and child tree, so a root transaction's nested calls sit directly underneath it, and each
-row expands to its thread, trace id, read-only flag, and any error. Configurable slow-transaction and
-connection-hold-time thresholds flag transactions worth a closer look, and local-only **Pause**, **Resume**, and
-**Clear** actions stop recording or empty the buffer without deregistering the listener.
-
-::: details What each captured transaction records
-
-Each captured transaction records:
-
-- the declared boundary name, typically `ClassName.methodName`.
-- a best-effort `propagation` classification. `NEW` means the manager actually started a transaction; `PARTICIPATING`
-  means it joined one already active on the same thread. Spring's listener SPI does not expose the declared `Propagation`
-  enum value itself.
-- the JDBC isolation level active at begin time.
-- the outcome — `COMMITTED`, `ROLLED_BACK`, or `UNKNOWN` when a begin/commit/rollback threw.
-- start/end timestamps and wall-clock duration.
-- the enclosing transaction's id, so nested transactions form a call tree.
-- the executing thread and, when present, the active Micrometer/W3C trace id.
-
-Each entry is also correlated, by thread and time window, to the executions already captured by the SQL Trace panel,
-surfacing the number of SQL statements and distinct JDBC connections a transaction touched without instrumenting anything
-twice.
-
-:::
-
-Transaction metadata — method names, propagation, isolation, thread names, trace ids — is not sensitive application
-data the way bound SQL parameters are, so none of it is masked or gated behind exposure settings.
-
-The panel fails closed and reports unavailable with a reason when no `PlatformTransactionManager` bean exists, and when
-a WebFlux application uses only a `ReactiveTransactionManager` over R2DBC, since Spring's listener hook exists solely
-on the blocking SPI. Capture, the initial recording state, buffer size, and the slow-transaction and connection-hold
-thresholds are configurable under `bootui.transactions.*`.
-
-The panel refreshes over Server-Sent Events. The browser subscribes to `/bootui/api/transactions/stream`, and the
-server pushes a coalesced notification whenever a transaction completes, the buffer is cleared, or recording is paused
-or resumed. When the auto-refresh toggle is off or the tab is hidden, the stream is closed, and the panel falls back to
-its initial load when Server-Sent Events are unavailable.
-
-::: details Sample app scenarios and MCP exposure
-
-The Spring sample's product list and uncached product-search operations use explicit read-only service transactions, so
-loading or checking products produces representative entries here as well as in SQL Trace. Its sample action lab has a
-one-click transaction scenario set that generates committed, slow, rolled-back, and nested boundaries, plus a Hibernate
-second-level cache action that loads one entity through two persistence contexts to produce visible miss, put, and hit
-counters in Hibernate Statistics. When the opt-in MCP Server is enabled on Spring MVC or WebFlux, `get_transactions`
-exposes the same bounded, local-only report to an agent; it is not advertised on Quarkus because transaction capture is
-not available there.
-
-:::
-
-This panel is not applicable on Quarkus. Its transaction management goes through Narayana's JTA `TransactionManager`
-and `Synchronization` or the CDI `@Transactional` interceptor, neither of which exposes a comparable per-boundary
-listener hook without far more invasive instrumentation than Spring's opt-in registration. The Quarkus endpoint reports
-unavailable with that reason rather than forcing false parity.
 
 ## Spring Data
 

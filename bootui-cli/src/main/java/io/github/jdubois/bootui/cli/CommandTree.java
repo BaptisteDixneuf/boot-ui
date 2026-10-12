@@ -56,11 +56,44 @@ final class CommandTree {
                             group.subcommands().keySet().stream()
                                     .filter(name -> !name.startsWith("-"))
                                     .toList()));
+            String prefix = String.join(" ", groupPath(group)) + " ";
+            listCommands(
+                    group,
+                    context.manifest().tools().stream()
+                            .filter(tool -> tool.command().startsWith(prefix))
+                            .toList(),
+                    false);
         }
 
         root.addSubcommand("tools", new CommandLine(toolsCommand(context)));
         root.addSubcommand("mcp", new CommandLine(mcpCommand(context)));
+        listCommands(root, context.manifest().tools(), true);
         return root;
+    }
+
+    /** The words of a group's command path below {@code bootui}, such as {@code memory heap}. */
+    private static List<String> groupPath(CommandSpec group) {
+        List<String> words = new ArrayList<>();
+        for (CommandSpec spec = group; spec.parent() != null; spec = spec.parent()) {
+            words.add(0, spec.name());
+        }
+        return words;
+    }
+
+    /**
+     * Replaces picocli's one-word-per-subcommand list with every command beneath {@code spec}, each with its
+     * arguments, what it returns, where its id comes from, and one example (M4-21). Agents in the benchmark spent
+     * almost half their calls walking {@code --help} one level at a time; this answers in one.
+     */
+    private static void listCommands(CommandSpec spec, List<ToolManifest.Tool> tools, boolean root) {
+        Map<String, CommandLine.IHelpSectionRenderer> sections =
+                new LinkedHashMap<>(spec.usageMessage().sectionMap());
+        sections.put(CommandLine.Model.UsageMessageSpec.SECTION_KEY_COMMAND_LIST_HEADING, help -> "");
+        sections.put(
+                CommandLine.Model.UsageMessageSpec.SECTION_KEY_COMMAND_LIST,
+                help -> HelpListing.render(
+                        tools, root, help.commandSpec().usageMessage().width()));
+        spec.usageMessage().sectionMap(sections);
     }
 
     private static CommandSpec childGroup(
@@ -94,12 +127,20 @@ final class CommandTree {
         ToolCommand command = new ToolCommand(context, tool);
         CommandSpec spec = CommandSpec.wrapWithoutInspection(command)
                 .name(tool.path().get(tool.path().size() - 1));
-        spec.usageMessage().description(tool.summary()).footer("", "MCP tool: " + tool.name() + stackNote(tool));
+        spec.usageMessage()
+                .description(HelpListing.literal(tool.helpDescription()))
+                .footer(
+                        "",
+                        HelpListing.literal("Example: " + tool.example()),
+                        "MCP tool: " + tool.name() + stackNote(tool));
         if (tool.takesQuery()) {
             spec.addOption(OptionSpec.builder("-q", "--query")
                     .paramLabel("<text>")
                     .type(String.class)
-                    .description("Filter the results, matched case-insensitively by the application.")
+                    .description(
+                            tool.queryHelp().isEmpty()
+                                    ? "Filter the results, matched case-insensitively by the application."
+                                    : HelpListing.literal("Filter the results: " + tool.queryHelp() + "."))
                     .setter(setter((String value) -> command.query = value))
                     .build());
         }
@@ -111,14 +152,29 @@ final class CommandTree {
                     .setter(setter((Integer value) -> command.limit = value))
                     .build());
         }
+        if (tool.ignoresLimit()) {
+            // A script written while the tool took a limit keeps working: the option is accepted, hidden, and unsent.
+            spec.addOption(OptionSpec.builder("-n", "--limit")
+                    .paramLabel("<count>")
+                    .type(Integer.class)
+                    .hidden(true)
+                    .description("Ignored: this command lists every match.")
+                    .setter(setter((Integer value) -> {}))
+                    .build());
+        }
         if (tool.takesId()) {
             spec.addPositional(PositionalParamSpec.builder()
                     .paramLabel("<id>")
                     .index("0")
-                    .arity("1")
-                    .required(true)
+                    .arity(tool.optionalId() ? "0..1" : "1")
+                    .required(!tool.optionalId())
                     .type(String.class)
-                    .description("The identifier of the resource to read.")
+                    .description(
+                            !tool.idHelp().isEmpty()
+                                    ? HelpListing.literal(tool.idHelp())
+                                    : tool.optionalId()
+                                            ? "Run id to compare with (default: previous)."
+                                            : "The identifier of the resource to read.")
                     .setter(setter((String value) -> command.id = value))
                     .build());
         }
@@ -143,7 +199,8 @@ final class CommandTree {
         return spec;
     }
 
-    private static String stackNote(ToolManifest.Tool tool) {
+    /** Empty for a command every stack has, otherwise {@code " (only on spring mvc, spring webflux)"}. */
+    static String stackNote(ToolManifest.Tool tool) {
         if (tool.onEveryStack()) {
             return "";
         }

@@ -9,18 +9,47 @@ applyTo: ".github/workflows/release.yml,.github/workflows/build.yml,.github/scri
   release contents and must match the release version before publication. Leave `.claude-plugin/plugin.json` inside
   the plugin version-free so Claude Code retains commit-SHA updates.
 - Keep `quarkus.platform.version` independent from the BootUI project version.
-- Published artifacts are the parent POM, core, engine, UI, Spring autoconfigure, both Spring starters (MVC and
-  reactive), Quarkus parent, Quarkus runtime, Quarkus deployment, `bootui-client`, and `bootui-cli`. Sample apps,
-  integration tests, coverage, and conformance must retain `maven.deploy.skip=true`, remain in the Central plugin's
-  `excludeArtifacts` list, and stay outside the publication-only reactor in `release.yml`.
+- Exactly seven coordinates are published: `bootui-engine` (with the core DTO package), `bootui-ui`,
+  `bootui-spring-boot-starter` (the auto-configuration and the one Spring starter, for Spring MVC and WebFlux),
+  `bootui-quarkus`, `bootui-quarkus-deployment`, `bootui-cli` (the CLI and its dependency-free client package, plus
+  the shaded `all` classifier), and the `bootui-agent` `-javaagent` jar. The same list lives in `release.yml`'s
+  availability poll,
+  `check-central-bundle.py` (whose `PUBLISHED` the bundle assembler and the release tests read),
+  `consumer-smoke-tests.sh`, and `check-release-integrity.sh`; change them together.
+- Publication never runs Maven's `deploy` phase: under Maven 3.10, `central-publishing-maven-plugin` stages resolver
+  bookkeeping that Central rejects. `release.yml` installs the publication-only reactor, signed, then
+  `assemble_central_bundle.py` bundles exactly the published coordinates from the local repository,
+  `check-central-bundle.py` checks the bundle, `verify-release-signatures.sh bundle` checks every signature in it, and
+  `publish_central_bundle.py` uploads it through the Central Portal API. The assembler's list is an allow-list, so
+  the parents and `bootui-agent-bridge` never reach the bundle.
+- Neither `bootui-parent` nor `bootui-quarkus-parent` is published. Each published module declares
+  `flatten-maven-plugin` (configured in the root POM, `ossrh` mode), so its installed and published POM has no
+  `<parent>`, resolved dependency versions, scopes, optional flags and exclusions, and the root's Central metadata.
+  The flattened POM stays beside `pom.xml`: Quarkus 3.33 breaks in-reactor builds when it lives under `target/`. A new
+  published module must declare the plugin too. Both parents stay in the publication reactor and in `excludeArtifacts`.
+- Sample apps, integration tests, coverage, and conformance must retain `maven.deploy.skip=true`, remain in the Central
+  plugin's `excludeArtifacts` list, and stay outside the publication-only reactor in `release.yml`.
+- The consumer smoke tests live in `.github/scripts/consumer-smoke-tests.sh`. Normal preparation runs them against the
+  exact unsigned candidate bundle staged as a file repository by `stage-release-candidate.sh`, before the release
+  commit and tag. Tag-entry or `skip_build` runs without successful pre-tag smoke stage and test from the immutable
+  tagged checkout before publication instead; a passed pre-tag smoke is not rerun after tagging. The script runs
+  against Maven Central after publication, including `resume_after_publish` recovery. Every run requires each resolved BootUI file to come from
+  the source under test and the consumers to resolve exactly the published coordinates. `build.yml`'s
+  `release-candidate` job runs the staged smoke on every change.
+- `bootui-agent-bridge` is built but never published: `bootui-agent` shades it in and declares it, like Byte Buddy,
+  `<optional>`. It is the one non-distribution jar module inside the publication-only reactor, so it keeps
+  `maven.deploy.skip=true` and its `excludeArtifacts` entry, and is never polled on Maven Central. The consumer smoke tests
+  resolve `bootui-agent` in a standalone consumer project, fails unless its runtime
+  classpath is the agent jar alone, and runs `java -javaagent:<jar> -version` on the Java 17 baseline, requiring exit
+  code 0 and the `[BootUI agent] BootUI agent <version> attached (javaagent); dormant until BootUI claims it` line.
 - The release also rewrites the `bootui-cli` coordinate in `jbang-catalog.json`, `README.md`, and `docs/CLI.md`, and
   fails when `jbang-catalog.json` still resolves the previous version, so `jbang bootui@jdubois/boot-ui` cannot install
   a stale release. The catalog alias points at the shaded `:all` classifier, so the CLI's shade execution and the alias
   must change together; `release.yml` verifies the `bootui-cli-${VERSION}-all.jar` is published.
 - Every published jar module attaches an empty placeholder `javadoc.jar` during `package`, before release-profile
   signing at `verify`; Maven Central requires the file, not generated Javadoc. The release profile's
-  `attach-empty-javadocs` execution covers modules with build output, and the source-less modules (`bootui-ui`,
-  `bootui-spring-boot-starter`, and `bootui-spring-boot-starter-reactive`) keep their own execution with the same id.
+  `attach-empty-javadocs` execution covers modules with build output, and the source-less `bootui-ui` keeps its own
+  execution with the same id.
 - Preserve the immutable source-first workflow sequence: prepare and verify the versioned working tree; commit the exact
   release contents; refuse to continue if the source branch advanced; create and verify a GPG-signed annotated tag; then
   atomically push the release commit and tag before any publication. Publish, verify, smoke-test, and deploy documentation
@@ -47,9 +76,13 @@ applyTo: ".github/workflows/release.yml,.github/workflows/build.yml,.github/scri
   major is at least the highest major among the stable tags on origin; an older-major patch skips the redeploy.
   `test_release_version_policy.py`, `test_release_line_gate.py`, and `test_release_integrity.py` cover these rules,
   the gate, and the guard.
-- Maven Central requires the matching public signing key to be available by fingerprint. Never expose signing secrets in
-  command arguments or logs. If macOS `gpg --send-keys` fails through dirmngr, use the HTTPS upload APIs for
-  `keys.openpgp.org` and `keyserver.ubuntu.com`.
+- Maven Central requires the matching public signing key to be available by fingerprint. `release.yml` pins that key's
+  primary fingerprint once, as the job's `RELEASE_KEY_FINGERPRINT`: right after the key is imported, a step refuses any
+  other key before anything is signed or tagged, and `verify-release-signatures.sh` requires every signature of the
+  verification build (before the tag, unless `skip_build`) and of the Central bundle (before the upload) to be by it.
+  Change the value only on a deliberate key rotation, in `release.yml` and `check-release-integrity.sh` together, after
+  publishing the new key. Never expose signing secrets in command arguments or logs. If macOS `gpg --send-keys` fails
+  through dirmngr, use the HTTPS upload APIs for `keys.openpgp.org` and `keyserver.ubuntu.com`.
 - A failed Central deployment may consume the coordinate. Drop the failed deployment before rerunning the existing
   signed tag. If publication succeeded but polling, smoke tests, or documentation failed, resume from that tag with
   `resume_after_publish=true` so Maven Central deployment is not repeated.

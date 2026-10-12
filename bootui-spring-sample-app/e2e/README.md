@@ -7,53 +7,59 @@ console against a running Spring Boot application.
 
 ## What is covered
 
-Each Playwright spec file targets one of the BootUI views (or a cross-cutting
-flow) exposed by the sample app:
+The specs target BootUI views and cross-cutting flows exposed by the sample app. Representative coverage includes:
 
-| Spec                      | Verifies                                                                                                                                      |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `app-shell.spec.js`       | Top navbar, sidebar links, deep-linking, navigation between every section                                                                     |
-| `overview.spec.js`        | Application / Runtime / Activation cards, refresh button                                                                                      |
-| `health.spec.js`          | Health tree renders with an overall status badge                                                                                              |
-| `metrics.spec.js`         | Micrometer meter browser, live graph, measurements, and type filtering                                                                        |
-| `memory.spec.js`          | Heap / non-heap cards and memory pools render without tuning controls                                                                         |
-| `jvm-tuning.spec.js`      | JVM options, Kubernetes calculator, copy feedback, and calculator updates                                                                     |
-| `heap-dump.spec.js`       | Heap dump capture/analyze/delete controls, class histogram, and raw-download gating                                                           |
-| `threads.spec.js`         | Thread state summaries, filtering, stack expansion, and raw-dump controls                                                                     |
-| `startup.spec.js`         | Startup timeline displays step rows                                                                                                           |
-| `config.spec.js`          | Property search, add an override (`sample.greeting`), confirm + delete it                                                                     |
-| `profile-diff.spec.js`    | Profile sources & properties render with filtering                                                                                            |
-| `loggers.spec.js`         | Logger search, change `io.github.jdubois.bootui.sample` to `WARN`, reset                                                                      |
-| `beans.spec.js`           | Dependency graph navigation, bean list rendering, name filter, and classification filter                                                      |
-| `conditions.spec.js`      | Positive / negative auto-config tabs, filtering                                                                                               |
-| `mappings.spec.js`        | HTTP mappings include the sample app routes, filter narrows the list                                                                          |
-| `scheduled.spec.js`       | Scheduled tasks view lists the sample echo scheduler                                                                                          |
-| `data.spec.js`            | `ProductRepository` is listed, detail panel shows `searchByName`                                                                              |
-| `hibernate.spec.js`       | Hibernate scan action and mapped-entity findings                                                                                              |
-| `cache.spec.js`           | Cache managers, cache details, annotations, metrics, and guarded clear actions                                                                |
-| `spring-security.spec.js` | Filter chains list `/api/secure`, explain endpoint returns a match                                                                            |
-| `security-logs.spec.js`   | Security Logs list recent audit events with filters, auto-refresh, and masked sensitive event data                                            |
-| `ai.spec.js`              | AI Framework summaries, token charts, content-capture guidance, and disabled states                                                           |
-| `traces.spec.js`          | Local trace list, waterfall details, OTLP ingest behavior, and clear action                                                                   |
-| `log-tail.spec.js`        | Log Tail connects, streams new events, pause / resume / clear controls work                                                                   |
-| `http-exchanges.spec.js`  | Recent inbound requests, masked header details, paging, and security failures                                                                 |
-| `http-probe.spec.js`      | Probe `/api/hello` and assert the response body is shown                                                                                      |
-| `pentesting.spec.js`      | OWASP hygiene report rendering, check details, and explicit scan controls                                                                     |
-| `vulnerabilities.spec.js` | Vulnerability inventory, severity ordering, OSV scan states, and read-only behavior                                                           |
-| `devtools.spec.js`        | DevTools LiveReload / restart status cards and guarded action feedback                                                                        |
-| `dev-services.spec.js`    | Dev Services snapshot, filtering, details, log viewing, and disabled restart controls                                                         |
-| `copilot.spec.js`         | Copilot dashboard, session explorer, sanitized events, raw reveal gating, and auto-refresh controls                                           |
-| `claude-code.spec.js`     | Claude Code dashboard, project-log parsing, sanitized events, raw reveal gating, and auto-refresh controls                                    |
-| `read-only.spec.js`       | Global and per-panel read-only properties block unsafe APIs and lock mutating browser controls                                                |
-| `sample-api.spec.js`      | Sample REST API (`/api/hello`, `/api/secure`, `/api/secure/products`, `/api/sample/hello`, `/api/sample/products`) and basic-auth on `/admin` |
+| Spec                                                                                         | Verifies                                                                                                                                      |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-shell.spec.js`                                                                          | Top navbar, sidebar links, deep-linking, navigation between every section                                                                     |
+| `overview.spec.js`                                                                           | Scorecard header, cached reports, explicit scans, score eligibility, and GitHub/MCP guidance                                                  |
+| `health.spec.js`                                                                             | Health tree renders with an overall status badge                                                                                              |
+| `metrics.spec.js`                                                                            | Micrometer meter browser, live graph, measurements, and type filtering                                                                        |
+| `live-memory.spec.js`                                                                        | Heap / non-heap cards, memory pools, and the guarded Free BootUI memory action                                                                |
+| `jvm-tuning.spec.js`                                                                         | JVM options, Kubernetes calculator, copy feedback, and calculator updates                                                                     |
+| `heap-dump.spec.js`                                                                          | Heap dump capture/analyze/delete controls, class histogram, and raw-download gating                                                           |
+| `threads.spec.js`                                                                            | Thread state summaries, filtering, stack expansion, and raw-dump controls                                                                     |
+| `startup.spec.js`                                                                            | Startup timeline displays step rows                                                                                                           |
+| `config.spec.js`                                                                             | Property search, add an override (`sample.greeting`), confirm + delete it                                                                     |
+| `profile-diff.spec.js`                                                                       | Profile sources & properties render with filtering                                                                                            |
+| `loggers.spec.js`                                                                            | Logger search, change `io.github.jdubois.bootui.sample` to `WARN`, reset                                                                      |
+| `beans.spec.js`                                                                              | Dependency graph navigation, bean list rendering, name filter, and classification filter                                                      |
+| `conditions.spec.js`                                                                         | Positive / negative auto-config tabs, filtering                                                                                               |
+| `mappings.spec.js`                                                                           | HTTP mappings include the sample app routes, filter narrows the list                                                                          |
+| `scheduled.spec.js`                                                                          | Scheduled tasks view lists the sample echo scheduler                                                                                          |
+| `data.spec.js`                                                                               | `ProductRepository` is listed, detail panel shows `searchByName`                                                                              |
+| `hibernate.spec.js`                                                                          | Hibernate scan action and mapped-entity findings                                                                                              |
+| `cache.spec.js`                                                                              | Cache managers, cache details, annotations, metrics, and guarded clear actions                                                                |
+| `spring-security.spec.js`                                                                    | Filter chains list `/api/secure`, explain endpoint returns a match                                                                            |
+| `security-logs.spec.js`                                                                      | Security Logs list recent audit events with filters, auto-refresh, and masked sensitive event data                                            |
+| `ai.spec.js`                                                                                 | AI Framework summaries, token charts, content-capture guidance, and disabled states                                                           |
+| `traces.spec.js`                                                                             | Local trace list, waterfall details, OTLP ingest behavior, and clear action                                                                   |
+| `log-tail.spec.js`                                                                           | Log Tail connects, streams new events, pause / resume / clear controls work                                                                   |
+| `http-exchanges.spec.js`                                                                     | Recent inbound requests, masked header details, paging, and security failures                                                                 |
+| `http-probe.spec.js`                                                                         | Probe `/api/hello` and assert the response body is shown                                                                                      |
+| `pentesting.spec.js`                                                                         | OWASP hygiene report rendering, check details, and explicit scan controls                                                                     |
+| `vulnerabilities.spec.js`                                                                    | Vulnerability inventory, severity ordering, OSV scan states, and read-only behavior                                                           |
+| `devtools.spec.js`                                                                           | DevTools LiveReload / restart status cards and guarded action feedback                                                                        |
+| `dev-services.spec.js`                                                                       | Dev Services snapshot, filtering, details, log viewing, and disabled restart controls                                                         |
+| `copilot.spec.js`                                                                            | Copilot dashboard, session explorer, sanitized events, raw reveal gating, and auto-refresh controls                                           |
+| `claude-code.spec.js`                                                                        | Claude Code dashboard, project-log parsing, sanitized events, raw reveal gating, and auto-refresh controls                                    |
+| `read-only.spec.js`                                                                          | Global and per-panel read-only properties block unsafe APIs and lock mutating browser controls                                                |
+| `sample-api.spec.js`                                                                         | Sample REST API (`/api/hello`, `/api/secure`, `/api/secure/products`, `/api/sample/hello`, `/api/sample/products`) and basic-auth on `/admin` |
+| `activity.spec.js`                                                                           | Live Activity correlation, request profiles, live flow, recording status, and durable-history controls                                        |
+| `runtime-insights.spec.js`                                                                   | Observation detail, explicit JFR profiling, comparison, and change-impact reads                                                               |
+| `runtime-insights-demo.spec.js`, `runtime-insights-lab.spec.js`                              | Real seed/counterexample traffic and the welcome-page demo actions                                                                            |
+| `java-agent.spec.js`, `code-paths.spec.js`, `code-inventory.spec.js`, `side-effects.spec.js` | Honest unattached states and agent-backed evidence when the agent suite is selected                                                           |
+| `action-buttons.spec.js`, `theme-contrast.spec.js`                                           | Secondary actions across all seven styles and theme contrast                                                                                  |
+| `advisor-violations.spec.js`, `stale-assets.spec.js`                                         | Bounded finding pages and recovery after a UI asset rebuild                                                                                   |
 
 ## WebFlux (reactive) smoke suite
 
 `tests-webflux/webflux-smoke.spec.js` is a separate, deliberately small suite that drives the
 **reactive** `bootui-spring-webflux-sample-app` (Netty/`DispatcherHandler`) instead of the servlet sample
 app above. It proves the shell boots, reports `platform: "spring-boot-reactive"`, a representative sample
-of ported panels render, and the panels with no reactive equivalent yet (HTTP Sessions, Spring Security,
-MCP Server, REST Client) explain why through the real sidebar/alert UI - it does not re-verify
+of ported panels render, including MCP Server, REST Client, and reactive Spring Security, and the one panel
+with no reactive equivalent (HTTP Sessions) explains why through the real sidebar/alert UI. The additional WebFlux
+specs exercise reactive capture, Runtime Insights, advisors, and actions; the smoke spec itself does not re-verify
 per-panel behavior already covered by the shared `bootui-conformance` suite
 (`WebFluxApiConformanceTest`) and the table above. Run it with its own config:
 
@@ -84,6 +90,51 @@ Playwright starts the MVC app on port 8083 and WebFlux app on port 8084. Set `BO
 server, including the servers `read-only.spec.js` starts, and can point them at an isolated repository. Use an absolute
 path: the suites start Maven from this `e2e` directory, so a relative `.m2` resolves to an empty `e2e/.m2`. For example,
 run `export BOOTUI_MAVEN_REPO_LOCAL="$PWD/.m2"` from the repository root.
+
+## Agent suite
+
+`playwright.agent.config.js` runs the whole Spring MVC suite (`tests/`) against the sample with the BootUI agent
+attached (`-javaagent`), plus the agent-only specs in `tests-agent/`: the armed claim, every sensor installed and passing
+its self-test with no failed transformation, the executors sensor's hooks and counters, the `ASYNC` entry Live Activity
+nests under the `work-after-response` seed's request, and that Runtime Insights reports the seed but not its
+counterexample. The Java Agent, Code Inventory, Code Paths, and Side Effects specs read the `agentAttached` fixture
+option, which only the agent suites set, and assert the armed claim and the recorded run instead of the not-attached
+state; the read-only spec starts its own samples with the suite's JVM arguments (the `sampleJvmArguments` option), so
+they run with the agent too. Build the sample and the agent first (`./mvnw install -pl bootui-spring-sample-app -am`),
+or set `BOOTUI_AGENT_JAR`, then run:
+
+```bash
+npm run test:agent
+```
+
+The companion suites start the sample with another agent beside BootUI's and run the agent's evidence
+specs (claims and self-tests, Live Activity, Code Paths, Code Inventory, Side Effects) plus a spec in
+`tests-agent-companion/` proving the other agent still works: the OpenTelemetry Java agent, before or after BootUI's,
+exports the sample's request spans to BootUI's OTLP receiver under a service name of its own; JaCoCo's agent records the
+coverage of the requests through the sample, read from its TCP server. Their jars are the ones the sample's build copies
+from Maven Central to `../target/agent-companions`. Set `BOOTUI_JACOCO_PORT` to move JaCoCo off port `6300`:
+
+```bash
+npm run test:agent:opentelemetry-first
+npm run test:agent:opentelemetry-last
+npm run test:agent:jacoco
+```
+
+To explore the sample with the agent attached by hand, run `./bootui-spring-sample-app/run-local-agent.sh` from the
+repository root: the Docker-free `dev` profile with the agent's default sensors (see the sample's README).
+
+Set `SERVER_PORT` with `BOOTUI_AGENT_SAMPLE_PORT` to run it beside another sample.
+
+`playwright.webflux-agent.config.js` runs the whole WebFlux suite (`tests-webflux/`) against the reactive sample with the
+agent attached, plus `tests-webflux-agent/` (work after the response on a raw pool, caught exceptions, change impact
+by a method the handler's subscription ran, and a metadata-only method probe started and stopped). Its Java Agent, Code Inventory, and
+Code Paths specs read the same `agentAttached` option and assert the armed claim with the suite's configured sensors, the
+run's inventory, and the assembly-only route trees. Set `BOOTUI_WEBFLUX_AGENT_PORT` to run it beside another sample; it
+passes the port to the application too:
+
+```bash
+npm run test:webflux:agent
+```
 
 ## Prerequisites
 
@@ -137,13 +188,28 @@ npm run screenshots
 To refresh only selected panels, pass route ids, titles, or image filenames:
 
 ```bash
-BOOTUI_SCREENSHOT_ONLY=overview,github,http-sessions npm run screenshots
+BOOTUI_SCREENSHOT_ONLY=scorecard,github,http-sessions npm run screenshots
 ```
+
+The script starts its own Vite server, not a sample backend, and stops it after capture. For an isolated worktree,
+choose a free port rather than reusing another developer's server:
+
+```bash
+BOOTUI_SCREENSHOT_PORT=18621 npm run screenshots
+BOOTUI_SCREENSHOT_PORT=18621 BOOTUI_SCREENSHOT_PLATFORM=quarkus npm run screenshots
+```
+
+The Quarkus mode captures the platform-specific application and Security advisors. The mock panel inventory comes
+from the conformance manifest, and MCP/CLI command names and arguments come from the generated command catalog.
+Both window and workspace scroll are reset before each image.
 
 ## Configuration
 
 - `BOOTUI_BASE_URL` — override the base URL (default `http://localhost:8080`).
 - `BOOTUI_SAMPLE_PORT` — override the port used to build the default base URL.
+  Also set `SERVER_PORT` to that port when Playwright starts the MVC app; the URL setting alone does not move it.
+- `BOOTUI_WEBFLUX_PORT` / `BOOTUI_WEBFLUX_BASE_URL` — corresponding settings for the reactive suite.
+  Set `SERVER_PORT` too when moving its auto-started app.
 - `BOOTUI_CUSTOM_MVC_PORT` / `BOOTUI_CUSTOM_WEBFLUX_PORT` — ports for the two custom-path test servers.
 - `BOOTUI_MAVEN_REPO_LOCAL` — optional absolute Maven local-repository path passed to every auto-started sample
   server (for example, `"$(cd ../.. && pwd)/.m2"` from this directory).
@@ -153,6 +219,7 @@ BOOTUI_SCREENSHOT_ONLY=overview,github,http-sessions npm run screenshots
   its own server (default `5173`).
 - `BOOTUI_SCREENSHOT_ONLY` — comma-separated route ids, titles, or filenames to
   capture instead of the full screenshot set.
+- `BOOTUI_SCREENSHOT_PLATFORM` — `quarkus` for the two platform-specific advisor images; Spring MVC by default.
 
 ## Artefacts
 

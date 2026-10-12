@@ -6,7 +6,7 @@ import {useRefreshState} from './useRefreshState.js'
  *
  * @param {Function} callback - function to call for initial, manual, interval, and visibility refreshes
  * @param {{intervalMs?: number, defaultEnabled?: boolean, enabled?: boolean | import('vue').Ref<boolean>, initialLoading?: boolean}} [options] - auto-refresh options
- * @returns {{ autoRefresh, intervalMs, loading, hasLoaded, initialLoading, load, refresh, startAutoRefresh, stopAutoRefresh }}
+ * @returns {{ autoRefresh, intervalMs, loading, hasLoaded, initialLoading, load, loadAfterCurrent, refresh, startAutoRefresh, stopAutoRefresh }}
  */
 export function useAutoRefresh(
   callback,
@@ -17,6 +17,8 @@ export function useAutoRefresh(
   const {loading, hasLoaded, initialLoading: isInitialLoading, refresh} = useRefreshState(callback, {initialLoading})
   let timer = null
   let inFlight = false
+  let pendingRefresh = null
+  let disposed = false
 
   function stopAutoRefresh() {
     if (timer) {
@@ -26,14 +28,44 @@ export function useAutoRefresh(
   }
 
   async function load(...args) {
-    if (!refreshEnabled.value) return
+    if (disposed || !refreshEnabled.value) return
     if (inFlight) return
     inFlight = true
     try {
       return await refresh(...args)
     } finally {
       inFlight = false
+      if (pendingRefresh) {
+        const pending = pendingRefresh
+        pendingRefresh = null
+        load(...pending.args).then(pending.resolve, pending.reject)
+      }
     }
+  }
+
+  // Post-action reads must not be dropped by an outstanding refresh. Ordinary refreshes keep their existing policy.
+  function loadAfterCurrent(...args) {
+    if (disposed || !refreshEnabled.value) return
+    if (inFlight) {
+      if (!pendingRefresh) {
+        let resolve
+        let reject
+        const promise = new Promise((yes, no) => {
+          resolve = yes
+          reject = no
+        })
+        pendingRefresh = {args, promise, resolve, reject}
+      } else {
+        pendingRefresh.args = args
+      }
+      return pendingRefresh.promise
+    }
+    return load(...args)
+  }
+
+  function cancelPendingRefresh() {
+    pendingRefresh?.resolve(undefined)
+    pendingRefresh = null
   }
 
   function startAutoRefresh() {
@@ -65,6 +97,7 @@ export function useAutoRefresh(
   watch([autoRefresh, refreshEnabled], ([autoRefreshEnabled, enabledNow], [, wasEnabled]) => {
     if (!enabledNow || !autoRefreshEnabled) {
       stopAutoRefresh()
+      if (!enabledNow) cancelPendingRefresh()
       return
     }
     startAutoRefresh()
@@ -82,6 +115,8 @@ export function useAutoRefresh(
   })
 
   onBeforeUnmount(() => {
+    disposed = true
+    cancelPendingRefresh()
     stopAutoRefresh()
     document.removeEventListener('visibilitychange', onVisibilityChange)
   })
@@ -93,6 +128,7 @@ export function useAutoRefresh(
     hasLoaded,
     initialLoading: isInitialLoading,
     load,
+    loadAfterCurrent,
     refresh: load,
     startAutoRefresh,
     stopAutoRefresh

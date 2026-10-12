@@ -1,7 +1,15 @@
 package io.github.jdubois.bootui.engine.faulttolerance;
 
 import io.github.jdubois.bootui.core.dto.FaultToleranceEventDto;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.journal.FaultTolerancePayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -26,7 +34,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Capture is fail-open: {@link #record} swallows its own failures so a protected call is never
  * disrupted by BootUI, and it becomes an immediate no-op when capture is disabled.</p>
  */
-public final class FaultToleranceEventRecorder {
+public final class FaultToleranceEventRecorder implements RuntimeEventPublisher, MemoryOffloadable {
+
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
 
     /** Hard cap on any captured free-text metadata value. */
     static final int MAX_METADATA_LENGTH = 200;
@@ -47,7 +57,39 @@ public final class FaultToleranceEventRecorder {
             Long durationMillis,
             String failureCategory,
             String state,
-            String traceId) {}
+            String traceId,
+            String requestId) {
+
+        /** Without BootUI's request identity. */
+        public CapturedEvent(
+                long id,
+                long timestamp,
+                String policyName,
+                String policyType,
+                String provider,
+                String target,
+                String outcome,
+                Integer attempt,
+                Long durationMillis,
+                String failureCategory,
+                String state,
+                String traceId) {
+            this(
+                    id,
+                    timestamp,
+                    policyName,
+                    policyType,
+                    provider,
+                    target,
+                    outcome,
+                    attempt,
+                    durationMillis,
+                    failureCategory,
+                    state,
+                    traceId,
+                    null);
+        }
+    }
 
     private final boolean enabled;
     private final int maxEntries;
@@ -57,12 +99,20 @@ public final class FaultToleranceEventRecorder {
     private final AtomicLong sequence = new AtomicLong();
     private final AtomicLong totalCaptured = new AtomicLong();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
-
-    private volatile TraceIdProvider traceIdProvider = FaultToleranceEventRecorder::mdcTraceId;
+    private final CorrelationSource correlation = new CorrelationSource();
 
     public FaultToleranceEventRecorder(boolean enabled, int maxEntries) {
         this.enabled = enabled;
         this.maxEntries = Math.min(MAX_BUFFER_SIZE, Math.max(1, maxEntries));
+    }
+
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each captured outcome, without the
+     * failure's message.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
     }
 
     public boolean isEnabled() {
@@ -74,12 +124,12 @@ public final class FaultToleranceEventRecorder {
     }
 
     /**
-     * Replaces the trace-id source. The Spring adapter keeps the SLF4J MDC default that Micrometer Tracing
-     * publishes; the Quarkus adapter supplies an OpenTelemetry-backed provider because its requests hop
-     * between the event loop and worker threads.
+     * Replaces the source of the request id stamped on each capture ({@code docs/PLAN-v2.md} §5.1). Defaults to the
+     * thread's correlation scope; the Quarkus adapter installs one that reads the request's Vert.x context. Passing
+     * {@code null} restores the default.
      */
-    public void setTraceIdProvider(TraceIdProvider traceIdProvider) {
-        this.traceIdProvider = traceIdProvider == null ? FaultToleranceEventRecorder::mdcTraceId : traceIdProvider;
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
     }
 
     /**
@@ -96,7 +146,33 @@ public final class FaultToleranceEventRecorder {
             Integer attempt,
             Long durationMillis,
             String failureCategory) {
-        record(policyName, policyType, provider, target, outcome, attempt, durationMillis, failureCategory, null);
+        record(
+                policyName,
+                policyType,
+                provider,
+                target,
+                outcome,
+                attempt,
+                durationMillis == null ? null : RuntimeEvent.millisToNanos(durationMillis),
+                failureCategory,
+                null);
+    }
+
+    /**
+     * Captures one fault tolerance event whose duration the library reports at nanosecond precision, such as a
+     * circuit breaker's elapsed call time: the panel keeps milliseconds, and the runtime journal the nanoseconds
+     * ({@code docs/PLAN-v2.md} §5.2).
+     */
+    public void recordNanos(
+            String policyName,
+            String policyType,
+            String provider,
+            String target,
+            String outcome,
+            Integer attempt,
+            Long durationNanos,
+            String failureCategory) {
+        record(policyName, policyType, provider, target, outcome, attempt, durationNanos, failureCategory, null);
     }
 
     /**
@@ -123,7 +199,7 @@ public final class FaultToleranceEventRecorder {
             String target,
             String outcome,
             Integer attempt,
-            Long durationMillis,
+            Long durationNanos,
             String failureCategory,
             String state) {
         if (!enabled) {
@@ -133,6 +209,7 @@ public final class FaultToleranceEventRecorder {
             if (isBlank(policyName) || isBlank(outcome)) {
                 return;
             }
+            CorrelationContext context = correlation.current();
             CapturedEvent event = new CapturedEvent(
                     sequence.incrementAndGet(),
                     System.currentTimeMillis(),
@@ -142,10 +219,11 @@ public final class FaultToleranceEventRecorder {
                     truncate(target),
                     truncate(outcome),
                     attempt == null ? null : Math.max(1, attempt),
-                    durationMillis == null ? null : Math.max(0L, durationMillis),
+                    durationNanos == null ? null : Math.max(0L, durationNanos) / 1_000_000,
                     truncate(failureCategory),
                     truncate(state),
-                    currentTraceId());
+                    currentTraceId(),
+                    context.requestId());
             synchronized (lock) {
                 buffer.addLast(event);
                 if (buffer.size() > maxEntries) {
@@ -153,6 +231,29 @@ public final class FaultToleranceEventRecorder {
                 }
             }
             totalCaptured.incrementAndGet();
+            long nanos = durationNanos == null ? -1 : Math.max(0L, durationNanos);
+            // A retry's duration is the wait before its next attempt, which starts now; any other duration has
+            // elapsed when the library reports it, so the event started that long ago.
+            boolean elapsed = !FaultToleranceVocabulary.OUTCOME_RETRY.equals(event.outcome());
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.FAULT_TOLERANCE,
+                    elapsed ? RuntimeEvent.startMillis(event.timestamp(), nanos) : event.timestamp(),
+                    nanos,
+                    context,
+                    event.traceId(),
+                    Thread.currentThread().getName(),
+                    null,
+                    FaultToleranceVocabulary.isFailureOutcome(event.outcome()),
+                    new FaultTolerancePayload(
+                            event.policyName(),
+                            event.policyType(),
+                            event.target(),
+                            event.outcome(),
+                            event.attempt(),
+                            event.state(),
+                            event.failureCategory(),
+                            FaultToleranceVocabulary.isFailureOutcome(event.outcome()),
+                            FaultToleranceVocabulary.isProtectiveOutcome(event.outcome()))));
             notifyListeners();
         } catch (RuntimeException ignored) {
             // Capture is strictly pass-through: a BootUI failure must never break a protected call.
@@ -184,6 +285,24 @@ public final class FaultToleranceEventRecorder {
 
     public long totalCaptured() {
         return totalCaptured.get();
+    }
+
+    @Override
+    public String offloadId() {
+        return "fault-tolerance";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "Fault tolerance events";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recent().size();
+        clear();
+        return retained;
     }
 
     public void clear() {
@@ -227,19 +346,9 @@ public final class FaultToleranceEventRecorder {
 
     private String currentTraceId() {
         try {
-            String traceId = traceIdProvider.currentTraceId();
+            String traceId = correlation.traceId();
             return traceId == null || traceId.isBlank() ? null : truncate(traceId);
         } catch (RuntimeException ex) {
-            return null;
-        }
-    }
-
-    /** Default trace-id source: the SLF4J MDC key Micrometer Tracing publishes on Spring. */
-    private static String mdcTraceId() {
-        try {
-            String traceId = org.slf4j.MDC.get("traceId");
-            return traceId == null || traceId.isBlank() ? null : traceId;
-        } catch (RuntimeException | LinkageError ex) {
             return null;
         }
     }

@@ -45,26 +45,29 @@ public class BootUiOtelProducer {
     }
 
     /**
-     * Stamps BootUI identity attributes ({@code bootui.enriched}/service/instance) on every span at start,
-     * so a cross-service trace waterfall can attribute each service's depth. Quarkus OpenTelemetry
-     * auto-discovers this as a second {@link SpanProcessor} bean; it re-reads the live enrichment toggle so
-     * it stays inert when {@code bootui.telemetry.enrich=false}. Concentrated here with the other OTel-touching
-     * capture beans and excluded from discovery when OpenTelemetry is absent.
+     * Observes every span at start: it tells the telemetry store which BootUI request or execution started the
+     * span, so an AI call nests under its request by id in the runtime journal, and stamps BootUI identity
+     * attributes ({@code bootui.enriched}/service/instance) so a cross-service trace waterfall can attribute each
+     * service's depth. Quarkus OpenTelemetry auto-discovers this as a second {@link SpanProcessor} bean; it
+     * re-reads the live capture and enrichment toggles, so identity stays off when
+     * {@code bootui.telemetry.enrich=false}. Concentrated here with the other OTel-touching capture beans and
+     * excluded from discovery when OpenTelemetry is absent.
      */
     @Produces
     @Singleton
-    public SpanProcessor bootUiIdentitySpanProcessor(QuarkusTelemetrySettings settings, Config config) {
+    public SpanProcessor bootUiIdentitySpanProcessor(
+            QuarkusTelemetrySettings settings, Config config, TelemetryStore store) {
         String serviceName = config.getOptionalValue("quarkus.application.name", String.class)
                 .orElse(null);
         String instanceId = System.getenv("HOSTNAME");
-        return new BootUiIdentitySpanProcessor(settings, serviceName, instanceId);
+        return new BootUiIdentitySpanProcessor(settings, serviceName, instanceId, store);
     }
 
     /**
      * The capture-time enricher that stamps {@code bootui.sql.*}/{@code bootui.exception.*} depth on the
      * active span. The SQL Trace recorder and exception store inject it via {@code Instance<SpanEnricher>}
      * and install it when resolvable; absent OpenTelemetry this producer is excluded, so those capture points
-     * resolve no enricher and keep the neutral no-op (mirrors the {@code TraceIdProvider} seam).
+     * resolve no enricher and keep the neutral no-op (mirrors the {@code TraceIdSource} seam).
      */
     @Produces
     @Singleton

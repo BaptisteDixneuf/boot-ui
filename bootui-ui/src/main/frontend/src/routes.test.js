@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {groups, routes} from './routes.js'
+import {HOME_NAVIGATION_GROUP, NAVIGATION_GROUPS, UNAVAILABLE_NAVIGATION_GROUP} from './utils/panelNavigation.js'
 
 const namedRoutes = routes.filter((route) => route.name)
 const repoRoot = findRepositoryRoot(path.dirname(fileURLToPath(import.meta.url)))
@@ -142,11 +143,17 @@ function parseQuarkusAvailability() {
     'private static final Map<String, String> NOT_YET_AVAILABLE_REASONS = Map.of',
     constants
   )
-  const detectorMatch = source.match(/BootUiPanels\.([A-Z_]+)\.equals\(panelId\)\s*&&\s*githubAvailable\(\)/)
-  if (!detectorMatch || !constants.has(detectorMatch[1])) {
-    throw new Error('Unable to parse the dynamic GitHub panel detector')
+  // Detector-gated panels decide availability per call: GitHub from the working directory, Code Inventory, Code
+  // Paths, and Side Effects from the BootUI agent.
+  const detectorMatches = [
+    ...source.matchAll(
+      /BootUiPanels\.([A-Z_]+)\.equals\(panelId\)\s*&&\s*(?:githubAvailable\(\)|codeInventoryUnavailableReason\(\) == null|codePathsUnavailableReason\(\) == null|sideEffectsUnavailableReason\(\) == null)/g
+    )
+  ]
+  if (detectorMatches.length !== 4 || detectorMatches.some((match) => !constants.has(match[1]))) {
+    throw new Error('Unable to parse the dynamic GitHub, Code Inventory, Code Paths, and Side Effects panel detectors')
   }
-  const detectorGated = new Set([constants.get(detectorMatch[1])])
+  const detectorGated = new Set(detectorMatches.map((match) => constants.get(match[1])))
 
   return {
     staticPanels,
@@ -224,6 +231,33 @@ function parseFrameworkSupportQuarkusGaps(markdown) {
   return {notApplicable, notYet: new Set([notYet[1]])}
 }
 
+function sidebarGroupRoutes(groupTitle) {
+  const group = [HOME_NAVIGATION_GROUP, ...NAVIGATION_GROUPS].find((candidate) => candidate.title === groupTitle)
+  return group ? namedRoutes.filter((route) => route.meta.group === group.key) : []
+}
+
+/** Sidebar group titles, in menu order, each mapped to its panel titles in menu order. */
+function sidebarGroupInventory() {
+  return new Map(
+    [HOME_NAVIGATION_GROUP, ...NAVIGATION_GROUPS].map((group) => [
+      group.title,
+      sidebarGroupRoutes(group.title).map((route) => route.meta.title)
+    ])
+  )
+}
+
+function parseFeatureGroupTable(markdown) {
+  const rows = [...markdown.matchAll(/^\| \[([^\]]+)\]\(\.\/([^)]+\.md)\) \| ([^|]+) \|/gm)].map((match) => ({
+    group: match[1],
+    file: match[2],
+    panels: match[3].split(' · ').map((title) => title.trim())
+  }))
+  if (!rows.length) {
+    throw new Error('Missing the group table in docs/features/README.md')
+  }
+  return rows
+}
+
 function sorted(values) {
   return [...values].sort()
 }
@@ -257,9 +291,9 @@ describe('routes', () => {
 
   it('keeps the sidebar order aligned with the documented feature order', () => {
     expect(namedRoutes.map((route) => route.meta.title)).toEqual([
-      'Overview',
+      'Scorecard',
       'Live Activity',
-      'GitHub',
+      'Runtime Insights',
       'Architecture',
       'REST API',
       'Spring',
@@ -288,8 +322,8 @@ describe('routes', () => {
       'Database Connection Pools',
       'PostgreSQL',
       'MySQL',
-      'Transactions',
       'SQL Trace',
+      'Transactions',
       'Hibernate Statistics',
       'Spring Data',
       'Flyway',
@@ -311,12 +345,17 @@ describe('routes', () => {
       'Exceptions',
       'HTTP Exchanges',
       'HTTP Probe',
+      'Java Agent',
+      'Code Paths',
+      'Code Inventory',
+      'Side Effects',
       'MCP Server',
       'Command Line',
       'Spring DevTools',
       'Dev Services',
       'Copilot',
-      'Claude Code'
+      'Claude Code',
+      'GitHub'
     ])
   })
 
@@ -428,33 +467,52 @@ describe('routes', () => {
   })
 
   it('keeps documented navigation groups aligned with route metadata', () => {
-    const expectedByGroup = new Map(
-      Object.entries({
-        Overview: groups.overview,
-        Advisors: groups.advisors,
-        Runtime: groups.runtime,
-        Configuration: groups.configuration,
-        Database: groups.database,
-        Security: groups.security,
-        Services: groups.services,
-        Diagnostics: groups.diagnostics,
-        'Developer Tools': groups.developerTools
-      }).map(([title, group]) => [
-        title,
-        namedRoutes.filter((route) => route.meta.group === group).map((route) => route.meta.title)
-      ])
-    )
+    const expectedByGroup = sidebarGroupInventory()
 
     const specification = parseSpecificationGroupInventory(readRepositoryFile('docs/SPECIFICATION.md'))
+    expect([...specification.keys()], 'docs/SPECIFICATION.md group order').toEqual([
+      ...expectedByGroup.keys(),
+      UNAVAILABLE_NAVIGATION_GROUP.title
+    ])
     for (const [group, expectedTitles] of expectedByGroup) {
-      const specificationGroup = group === 'Developer Tools' ? 'Developer tools' : group
-      expect(specification.get(specificationGroup), `docs/SPECIFICATION.md ${group}`).toEqual(expectedTitles)
+      expect(specification.get(group), `docs/SPECIFICATION.md ${group}`).toEqual(expectedTitles)
+    }
+  })
+
+  it('keeps the docs/features/ group table and panel sections in sidebar order', () => {
+    const expectedByGroup = sidebarGroupInventory()
+    const rows = parseFeatureGroupTable(readRepositoryFile('docs/features/README.md'))
+
+    expect(
+      rows.map((row) => row.group),
+      'docs/features/README.md group titles'
+    ).toEqual([...expectedByGroup.keys()])
+    for (const row of rows) {
+      const groupRoutes = sidebarGroupRoutes(row.group)
+      // A panel retitled per platform (Spring on Spring Boot, Quarkus on Quarkus) lists every title, in place.
+      const expectedPanels = groupRoutes.flatMap((route) => [
+        ...new Set([route.meta.title, ...Object.values(route.meta.titleByPlatform ?? {})])
+      ])
+      expect(row.panels, `docs/features/README.md ${row.group} panels`).toEqual(expectedPanels)
+
+      // Each panel's section in the group page follows the sidebar order. A title can head both the page and a
+      // section (Configuration), so only its first heading counts.
+      const page = readRepositoryFile(path.join('docs/features', row.file))
+      const panelTitles = new Set(expectedPanels)
+      const headings = [
+        ...new Set(
+          [...page.matchAll(/^#{1,2} (.+)$/gm)]
+            .map((match) => match[1].trim())
+            .filter((title) => panelTitles.has(title))
+        )
+      ]
+      expect(headings, `docs/features/${row.file} panel section order`).toEqual(expectedPanels)
     }
   })
 
   it('defines complete and unique sidebar metadata for every navigable route', () => {
     expect(Object.values(groups)).toEqual([
-      'overview',
+      'home',
       'advisors',
       'runtime',
       'configuration',
@@ -462,6 +520,7 @@ describe('routes', () => {
       'security',
       'services',
       'diagnostics',
+      'agent',
       'developer-tools'
     ])
     expect(new Set(namedRoutes.map((route) => route.name)).size).toBe(namedRoutes.length)
@@ -476,7 +535,7 @@ describe('routes', () => {
         title: expect.any(String),
         icon: expect.stringMatching(/^bi-/),
         group: expect.stringMatching(
-          /^(overview|advisors|runtime|configuration|database|security|services|diagnostics|developer-tools)$/
+          /^(home|advisors|runtime|configuration|database|security|services|diagnostics|agent|developer-tools)$/
         ),
         shortcut: expect.stringMatching(/^[a-z]{2,3}$/)
       })
@@ -485,9 +544,9 @@ describe('routes', () => {
 
   it('uses navigation group keys understood by the app shell', () => {
     expect(namedRoutes.map((route) => route.meta.group)).toEqual([
-      groups.overview,
-      groups.overview,
-      groups.overview,
+      groups.home,
+      groups.home,
+      groups.home,
       groups.advisors,
       groups.advisors,
       groups.advisors,
@@ -539,6 +598,11 @@ describe('routes', () => {
       groups.diagnostics,
       groups.diagnostics,
       groups.diagnostics,
+      groups.agent,
+      groups.agent,
+      groups.agent,
+      groups.agent,
+      groups.developerTools,
       groups.developerTools,
       groups.developerTools,
       groups.developerTools,
@@ -548,9 +612,24 @@ describe('routes', () => {
     ])
   })
 
+  it('groups the agent-backed panels under Instrumentation, setup first', () => {
+    const agentRoutes = namedRoutes.filter((route) => route.meta.group === groups.agent)
+    expect(agentRoutes.map((route) => route.name)).toEqual([
+      'java-agent',
+      'code-paths',
+      'code-inventory',
+      'side-effects'
+    ])
+    expect(agentRoutes.map((route) => route.meta.requiresAgent === true)).toEqual([false, true, true, true])
+    expect(namedRoutes.filter((route) => route.meta.requiresAgent).every((r) => r.meta.group === groups.agent)).toBe(
+      true
+    )
+  })
+
   it('keeps redirect aliases out of sidebar navigation', () => {
     expect(routes.filter((route) => route.redirect)).toEqual([
-      {path: '/', redirect: '/overview'},
+      {path: '/', redirect: '/scorecard'},
+      {path: '/overview', redirect: '/scorecard'},
       {path: '/tuning-advisor', redirect: '/jvm-tuning'},
       {path: '/pentest', redirect: '/pentesting'},
       {path: '/dependencies', redirect: '/vulnerabilities'},

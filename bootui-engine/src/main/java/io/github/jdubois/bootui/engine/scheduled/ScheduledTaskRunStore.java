@@ -1,5 +1,12 @@
 package io.github.jdubois.bootui.engine.scheduled;
 
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.engine.journal.ScheduledPayload;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -23,10 +30,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>All retained data lives only in memory, is bounded to {@code maxEntries} (oldest evicted first),
  * and is reset on application restart or via {@link #clear()}.
  */
-public final class ScheduledTaskRunStore {
+public final class ScheduledTaskRunStore implements RuntimeEventPublisher, MemoryOffloadable {
 
     private final int maxEntries;
     private final Object lock = new Object();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
     private final Deque<Run> runs = new ArrayDeque<>();
     private final AtomicLong sequence = new AtomicLong();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
@@ -47,6 +55,15 @@ public final class ScheduledTaskRunStore {
      * @param message the thrown exception's message, or {@code null} on success or when absent
      * @param thread the thread the task executed on, or {@code null} when unknown
      */
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded run right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
     public void record(
             String runnable,
             long startTimestamp,
@@ -55,22 +72,74 @@ public final class ScheduledTaskRunStore {
             String exceptionClassName,
             String message,
             String thread) {
+        record(runnable, startTimestamp, durationMs, success, exceptionClassName, message, thread, null);
+    }
+
+    /**
+     * Records one run with the BootUI execution id it ran under ({@code docs/PLAN-v2.md} §5.1), so the signals it
+     * produced, which carry the same id, nest under it.
+     */
+    public void record(
+            String runnable,
+            long startTimestamp,
+            long durationMs,
+            boolean success,
+            String exceptionClassName,
+            String message,
+            String thread,
+            String executionId) {
+        recordNanos(
+                runnable,
+                startTimestamp,
+                Math.max(0L, durationMs) * 1_000_000,
+                success,
+                exceptionClassName,
+                message,
+                thread,
+                executionId);
+    }
+
+    /**
+     * Records one run timed in nanoseconds by a monotonic clock: the panel keeps milliseconds, and the runtime journal
+     * the nanoseconds ({@code docs/PLAN-v2.md} §5.2). Adapters that only know the run's wall-clock start, such as
+     * Quarkus's scheduler, which reports its fire time, pass whole milliseconds.
+     */
+    public void recordNanos(
+            String runnable,
+            long startTimestamp,
+            long durationNanos,
+            boolean success,
+            String exceptionClassName,
+            String message,
+            String thread,
+            String executionId) {
         try {
+            long nanos = Math.max(0L, durationNanos);
             Run run = new Run(
                     sequence.incrementAndGet(),
                     runnable,
                     startTimestamp,
-                    Math.max(0L, durationMs),
+                    nanos / 1_000_000,
                     success,
                     exceptionClassName,
                     message,
-                    thread);
+                    thread,
+                    executionId);
             synchronized (lock) {
                 runs.addFirst(run);
                 while (runs.size() > maxEntries) {
                     runs.removeLast();
                 }
             }
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.SCHEDULED,
+                    startTimestamp,
+                    nanos,
+                    CorrelationContext.forExecution(executionId),
+                    thread,
+                    null,
+                    !success,
+                    new ScheduledPayload(runnable, exceptionClassName)));
             notifyListeners();
         } catch (RuntimeException ex) {
             // Recording must never disrupt the scheduled task execution it observes.
@@ -82,6 +151,24 @@ public final class ScheduledTaskRunStore {
         synchronized (lock) {
             return new ArrayList<>(runs);
         }
+    }
+
+    @Override
+    public String offloadId() {
+        return "scheduled-runs";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "Scheduled task runs";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = runs().size();
+        clear();
+        return retained;
     }
 
     public void clear() {
@@ -120,5 +207,20 @@ public final class ScheduledTaskRunStore {
             boolean success,
             String exceptionClassName,
             String message,
-            String thread) {}
+            String thread,
+            String executionId) {
+
+        /** Without BootUI's execution identity. */
+        public Run(
+                long sequence,
+                String runnable,
+                long startTimestamp,
+                long durationMs,
+                boolean success,
+                String exceptionClassName,
+                String message,
+                String thread) {
+            this(sequence, runnable, startTimestamp, durationMs, success, exceptionClassName, message, thread, null);
+        }
+    }
 }

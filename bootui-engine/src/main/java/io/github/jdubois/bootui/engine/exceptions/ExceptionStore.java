@@ -1,21 +1,32 @@
 package io.github.jdubois.bootui.engine.exceptions;
 
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.journal.ExceptionPayload;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.engine.journal.ThrowableMarks;
 import io.github.jdubois.bootui.engine.support.StackFramePrefixes;
 import io.github.jdubois.bootui.engine.telemetry.SpanEnricher;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.WeakHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Predicate;
 
@@ -51,7 +62,7 @@ import java.util.function.Predicate;
  * a lifetime counter: manual {@link #setStatus} calls never change it, so it keeps answering "has this
  * exact failure signature come back before?" across any number of later manual resolves.</p>
  */
-public final class ExceptionStore {
+public final class ExceptionStore implements RuntimeEventPublisher, MemoryOffloadable {
 
     /** Number of leading frames that contribute to a group's fingerprint. */
     private static final int FINGERPRINT_FRAMES = 5;
@@ -69,11 +80,14 @@ public final class ExceptionStore {
 
     private final Object lock = new Object();
     private final Map<String, Group> groups = new HashMap<>();
-    private final Set<Throwable> seen = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    private final Set<SeenThrowable> seen = new HashSet<>();
+    private final ReferenceQueue<Throwable> seenQueue = new ReferenceQueue<>();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
 
     private volatile List<String> applicationPackages = List.of();
     private volatile SpanEnricher spanEnricher = SpanEnricher.NO_OP;
+    private final CorrelationSource correlation = new CorrelationSource();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
 
     public ExceptionStore(int maxGroups, int maxOccurrencesPerGroup, int maxStackFrames) {
         this(maxGroups, maxOccurrencesPerGroup, maxStackFrames, throwable -> false);
@@ -105,6 +119,25 @@ public final class ExceptionStore {
     }
 
     /**
+     * Replaces the source of the request id stamped on each occurrence ({@code docs/PLAN-v2.md} §5.1). Defaults to
+     * the thread's correlation scope, which covers every capture path that runs on the request's own thread,
+     * including a log appender; the Quarkus adapter installs one that reads the request's Vert.x context. Passing
+     * {@code null} restores the default.
+     */
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded exception occurrence right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
+    }
+
+    /**
      * Records a thrown exception. No-ops if any {@link Throwable} in this throwable's cause chain was
      * already recorded, so a failure observed by more than one feeder — and a framework wrapper around
      * an already-seen cause — counts once. The whole chain is then marked seen so a later wrapper of the
@@ -122,7 +155,7 @@ public final class ExceptionStore {
      * overload}, which the Spring <strong>servlet</strong> (MVC) handler-exception capture path always uses
      * (that adapter correlates by serving thread instead — see {@code ExceptionGroupDto.lastTraceId}).
      * Spring <strong>WebFlux</strong>'s handler-exception capture and Quarkus's handler and log-based
-     * capture all supply a real trace id via their own {@code TraceIdProvider}; Spring's Logback-based
+     * capture all supply a real trace id via their adapter's {@code CorrelationContextProvider}; Spring's Logback-based
      * log-appender capture path (shared by both the servlet and WebFlux adapters) always passes
      * {@code null}, since it has no reliable request-scoped context to read from an appender callback.
      */
@@ -144,12 +177,14 @@ public final class ExceptionStore {
                 throwable.getMessage(),
                 frames,
                 causes,
+                exceptionTypes(throwable),
                 thread,
                 method,
                 path,
                 handler,
                 source,
-                traceId);
+                traceId,
+                ThrowableMarks.of(throwable));
     }
 
     /**
@@ -157,17 +192,46 @@ public final class ExceptionStore {
      * observe the chain, {@code false} if any link was already recorded (a duplicate from another source).
      */
     private boolean markSeen(Throwable throwable) {
-        boolean fresh = true;
-        Throwable current = throwable;
-        int depth = 0;
-        while (current != null && depth < MAX_CAUSE_DEPTH) {
-            if (!seen.add(current)) {
-                fresh = false;
+        synchronized (seen) {
+            SeenThrowable ended;
+            while ((ended = (SeenThrowable) seenQueue.poll()) != null) {
+                seen.remove(ended);
             }
-            current = current.getCause() == current ? null : current.getCause();
-            depth++;
+            boolean fresh = true;
+            Throwable current = throwable;
+            int depth = 0;
+            while (current != null && depth < MAX_CAUSE_DEPTH) {
+                if (!seen.add(new SeenThrowable(current, seenQueue))) {
+                    fresh = false;
+                }
+                current = current.getCause() == current ? null : current.getCause();
+                depth++;
+            }
+            return fresh;
         }
-        return fresh;
+    }
+
+    private static final class SeenThrowable extends WeakReference<Throwable> {
+        private final int hash;
+
+        SeenThrowable(Throwable throwable, ReferenceQueue<Throwable> queue) {
+            super(throwable, queue);
+            hash = System.identityHashCode(throwable);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            Throwable throwable = get();
+            return throwable != null && other instanceof SeenThrowable reference && throwable == reference.get();
+        }
     }
 
     private void capture(
@@ -175,12 +239,14 @@ public final class ExceptionStore {
             String rawMessage,
             List<Frame> frames,
             List<Cause> causes,
+            List<String> types,
             String thread,
             String method,
             String path,
             String handler,
             String source,
-            String traceId) {
+            String traceId,
+            ThrowableMarks marks) {
         String className = exceptionClassName == null ? "java.lang.Throwable" : exceptionClassName;
         List<Frame> safeFrames = frames == null ? List.of() : frames;
         List<Cause> safeCauses = causes == null ? List.of() : causes;
@@ -189,7 +255,9 @@ public final class ExceptionStore {
         String location = location(safeFrames);
         boolean applicationException = safeFrames.stream().anyMatch(Frame::applicationFrame);
         long now = System.currentTimeMillis();
-        Occurrence occurrence = new Occurrence(now, thread, method, path, handler, source, traceId);
+        CorrelationContext context = correlation.current();
+        Occurrence occurrence = new Occurrence(
+                now, thread, method, path, handler, source, traceId, context.requestId(), context.executionId());
 
         synchronized (lock) {
             Group group = groups.get(fingerprint);
@@ -211,6 +279,26 @@ public final class ExceptionStore {
             group.lastSeen = now;
             group.count++;
             group.addOccurrence(occurrence, maxOccurrencesPerGroup);
+        }
+        try {
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.EXCEPTION,
+                    now,
+                    -1,
+                    context,
+                    traceId,
+                    thread,
+                    null,
+                    true,
+                    new ExceptionPayload(
+                            fingerprint,
+                            className,
+                            signature(className, safeFrames),
+                            types,
+                            marks,
+                            "log".equals(source))));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the exception's capture.
         }
         notifyListeners();
         spanEnricher.onException(className);
@@ -266,11 +354,34 @@ public final class ExceptionStore {
         return updated;
     }
 
+    @Override
+    public String offloadId() {
+        return "exceptions";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "Exception groups";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = groups().size();
+        clear();
+        return retained;
+    }
+
     public void clear() {
         synchronized (lock) {
             groups.clear();
         }
-        seen.clear();
+        synchronized (seen) {
+            seen.clear();
+            while (seenQueue.poll() != null) {
+                // Discard only identity bookkeeping; cleared exceptions remain unretained.
+            }
+        }
         notifyListeners();
     }
 
@@ -350,6 +461,31 @@ public final class ExceptionStore {
         return causes;
     }
 
+    private static List<String> exceptionTypes(Throwable throwable) {
+        List<Throwable> chain = new ArrayList<>();
+        for (Throwable current = throwable;
+                current != null && chain.size() <= MAX_CAUSE_DEPTH && !chain.contains(current);
+                current = current.getCause()) {
+            chain.add(current);
+        }
+        List<String> types = new ArrayList<>();
+        for (int i = chain.size() - 1; i >= 0 && types.size() < ExceptionPayload.MAX_TYPES; i--) {
+            for (Class<?> type = chain.get(i).getClass();
+                    type != null
+                            && type != Throwable.class
+                            && type != Exception.class
+                            && type != RuntimeException.class
+                            && type != Error.class
+                            && types.size() < ExceptionPayload.MAX_TYPES;
+                    type = type.getSuperclass()) {
+                if (!types.contains(type.getName())) {
+                    types.add(type.getName());
+                }
+            }
+        }
+        return List.copyOf(types);
+    }
+
     private Cause toCause(Throwable cause, Throwable enclosing) {
         StackTraceElement[] causeTrace = cause.getStackTrace();
         StackTraceElement[] enclosingTrace = enclosing.getStackTrace();
@@ -411,8 +547,30 @@ public final class ExceptionStore {
         return message.length() <= MAX_MESSAGE_LENGTH ? message : message.substring(0, MAX_MESSAGE_LENGTH) + "…";
     }
 
-    private static String fingerprint(String className, List<Frame> frames) {
+    /** The bootstrap bridge of the BootUI agent, whose frames sit on a task's stack only when the agent is attached. */
+    static final String AGENT_BRIDGE_PREFIX = "io.github.jdubois.bootui.agent.bridge.";
+
+    /**
+     * The frames a fingerprint reads: without the BootUI agent bridge's, so the same failure groups together whether
+     * or not the agent propagated the task it ran in (M5-2).
+     */
+    static List<Frame> fingerprintFrames(List<Frame> frames) {
+        List<Frame> kept = new java.util.ArrayList<>(Math.min(frames.size(), FINGERPRINT_FRAMES));
+        for (Frame frame : frames) {
+            if (kept.size() >= FINGERPRINT_FRAMES) {
+                break;
+            }
+            String type = frame.declaringClass();
+            if (type == null || !type.startsWith(AGENT_BRIDGE_PREFIX)) {
+                kept.add(frame);
+            }
+        }
+        return kept;
+    }
+
+    private static String fingerprint(String className, List<Frame> allFrames) {
         StringBuilder builder = new StringBuilder(className);
+        List<Frame> frames = fingerprintFrames(allFrames);
         int count = Math.min(frames.size(), FINGERPRINT_FRAMES);
         for (int i = 0; i < count; i++) {
             Frame frame = frames.get(i);
@@ -422,6 +580,21 @@ public final class ExceptionStore {
                     .append(frame.methodName())
                     .append(':')
                     .append(frame.lineNumber());
+        }
+        return sha256Hex(builder.toString()).substring(0, 16);
+    }
+
+    /**
+     * The occurrence's cross-run signature: like its fingerprint, but without line numbers, so an edit that shifts the
+     * lines of its frames keeps it ({@code docs/PLAN-v2.md} §5.5).
+     */
+    static String signature(String className, List<Frame> allFrames) {
+        StringBuilder builder = new StringBuilder(className);
+        List<Frame> frames = fingerprintFrames(allFrames);
+        int count = Math.min(frames.size(), FINGERPRINT_FRAMES);
+        for (int i = 0; i < count; i++) {
+            Frame frame = frames.get(i);
+            builder.append('\n').append(frame.declaringClass()).append('#').append(frame.methodName());
         }
         return sha256Hex(builder.toString()).substring(0, 16);
     }
@@ -505,7 +678,37 @@ public final class ExceptionStore {
             String requestPath,
             String handler,
             String source,
-            String traceId) {}
+            String traceId,
+            String requestId,
+
+            String executionId) {
+
+        /** Without BootUI's execution identity. */
+        public Occurrence(
+                long timestamp,
+                String thread,
+                String requestMethod,
+                String requestPath,
+                String handler,
+                String source,
+                String traceId,
+                String requestId) {
+
+            this(timestamp, thread, requestMethod, requestPath, handler, source, traceId, requestId, null);
+        }
+
+        /** Without BootUI's request identity. */
+        public Occurrence(
+                long timestamp,
+                String thread,
+                String requestMethod,
+                String requestPath,
+                String handler,
+                String source,
+                String traceId) {
+            this(timestamp, thread, requestMethod, requestPath, handler, source, traceId, null);
+        }
+    }
 
     public record GroupSummary(
             String fingerprint,

@@ -10,9 +10,11 @@ import {useEventStreamRefresh} from '../utils/useEventStreamRefresh.js'
 import {useFlashMessage} from '../utils/useFlashMessage.js'
 import FlashBanner from './components/FlashBanner.vue'
 import PanelHeader from './components/PanelHeader.vue'
+import FoldedInsightsLink from './components/FoldedInsightsLink.vue'
 import PanelSkeleton from './components/PanelSkeleton.vue'
 import ReadOnlyNotice from './components/ReadOnlyNotice.vue'
 import AiExportPreview from './components/AiExportPreview.vue'
+import CaughtInCode from './components/CaughtInCode.vue'
 import {exceptionMarkdown, loadExceptionCorrelation} from '../utils/markdownExport.js'
 import SpinnerButton from './components/SpinnerButton.vue'
 
@@ -21,6 +23,7 @@ const {readOnly, readOnlyReason} = usePanelState(props)
 const {confirm} = useConfirm()
 
 const report = ref(null)
+const caughtReport = ref(null)
 const detail = ref(null)
 const error = ref(null)
 const {message: banner, flash, show, clear} = useFlashMessage(4000)
@@ -34,15 +37,25 @@ const busy = ref(false)
 // The "Copy for AI" preview of the open detail, or null while the detail itself is shown.
 const aiExport = ref(null)
 const lastFetched = ref(null)
+let reportVersion = 0
 
 const STATUSES = ['OPEN', 'ACKNOWLEDGED', 'RESOLVED']
 
 async function fetchExceptions() {
+  const version = reportVersion
   error.value = null
   try {
-    report.value = await getJson('api/exceptions')
+    // The caught-in-code section is optional: its failure never hides the exception groups.
+    const [exceptions, caught] = await Promise.all([
+      getJson('api/exceptions'),
+      getJson('api/exceptions/caught').catch(() => null)
+    ])
+    if (version !== reportVersion) return
+    report.value = exceptions
+    caughtReport.value = caught
     lastFetched.value = Date.now()
   } catch (e) {
+    if (version !== reportVersion) return
     error.value = describeLoadError(e, 'Unable to load exceptions')
   }
 }
@@ -120,6 +133,8 @@ async function clearAll() {
   try {
     const res = await apiFetch('api/exceptions', {method: 'DELETE'})
     if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`)
+    reportVersion++
+    if (report.value) report.value = {...report.value, groups: [], totalExceptions: 0}
     closeDrawer()
     await load()
     flash('Cleared captured exceptions.', 'success')
@@ -165,6 +180,8 @@ async function changeStatus(group, status) {
     flash(readOnlyReason.value, 'warning')
     return
   }
+  if (busy.value) return
+  busy.value = true
   try {
     const res = await apiFetch(`api/exceptions/${encodeURIComponent(group.id)}/status`, {
       method: 'POST',
@@ -173,10 +190,14 @@ async function changeStatus(group, status) {
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const updated = await res.json()
+    reportVersion++
     applyUpdatedGroup(updated)
     flash(`Status changed to ${statusLabel(updated.status)}.`, 'success')
+    if (loading.value) await load()
   } catch (e) {
     show(formatLoadError(e, 'Could not update status'), 'danger')
+  } finally {
+    busy.value = false
   }
 }
 
@@ -275,6 +296,8 @@ onMounted(() => {
 
       <ReadOnlyNotice v-if="readOnly" :reason="readOnlyReason">Clearing exceptions is read-only.</ReadOnlyNotice>
 
+      <FoldedInsightsLink v-if="report.available" class="mb-3" theme="errors" what="Exception groups per route" />
+
       <template v-if="report.available">
         <div v-if="!report.groups || report.groups.length === 0" class="alert alert-secondary">
           No exceptions captured yet. BootUI records exceptions thrown by web request handlers and anything logged with
@@ -353,6 +376,7 @@ onMounted(() => {
                         <i class="bi bi-shield-check me-1"></i>Handled by
                         <router-link
                           :to="{path: '/rest-api', query: {errorContract: g.errorContract.component}}"
+                          class="btn btn-outline-secondary btn-sm"
                           :title="`Open the declared error contract for ${g.errorContract.component}`"
                         >
                           <code
@@ -382,7 +406,7 @@ onMounted(() => {
                             v-for="s in STATUSES"
                             :key="s"
                             type="button"
-                            :disabled="readOnly"
+                            :disabled="readOnly || busy"
                             :class="{active: g.status === s}"
                             class="btn btn-outline-secondary"
                             @click="changeStatus(g, s)"
@@ -512,6 +536,8 @@ onMounted(() => {
           </div>
         </template>
       </template>
+
+      <CaughtInCode v-if="caughtReport" :report="caughtReport" class="mt-4" />
     </template>
   </div>
 </template>

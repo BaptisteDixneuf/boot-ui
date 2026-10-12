@@ -1,7 +1,6 @@
 package io.github.jdubois.bootui.quarkus.web;
 
 import io.github.jdubois.bootui.core.ValueExposure;
-import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
 import io.github.jdubois.bootui.core.dto.ActivityPageInfo;
 import io.github.jdubois.bootui.core.dto.ActivityPersistenceOptionDto;
 import io.github.jdubois.bootui.core.dto.ActivitySwitchRequest;
@@ -12,12 +11,16 @@ import io.github.jdubois.bootui.core.dto.ExceptionGroupDto;
 import io.github.jdubois.bootui.core.dto.HttpExchangeDto;
 import io.github.jdubois.bootui.core.dto.HttpExchangesReport;
 import io.github.jdubois.bootui.core.dto.LiveActivityReport;
+import io.github.jdubois.bootui.core.dto.RequestJournalProfileDto;
 import io.github.jdubois.bootui.core.dto.RequestProfileDto;
+import io.github.jdubois.bootui.core.dto.RequestProfileSelectionDto;
 import io.github.jdubois.bootui.core.dto.RestClientTraceEntryDto;
+import io.github.jdubois.bootui.core.dto.RuntimeJournalClearRequest;
+import io.github.jdubois.bootui.core.dto.RuntimeJournalStatusDto;
+import io.github.jdubois.bootui.core.dto.RuntimeResourcesDto;
 import io.github.jdubois.bootui.core.dto.SecurityLogEventDto;
 import io.github.jdubois.bootui.core.dto.SqlTraceEntryDto;
-import io.github.jdubois.bootui.engine.activity.ActivityCaptureFactory;
-import io.github.jdubois.bootui.engine.activity.ActivityCapturePoller;
+import io.github.jdubois.bootui.engine.activity.ActivityCapture;
 import io.github.jdubois.bootui.engine.activity.ActivityPage;
 import io.github.jdubois.bootui.engine.activity.ActivityPersistenceSettings;
 import io.github.jdubois.bootui.engine.activity.ActivityQuery;
@@ -25,10 +28,25 @@ import io.github.jdubois.bootui.engine.activity.ActivityStore;
 import io.github.jdubois.bootui.engine.activity.ActivitySwitchResponse;
 import io.github.jdubois.bootui.engine.activity.ActivitySwitchService;
 import io.github.jdubois.bootui.engine.activity.SwitchableActivityStore;
+import io.github.jdubois.bootui.engine.correlation.HandoffWindow;
 import io.github.jdubois.bootui.engine.email.EmailCaptureService;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionsService;
 import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
+import io.github.jdubois.bootui.engine.journal.ActivityFeedSource;
+import io.github.jdubois.bootui.engine.journal.AgentEvidence;
+import io.github.jdubois.bootui.engine.journal.JournalActivityCapture;
+import io.github.jdubois.bootui.engine.journal.JournalActivityFeed;
+import io.github.jdubois.bootui.engine.journal.JournalActivityReports;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates;
+import io.github.jdubois.bootui.engine.journal.JournalRowDetails;
+import io.github.jdubois.bootui.engine.journal.JournalSourcePanels;
+import io.github.jdubois.bootui.engine.journal.JournalTextExposure;
+import io.github.jdubois.bootui.engine.journal.RequestJournalProfiles;
+import io.github.jdubois.bootui.engine.journal.RequestProfileSelection;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournal;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournalService;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
 import io.github.jdubois.bootui.engine.panel.BootUiPanels;
 import io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder;
@@ -37,6 +55,7 @@ import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
 import io.github.jdubois.bootui.engine.security.SecurityEventBuffer;
 import io.github.jdubois.bootui.engine.security.SecurityLogsService;
 import io.github.jdubois.bootui.engine.sqltrace.RouteTemplateResolver;
+import io.github.jdubois.bootui.engine.sqltrace.SqlTraceGrouping;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder;
 import io.github.jdubois.bootui.engine.telemetry.TracesService;
 import io.github.jdubois.bootui.engine.web.ExecutionProfileAssembler;
@@ -56,6 +75,7 @@ import io.smallrye.mutiny.Multi;
 import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
@@ -73,6 +93,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import javax.sql.DataSource;
+import org.eclipse.microprofile.config.Config;
 
 /**
  * JAX-RS resource for the Live Activity panel ({@code GET /bootui/api/activity}). The Quarkus analogue of
@@ -91,15 +112,14 @@ import javax.sql.DataSource;
  * via {@link QuarkusPanelAvailability}); when either is absent the assembler surfaces a warning (SQL) or
  * simply omits the source (security) and its entries are omitted. Signal-to-request correlation is
  * data-driven on the OpenTelemetry trace id when present: each captured signal is stamped with the active
- * span's trace id (see {@code QuarkusOtelTraceIdProvider}), and the engine {@link LiveActivityAssembler}
+ * span's trace id (see {@code QuarkusOtelTraceIdSource}), and the engine {@link LiveActivityAssembler}
  * nests SQL/exception/security/MAIL entries under the request sharing that trace id, also stamping a uniquely
  * correlated security event's principal onto its parent request as {@code securedPrincipal}.
  *
  * <p>The optional JDBC persistence backend ({@code bootui.activity.persistence.enabled}) is served by the
  * shared {@link SwitchableActivityStore} bean, which always exists (even with persistence disabled, as a
  * bare in-memory store) so this resource can always inject it directly. {@code QuarkusActivityCapture}
- * owns the capture side (polling {@link #mergedReport} and appending whatever it has not yet captured into
- * the store), and {@link #activity} branches on the store's own live {@link SwitchableActivityStore#persistent()}
+ * owns the startup journal subscriber, and {@link #activity} branches on the store's own live {@link SwitchableActivityStore#persistent()}
  * state — not the static startup settings — so it correctly reflects a runtime switch: when persistent, the
  * store (which itself merges its in-memory hot cache with the durable backend) serves entries and
  * pagination instead of a fresh live re-merge. This is entirely additive: with persistence never enabled
@@ -112,11 +132,11 @@ import javax.sql.DataSource;
  *
  * <p>{@link #useExistingDatasource} hot-switches Live Activity from in-memory to durable JDBC persistence
  * by reusing the host application's own {@code DataSource} — no restart required — mirroring the Spring
- * adapter's identically named controller action. On success it starts its own capture poller against the
- * newly durable store (held in {@link #switchPoller}, independent of {@code QuarkusActivityCapture}'s own
- * poller field: the two poller-creation paths are mutually exclusive, since a switch only succeeds when
+ * adapter's identically named controller action. On success it starts its own journal capture against the
+ * candidate durable store before publishing it (held in {@link #switchCapture}, independent of {@code QuarkusActivityCapture}'s own
+ * capture field: the two capture-creation paths are mutually exclusive, since a switch only succeeds when
  * the store was not already persistent, which is exactly the condition under which
- * {@code QuarkusActivityCapture}'s startup poller would not have been created) and closes it on
+ * {@code QuarkusActivityCapture}'s startup capture would not have been created) and closes it on
  * {@link #onStop}.
  *
  * <p>The per-request <em>profile</em> drill-down ({@code GET /bootui/api/activity/request/{id}}) is served
@@ -124,17 +144,19 @@ import javax.sql.DataSource;
  * MVC also correlates by serving thread and time window, which relies on its synchronous
  * one-thread-per-request servlet model and has no reliable Quarkus equivalent, so this resource reports
  * those tiers unavailable rather than inferring them. A REQUEST entry from
- * {@link #activity} is marked {@code profileable} by this resource, as a thin post-processing step over the
- * shared assembler's output, iff its exchange carries a resolvable trace id — the exact (and only) signal
- * {@link #request} can correlate on; every other entry, and every request without one, stays
- * non-profileable. Spring's controller/correlator computes its own {@code profileable} semantics
- * independently and is unaffected by this adapter-only step. Read-only (the profile drill-down only reads
+ * {@link #activity} is marked {@code profileable} through the engine's shared
+ * {@link LiveActivityAssembler#withExactProfiles} iff its exchange carries BootUI's request id or a resolvable
+ * trace id — the exact signals {@link #request} can correlate on; every other entry, and every request with
+ * neither, stays non-profileable. Spring MVC's controller/correlator computes its own {@code profileable}
+ * semantics independently. Read-only (the profile drill-down only reads
  * already-captured signals), plus the SSE change-notification stream {@code /stream} that ticks whenever
  * any merged source changes (a new HTTP exchange, a captured {@code @Scheduled} execution, a Kafka message,
  * or a captured email) so the shared Vue panel's auto-refresh toggle works identically to Spring.
  */
 @Path("/bootui/api/activity")
 public class LiveActivityResource {
+
+    private static final org.jboss.logging.Logger LOG = org.jboss.logging.Logger.getLogger(LiveActivityResource.class);
 
     /** Upper bound on simultaneous activity streams; this is a local dev tool, not a fan-out hub. */
     static final int MAX_CONCURRENT_STREAMS = 20;
@@ -156,6 +178,9 @@ public class LiveActivityResource {
     private final SwitchableActivityStore activityStore;
     private final ActivityPersistenceSettings persistenceSettings;
     private final Instance<DataSource> dataSources;
+    private Instance<RuntimeJournal> journal;
+    private Instance<JournalAggregates> journalAggregates;
+    private Instance<AgentEvidence> agentEvidence;
     private final KafkaActivityRecorder kafkaRecorder;
     private final RabbitActivityRecorder rabbitRecorder;
     private final FaultToleranceEventRecorder faultToleranceRecorder;
@@ -163,11 +188,13 @@ public class LiveActivityResource {
     private final HttpExchangesService exchanges = new HttpExchangesService();
     private final LiveActivityAssembler assembler;
     private final ReservedActivityEntries reservedEntries;
-    private final ExecutionProfileAssembler profileAssembler = new ExecutionProfileAssembler();
+    private volatile ExecutionProfileAssembler profileAssembler = new ExecutionProfileAssembler();
+    private volatile Instance<JavaAgentService> javaAgent;
     private final SecurityLogsService securityLogs = new SecurityLogsService();
     private final AtomicInteger openStreams = new AtomicInteger();
-    private volatile ActivityCapturePoller switchPoller;
+    private volatile ActivityCapture switchCapture;
     private Supplier<RouteTemplateResolver> declaredRoutes = RouteTemplateResolver::empty;
+    private ActivityFeedSource feedSource = ActivityFeedSource.DEFAULT;
 
     @Inject
     public LiveActivityResource(
@@ -222,19 +249,85 @@ public class LiveActivityResource {
     }
 
     /**
-     * Stops {@link #switchPoller} (making one last synchronous capture pass first, so entries produced
+     * {@code bootui.activity.feed-source}, the same key and default as on Spring ({@code docs/PLAN-v2.md} §5.3). An
+     * unknown source fails startup rather than silently serving another feed.
+     */
+    @Inject
+    void setFeedSource(Config config) {
+        this.feedSource = BootUiEngineProducer.activityFeedSource(config);
+        this.maxHandoff = config.getOptionalValue("bootui.agent.executors.max-handoff", java.time.Duration.class)
+                .orElse(null);
+        this.profileAssembler = new ExecutionProfileAssembler(
+                SqlTraceGrouping.DEFAULT_N_PLUS_ONE_THRESHOLD,
+                ExecutionProfileAssembler.DEFAULT_MAX_CHILDREN_PER_SECTION,
+                HandoffWindow.millis(maxHandoff));
+    }
+
+    /** The Java Agent service, which says whether the request profile's {@code PROPAGATED} tier applies (M5-2). */
+    @Inject
+    void setJavaAgent(Instance<JavaAgentService> javaAgent) {
+        this.javaAgent = javaAgent;
+    }
+
+    private String propagationUnavailableReason() {
+        try {
+            Instance<JavaAgentService> agent = javaAgent;
+            return agent == null || !agent.isResolvable()
+                    ? ProfileCapabilities.PROPAGATION_REASON
+                    : agent.get().propagationUnavailableReason();
+        } catch (RuntimeException ex) {
+            return ProfileCapabilities.PROPAGATION_REASON;
+        }
+    }
+
+    private java.time.Duration maxHandoff;
+
+    /** The runtime journal whose status block and <b>Clear recording</b> this panel serves. */
+    @Inject
+    void setRuntimeJournal(Instance<RuntimeJournal> journal, Instance<JournalAggregates> journalAggregates) {
+        this.journal = journal;
+        this.journalAggregates = journalAggregates;
+    }
+
+    /**
+     * The BootUI agent's evidence kept outside the journal (M5-11), which the journal status reports beside its own bytes
+     * and which every clear of the journal clears.
+     */
+    @Inject
+    void setAgentEvidence(Instance<AgentEvidence> agentEvidence) {
+        this.agentEvidence = agentEvidence;
+    }
+
+    /**
+     * Stops {@link #switchCapture} (processing what the journal already recorded first, so entries produced
      * since the last tick aren't dropped) when persistence was hot-switched on at runtime. Independent of
-     * {@code QuarkusActivityCapture}'s own {@code ShutdownEvent} observer, which stops its own poller
+     * {@code QuarkusActivityCapture}'s own {@code ShutdownEvent} observer, which stops its own capture
      * (started only when persistence was already enabled at startup) and closes the shared
-     * {@link SwitchableActivityStore} bean itself; the two never both hold a live poller, since a switch
+     * {@link SwitchableActivityStore} bean itself; the two never both hold a live capture, since a switch
      * only succeeds when the store was not already persistent.
      */
     void onStop(@Observes ShutdownEvent event) {
-        ActivityCapturePoller poller = switchPoller;
-        if (poller != null) {
-            poller.close();
-            switchPoller = null;
+        synchronized (activityStore) {
+            journal = null;
+            ActivityCapture capture = switchCapture;
+            if (capture != null) {
+                capture.close();
+                switchCapture = null;
+            }
         }
+    }
+
+    /** The feed from the configured source, without the journal-only filters; for callers such as the MCP bridge. */
+    public LiveActivityReport activity(
+            Integer limit,
+            String type,
+            String severity,
+            String q,
+            Long since,
+            Long until,
+            String cursor,
+            Integer pageSize) {
+        return activity(limit, type, severity, q, since, until, cursor, pageSize, null, null, null, null, false);
     }
 
     @GET
@@ -247,8 +340,17 @@ public class LiveActivityResource {
             @QueryParam("since") Long since,
             @QueryParam("until") Long until,
             @QueryParam("cursor") String cursor,
-            @QueryParam("pageSize") Integer pageSize) {
-        LiveActivityReport live = mergedReport(limit == null ? 0 : limit);
+            @QueryParam("pageSize") Integer pageSize,
+            @QueryParam("source") String source,
+            @QueryParam("route") String route,
+            @QueryParam("run") String run,
+            @QueryParam("requestId") String requestId,
+            @QueryParam("noRequest") boolean noRequest) {
+        LiveActivityReport live = live(
+                source,
+                new JournalActivityFeed.Filter(
+                        type, severity, since == null ? 0 : since, route, run, requestId, noRequest),
+                limit == null ? 0 : limit);
         ActivityPersistenceOptionDto persistenceOption = new ActivityPersistenceOptionDto(
                 activityStore.persistent(),
                 BootUiEngineProducer.resolveDataSource(dataSources) != null,
@@ -277,9 +379,18 @@ public class LiveActivityResource {
                 until,
                 cursor,
                 pageSize == null ? 0 : pageSize);
-        ActivityPage page = activityStore.query(query);
+        JournalTextExposure storedRule = JournalTextExposure.of(exposure);
+        ActivityPage page = io.github.jdubois.bootui.engine.activity.ReadableActivityPages.query(
+                activityStore,
+                query,
+                row -> JournalSourcePanels.isReadable(
+                        row,
+                        panel -> panelAvailability.isPanelAvailable(panel) && panelAvailability.isPanelEnabled(panel)),
+                storedRule::reapply);
         return new LiveActivityReport(
                 live.available(),
+                // Stored rows were written under MASKED (or raw, by an older build) while their panel was enabled;
+                // the live panel gate and exposure policy apply on read, and a search matches only what they show.
                 page.entryDtos(),
                 live.typeCounts(),
                 live.kpis(),
@@ -289,13 +400,94 @@ public class LiveActivityResource {
                 persistenceOption);
     }
 
+    /** The runtime journal's status block ({@code docs/PLAN-v2.md} §5.2). */
+    @GET
+    @Path("/journal")
+    @Produces(MediaType.APPLICATION_JSON)
+    public RuntimeJournalStatusDto journal() {
+        return runtimeJournal().status();
+    }
+
+    /** The run's resource track and CPU ledger ({@code docs/PLAN-v2.md} §5.11). */
+    @GET
+    @Path("/resources")
+    @Produces(MediaType.APPLICATION_JSON)
+    public RuntimeResourcesDto resources() {
+        return runtimeJournal().resources();
+    }
+
+    /** <b>Clear recording</b>: drops the run's recorded events and aggregates, when confirmed. */
+    @POST
+    @Path("/journal/clear")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response clearJournal(RuntimeJournalClearRequest request) {
+        RuntimeJournalService.Response response = runtimeJournal().clear(request);
+        return Response.status(response.status()).entity(response.body()).build();
+    }
+
+    /**
+     * The live feed from the requested source, or the configured one ({@code docs/PLAN-v2.md} §5.3). An unknown source
+     * is rejected, never silently replaced.
+     */
+    private LiveActivityReport live(String source, JournalActivityFeed.Filter filter, int limit) {
+        ActivityFeedSource resolved;
+        try {
+            resolved = ActivityFeedSource.parse(source, feedSource);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException(ex.getMessage());
+        }
+        JournalActivityReports reports = new JournalActivityReports(
+                journal != null && journal.isResolvable() ? journal.get() : null,
+                buffer.slowThresholdMillis(),
+                SqlTraceGrouping.DEFAULT_N_PLUS_ONE_THRESHOLD,
+                declaredRoutes,
+                panel -> panelAvailability.isPanelAvailable(panel) && panelAvailability.isPanelEnabled(panel),
+                exposure);
+        // With the journal disabled or absent, the panel buffers serve the feed rather than leaving it empty.
+        if (resolved == ActivityFeedSource.JOURNAL && reports.recording()) {
+            return reports.report(
+                    filter,
+                    limit,
+                    null,
+                    JournalRowDetails.of(
+                            requestsReport().exchanges(),
+                            panelVisible(BootUiPanels.EXCEPTIONS)
+                                    ? exceptionsService.report(exceptionStore).groups()
+                                    : null,
+                            emailReport() == null ? null : emailReport().messages(),
+                            securityEvents(panelVisible(BootUiPanels.SECURITY_LOGS))));
+        }
+        LiveActivityReport live = mergedReport(limit);
+        boolean journalAsked = resolved == ActivityFeedSource.JOURNAL && source != null && !source.isBlank();
+        if (!journalAsked && !JournalActivityReports.hasJournalOnlyFilter(filter)) {
+            return live;
+        }
+        List<String> warnings = new ArrayList<>(live.warnings());
+        if (journalAsked) {
+            warnings.add(JournalActivityReports.JOURNAL_UNAVAILABLE);
+        }
+        if (JournalActivityReports.hasJournalOnlyFilter(filter)) {
+            warnings.add(JournalActivityReports.JOURNAL_FILTERS_IGNORED);
+        }
+        return new LiveActivityReport(
+                live.available(), live.entries(), live.typeCounts(), live.kpis(), live.sources(), warnings);
+    }
+
+    private RuntimeJournalService runtimeJournal() {
+        return new RuntimeJournalService(
+                journal != null && journal.isResolvable() ? journal.get() : null,
+                journalAggregates != null && journalAggregates.isResolvable() ? journalAggregates.get() : null,
+                agentEvidence != null && agentEvidence.isResolvable() ? agentEvidence.get() : null);
+    }
+
     /**
      * Hot-switches Live Activity from in-memory to durable JDBC persistence, reusing the host
      * application's own {@code DataSource} — no restart required. Gated by explicit confirmation (this
      * creates a database table and starts writing to it) and by the shared {@code LocalhostGuard} write
      * floor enforced by {@code BootUiQuarkusSafetyFilter}, like every other mutating panel action.
      * Idempotent: calling this when persistence is already active is a no-op that reports success rather
-     * than an error. On success, starts this resource's own capture poller against the newly durable
+     * than an error. On success, starts the journal subscriber against the newly durable
      * store, exactly as {@code QuarkusActivityCapture}'s {@code onStart} would have done had persistence
      * been enabled from startup.
      */
@@ -305,37 +497,60 @@ public class LiveActivityResource {
     @Produces(MediaType.APPLICATION_JSON)
     public Response useExistingDatasource(ActivitySwitchRequest request) {
         DataSource dataSource = BootUiEngineProducer.resolveDataSource(dataSources);
-        ActivitySwitchResponse response = new ActivitySwitchService()
-                .useExistingDataSource(activityStore, persistenceSettings, dataSource, request);
-        if (response.newSettings() != null) {
-            switchPoller = startCapture(activityStore, response.newSettings());
+        synchronized (activityStore) {
+            RuntimeJournal current = journal != null && journal.isResolvable() ? journal.get() : null;
+            ActivitySwitchResponse response = new ActivitySwitchService()
+                    .useExistingDataSource(
+                            activityStore,
+                            persistenceSettings,
+                            dataSource,
+                            request,
+                            current,
+                            (target, settings) -> startCapture(target, settings, current));
+            if (response.capture() != null) {
+                switchCapture = response.capture();
+            }
+            return Response.status(response.status()).entity(response.body()).build();
         }
-        return Response.status(response.status()).entity(response.body()).build();
     }
 
     /**
-     * Starts a capture poller that appends this resource's {@link #mergedReport} feed to {@code store}, remembering
-     * the entries the exchange, SQL, and REST client buffers reserve with the exchange buffer's own request slow
-     * threshold. Shared by {@code QuarkusActivityCapture} at startup and by the runtime switch; the caller owns closing
-     * the returned poller.
+     * Starts writing Live Activity's durable history from the same source the feed reads ({@code docs/PLAN-v2.md}
+     * §5.3): the runtime journal's subscriber, whatever source the feed reads, or nothing, with a warning, when the
+     * journal is disabled; 2.0.0 removed the poller of {@link #mergedReport}. Shared by {@code QuarkusActivityCapture} at startup and by the
+     * runtime switch; the caller owns closing the returned capture.
      */
-    public ActivityCapturePoller startCapture(ActivityStore store, ActivityPersistenceSettings settings) {
-        return ActivityCaptureFactory.start(
-                store, settings, reservedEntries, () -> mergedReport(0).entries());
+    public ActivityCapture startPersistence(ActivityStore store, ActivityPersistenceSettings settings) {
+        RuntimeJournal current = journal != null && journal.isResolvable() ? journal.get() : null;
+        if (current != null && current.settings().enabled()) {
+            return startCapture(store, settings, current);
+        }
+        LOG.warn("Live Activity persistence is enabled, but the runtime journal is disabled"
+                + " (bootui.runtime-journal.enabled=false), so no durable history is written: the journal is its only"
+                + " source in 2.0.");
+        return null;
+    }
+
+    private ActivityCapture startCapture(
+            ActivityStore target, ActivityPersistenceSettings settings, RuntimeJournal journal) {
+        return JournalActivityCapture.start(
+                target,
+                settings,
+                reservedEntries,
+                journal,
+                new JournalActivityFeed(
+                        buffer.slowThresholdMillis(), SqlTraceGrouping.DEFAULT_N_PLUS_ONE_THRESHOLD, declaredRoutes),
+                panel -> panelAvailability.isPanelAvailable(panel) && panelAvailability.isPanelEnabled(panel));
     }
 
     /**
-     * The merged, reverse-chronological Live Activity feed — today's entire {@link #activity} body
-     * before persistence-aware pagination, extracted so {@code QuarkusActivityCapture}'s capture poller
-     * can reuse it as its feed {@link java.util.function.Supplier} without duplicating the
-     * signal-gathering/masking/profileable-stamping logic. Reusing this method (rather than re-reading
-     * the five signal sources independently) means the poller sees the exact same self-filtered, masked
-     * view the panel itself renders.
+     * The merged, reverse-chronological Live Activity feed read from the panel buffers, today's entire {@link
+     * #activity} body before persistence-aware pagination when the feed source is {@code buffers}.
      */
     public LiveActivityReport mergedReport(int limit) {
         HttpExchangesReport requests = requestsReport();
         SqlSnapshot sql = sqlSnapshot();
-        boolean securityAvailable = panelAvailability.isPanelAvailable(BootUiPanels.SECURITY_LOGS);
+        boolean securityAvailable = panelVisible(BootUiPanels.SECURITY_LOGS);
         boolean kafkaAvailable = panelAvailability.isPanelAvailable(BootUiPanels.KAFKA)
                 && panelAvailability.isPanelEnabled(BootUiPanels.KAFKA)
                 && kafkaRecorder.isEnabled();
@@ -355,7 +570,9 @@ public class LiveActivityResource {
                 sql.entries(),
                 sql.available(),
                 sql.unavailableWarning(),
-                exceptionsService.report(exceptionStore).groups(),
+                panelVisible(BootUiPanels.EXCEPTIONS)
+                        ? exceptionsService.report(exceptionStore).groups()
+                        : List.<ExceptionGroupDto>of(),
                 securityEvents(securityAvailable),
                 securityAvailable,
                 // No Quarkus cache-access capture seam exists yet (see LiveActivityAssembler's class
@@ -387,21 +604,9 @@ public class LiveActivityResource {
                         : List.<FaultToleranceEventRecorder.CapturedEvent>of(),
                 faultToleranceAvailable);
 
-        // Adapter-side post-processing over the shared assembler's output — not a change to the engine's
-        // own `profileable` default (which stays `false` for every entry it builds, unaffected by this
-        // step and by extension unaffected on Spring too): a REQUEST entry is profileable here iff its
-        // exchange carries a resolvable trace id, since that is the exact (and only) signal #request can
-        // correlate on.
-        List<ActivityEntryDto> entries = new ArrayList<>(report.entries().size());
-        for (ActivityEntryDto entry : report.entries()) {
-            boolean profileable = "REQUEST".equals(entry.type())
-                    && entry.correlationId() != null
-                    && !entry.correlationId().isBlank();
-            entries.add(profileable ? withProfileable(entry) : entry);
-        }
-
-        return new LiveActivityReport(
-                report.available(), entries, report.typeCounts(), report.kpis(), report.sources(), report.warnings());
+        // A REQUEST entry is profileable when its exchange carries a trace id or BootUI's request id, the exact
+        // signals the reduced profile correlates on. The engine owns the rule, shared with the other reactive stack.
+        return LiveActivityAssembler.withExactProfiles(report, requests == null ? List.of() : requests.exchanges());
     }
 
     /**
@@ -411,12 +616,35 @@ public class LiveActivityResource {
      * honest-degrade shaping to the shared engine assembler. Cache accesses have no capture seam on
      * Quarkus, so that section reports itself unavailable.
      */
+    /**
+     * One request as the runtime journal recorded it ({@code docs/PLAN-v2.md} §5.3, §5.11): its timeline, GC pauses,
+     * measured resources, route comparison, and touched resources.
+     */
+    @GET
+    @Path("/request/{id}/journal")
+    @Produces(MediaType.APPLICATION_JSON)
+    public RequestJournalProfileDto requestJournal(@PathParam("id") String id) {
+        return new RequestJournalProfiles(
+                        journal != null && journal.isResolvable() ? journal.get() : null,
+                        journalAggregates != null && journalAggregates.isResolvable() ? journalAggregates.get() : null,
+                        buffer.slowThresholdMillis(),
+                        SqlTraceGrouping.DEFAULT_N_PLUS_ONE_THRESHOLD,
+                        panel -> panelAvailability.isPanelAvailable(panel) && panelAvailability.isPanelEnabled(panel),
+                        exposure)
+                .maxHandoff(maxHandoff)
+                .profile(id);
+    }
+
+    public RequestProfileSelectionDto agentProfile(String id) {
+        return RequestProfileSelection.select(id, this::requestJournal, this::request);
+    }
+
     @GET
     @Path("/request/{id}")
     @Produces(MediaType.APPLICATION_JSON)
     public RequestProfileDto request(@PathParam("id") String id) {
         List<HttpExchangeDto> requests = requestsReport().exchanges();
-        boolean found = requests.stream().anyMatch(exchange -> id.equals(exchange.id()));
+        boolean found = requests.stream().anyMatch(exchange -> ExecutionProfileAssembler.identifies(exchange, id));
         ProfileEvidence evidence = found
                 ? new ProfileEvidence(
                         requests,
@@ -429,7 +657,8 @@ public class LiveActivityResource {
                                 ? null
                                 : tracesService.detail(traceId).orElse(null))
                 : new ProfileEvidence(requests, null, null, null, null, null, null);
-        return profileAssembler.requestProfile(id, evidence, ProfileCapabilities.traceIdOnly());
+        return profileAssembler.requestProfile(
+                id, evidence, ProfileCapabilities.traceIdOnly().withPropagation(propagationUnavailableReason()));
     }
 
     private Source<SqlTraceEntryDto> sqlSource() {
@@ -437,7 +666,10 @@ public class LiveActivityResource {
             return Source.panelDisabled("SQL Trace");
         }
         SqlSnapshot sql = sqlSnapshot();
-        return sql.available() ? Source.of(sql.entries()) : Source.unavailable(sql.unavailableWarning());
+        SqlTraceRecorder recorder = sqlRecorder.isResolvable() ? sqlRecorder.get() : null;
+        return sql.available()
+                ? Source.of(sql.entries(), recorder == null ? null : recorder.executionCaptureLimitation())
+                : Source.unavailable(sql.unavailableWarning());
     }
 
     private Source<ExceptionDetailDto> exceptionSource() {
@@ -488,7 +720,18 @@ public class LiveActivityResource {
                                                 emailChangeSource()),
                                         restClientChangeSource()),
                                 sqlChangeSource()),
-                        combined(exceptionStore::subscribe, faultToleranceChangeSource())));
+                        combined(
+                                combined(exceptionStore::subscribe, faultToleranceChangeSource()),
+                                journalChangeSource())));
+    }
+
+    /**
+     * Ticks the merged stream whenever the runtime journal records a batch, so a log event or any other source only
+     * the journal records refreshes the panel too ({@code docs/PLAN-v2.md} §5.3).
+     */
+    private SseStreams.ChangeSource journalChangeSource() {
+        return onChange ->
+                journal != null && journal.isResolvable() ? journal.get().subscribe(onChange) : () -> {};
     }
 
     /**
@@ -525,7 +768,18 @@ public class LiveActivityResource {
         };
     }
 
+    /**
+     * Whether a panel's evidence may be shown: the application can serve it and the user enabled it, the same rule as
+     * the journal's source-panel predicate ({@code docs/PLAN-v2.md} §8).
+     */
+    private boolean panelVisible(String panel) {
+        return panelAvailability.isPanelAvailable(panel) && panelAvailability.isPanelEnabled(panel);
+    }
+
     private HttpExchangesReport requestsReport() {
+        if (!panelVisible(BootUiPanels.HTTP_EXCHANGES)) {
+            return HttpExchangesReport.unavailable("HTTP Exchanges panel is disabled");
+        }
         return exchanges.report(
                 buffer.snapshot(),
                 // The capture filter never records BootUI's own requests, judged below the root path.
@@ -542,7 +796,7 @@ public class LiveActivityResource {
     }
 
     private EmailsReport emailReport() {
-        if (!panelAvailability.isPanelAvailable(BootUiPanels.EMAIL) || !emailCaptureService.isResolvable()) {
+        if (!panelVisible(BootUiPanels.EMAIL) || !emailCaptureService.isResolvable()) {
             return null;
         }
         return emailCaptureService.get().list();
@@ -587,6 +841,9 @@ public class LiveActivityResource {
     }
 
     private SqlSnapshot sqlSnapshot() {
+        if (!panelAvailability.isPanelEnabled(BootUiPanels.SQL_TRACE)) {
+            return new SqlSnapshot(List.of(), false, "SQL Trace panel is disabled");
+        }
         SqlTraceRecorder rec = sqlRecorder.isResolvable() ? sqlRecorder.get() : null;
         boolean available = rec != null && rec.isEnabled() && rec.hasWrappedDataSource();
         if (!available) {
@@ -598,7 +855,7 @@ public class LiveActivityResource {
             return new SqlSnapshot(List.of(), false, warning);
         }
         boolean exposeParameters = rec.isCaptureParameters() && exposure.valueExposure() != ValueExposure.METADATA_ONLY;
-        return new SqlSnapshot(rec.report(exposeParameters).entries(), true, null);
+        return new SqlSnapshot(rec.entries(exposeParameters), true, null);
     }
 
     private List<SecurityLogEventDto> securityEvents(boolean securityAvailable) {
@@ -633,26 +890,6 @@ public class LiveActivityResource {
             }
         }
         return details;
-    }
-
-    private static ActivityEntryDto withProfileable(ActivityEntryDto entry) {
-        return new ActivityEntryDto(
-                entry.id(),
-                entry.type(),
-                entry.timestamp(),
-                entry.severity(),
-                entry.summary(),
-                entry.detail(),
-                entry.durationMs(),
-                entry.correlationId(),
-                entry.method(),
-                entry.path(),
-                entry.status(),
-                entry.thread(),
-                true,
-                entry.parentId(),
-                entry.securedPrincipal(),
-                entry.sqlNPlusOneSuspected());
     }
 
     /** SQL trace snapshot for one request cycle: entries plus whether the source is present and feeding. */

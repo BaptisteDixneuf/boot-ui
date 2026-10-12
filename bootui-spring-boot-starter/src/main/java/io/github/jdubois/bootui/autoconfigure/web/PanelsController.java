@@ -1,0 +1,762 @@
+package io.github.jdubois.bootui.autoconfigure.web;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.datasource.DataSourceDeclarations;
+import io.github.jdubois.bootui.core.dto.PanelDto;
+import io.github.jdubois.bootui.core.dto.PanelsReport;
+import io.github.jdubois.bootui.engine.agent.AgentSessionStore;
+import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
+import io.github.jdubois.bootui.engine.github.GitHubRepositoryDetector;
+import io.github.jdubois.bootui.engine.heapdump.HeapDumpService;
+import io.github.jdubois.bootui.engine.insights.RuntimeInsightsService;
+import io.github.jdubois.bootui.engine.inventory.CodeInventoryService;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
+import io.github.jdubois.bootui.engine.mysql.MySqlDataSourceDetection;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels.Panel;
+import io.github.jdubois.bootui.engine.postgres.PostgresDataSourceDetection;
+import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
+import io.github.jdubois.bootui.engine.sideeffects.SideEffectsService;
+import io.github.jdubois.bootui.engine.telemetry.AiFrameworkDetector;
+import io.github.jdubois.bootui.engine.websocket.WebSocketService;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
+import org.springframework.boot.actuate.audit.AuditEventRepository;
+import org.springframework.boot.actuate.autoconfigure.condition.ConditionsReportEndpoint;
+import org.springframework.boot.actuate.beans.BeansEndpoint;
+import org.springframework.boot.actuate.startup.StartupEndpoint;
+import org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository;
+import org.springframework.boot.autoconfigure.AutoConfigurationPackages;
+import org.springframework.boot.micrometer.metrics.actuate.endpoint.MetricsEndpoint;
+import org.springframework.boot.web.context.reactive.ReactiveWebApplicationContext;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.cache.CacheManager;
+import org.springframework.context.ApplicationContext;
+import org.springframework.core.NativeDetector;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.PropertySource;
+import org.springframework.scheduling.annotation.ScheduledAnnotationBeanPostProcessor;
+import org.springframework.scheduling.config.ScheduledTaskHolder;
+import org.springframework.transaction.ConfigurableTransactionManager;
+import org.springframework.util.ClassUtils;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("${bootui.api-path:${bootui.path:/bootui}/api}/panels")
+public class PanelsController {
+
+    // Matches the application-<profile>.{properties,yml,yaml} token in both plain source names and
+    // Spring Boot's "Config resource 'file ... application-<profile>.yml'" source names (via find()).
+    private static final Pattern PROFILE_SOURCE_PATTERN =
+            Pattern.compile("application-([\\w-]++)(?:\\.properties|\\.ya?ml)");
+
+    private final ApplicationContext applicationContext;
+    private final Environment environment;
+    private final BootUiProperties properties;
+
+    public PanelsController(
+            ApplicationContext applicationContext, Environment environment, BootUiProperties properties) {
+        this.applicationContext = applicationContext;
+        this.environment = environment;
+        this.properties = properties;
+    }
+
+    @GetMapping
+    public PanelsReport panels() {
+        return new PanelsReport(
+                platform(), BootUiPanels.all().stream().map(this::panel).toList());
+    }
+
+    /** Available while the BootUI agent's inventory sensor records this run, else with the agent's reason. */
+    private Availability codeInventoryAvailability() {
+        try {
+            CodeInventoryService service = applicationContext
+                    .getBeanProvider(CodeInventoryService.class)
+                    .getIfUnique();
+            String reason =
+                    service == null ? JavaAgentService.INVENTORY_REQUIREMENT + "." : service.unavailableReason();
+            return availability(reason == null, reason);
+        } catch (RuntimeException ex) {
+            return availability(false, JavaAgentService.INVENTORY_REQUIREMENT + ".");
+        }
+    }
+
+    /** Available while the BootUI agent's code-paths sensor records this run, else with the agent's reason. */
+    private Availability codePathsAvailability() {
+        try {
+            CodePathsService service =
+                    applicationContext.getBeanProvider(CodePathsService.class).getIfUnique();
+            String reason =
+                    service == null ? JavaAgentService.CODE_PATHS_REQUIREMENT + "." : service.unavailableReason();
+            return availability(reason == null, reason);
+        } catch (RuntimeException ex) {
+            return availability(false, JavaAgentService.CODE_PATHS_REQUIREMENT + ".");
+        }
+    }
+
+    /** Available while the BootUI agent is armed for this run with Side Effects support, else with the agent's reason. */
+    private Availability sideEffectsAvailability() {
+        try {
+            SideEffectsService service =
+                    applicationContext.getBeanProvider(SideEffectsService.class).getIfUnique();
+            String reason =
+                    service == null ? JavaAgentService.SIDE_EFFECTS_REQUIREMENT + "." : service.unavailableReason();
+            return availability(reason == null, reason);
+        } catch (RuntimeException ex) {
+            return availability(false, JavaAgentService.SIDE_EFFECTS_REQUIREMENT + ".");
+        }
+    }
+
+    private String platform() {
+        return isReactive() ? PanelsReport.PLATFORM_SPRING_BOOT_REACTIVE : PanelsReport.PLATFORM_SPRING_BOOT;
+    }
+
+    // This same controller class is imported unmodified by both BootUiAutoConfiguration (servlet) and
+    // BootUiReactiveAutoConfiguration (WebFlux) - see the class-level shared-controller convention documented
+    // in BootUiReactiveAutoConfiguration. ReactiveWebApplicationContext is the deterministic Spring Boot marker
+    // for "this is the reactive stack" (set by the actual running ApplicationContext type, not a classpath
+    // heuristic), so it correctly distinguishes the two adapters even if both spring-webmvc and spring-webflux
+    // happen to be on the classpath at once.
+    private boolean isReactive() {
+        return applicationContext instanceof ReactiveWebApplicationContext;
+    }
+
+    private PanelDto panel(Panel definition) {
+        Availability availability = availability(definition.id());
+        boolean readOnly = definition.actionCapable() && properties.isPanelReadOnly(definition.id());
+        return new PanelDto(
+                definition.id(),
+                definition.title(),
+                availability.available(),
+                availability.available() ? null : availability.unavailableReason(),
+                properties.isPanelEnabled(definition.id()),
+                readOnly,
+                readOnly ? properties.panelReadOnlyReason(definition.id()) : null);
+    }
+
+    private Availability availability(String id) {
+        // Split across grouped helpers so no single switch grows unwieldy.
+        // Each helper covers a disjoint set of panel ids; coreAvailability() returns null for ids it does
+        // not own so the dispatcher can fall through to scannerAvailability(), which owns the default case.
+        Availability availability = coreAvailability(id);
+        return availability != null ? availability : scannerAvailability(id);
+    }
+
+    // Always-available panels plus those gated purely on an actuator endpoint, bean, or classpath marker.
+    private Availability coreAvailability(String id) {
+        return switch (id) {
+            case BootUiPanels.OVERVIEW,
+                    BootUiPanels.LIVE_MEMORY,
+                    BootUiPanels.MEMORY,
+                    BootUiPanels.CONFIG,
+                    BootUiPanels.EXCEPTIONS,
+                    BootUiPanels.HTTP_PROBE,
+                    BootUiPanels.PENTESTING,
+                    BootUiPanels.SPRING,
+                    BootUiPanels.VULNERABILITIES,
+                    BootUiPanels.ACTIVITY,
+                    BootUiPanels.CLI,
+                    BootUiPanels.JAVA_AGENT,
+                    BootUiPanels.DATABASE_ADVISOR -> available();
+            case BootUiPanels.RUNTIME_INSIGHTS ->
+                availability(properties.getRuntimeJournal().isEnabled(), RuntimeInsightsService.DISABLED);
+            case BootUiPanels.CODE_INVENTORY -> codeInventoryAvailability();
+            case BootUiPanels.CODE_PATHS -> codePathsAvailability();
+            case BootUiPanels.SIDE_EFFECTS -> sideEffectsAvailability();
+            case BootUiPanels.MCP_SERVER -> availability(mcpServerAvailable(), mcpServerUnavailableReason());
+            case BootUiPanels.JVM_TUNING ->
+                availability(
+                        !nativeImageDetected(), "JVM Tuning is not applicable when running as a GraalVM native image");
+            case BootUiPanels.HEALTH ->
+                availability(
+                        beanPresent("org.springframework.boot.health.actuate.endpoint.HealthEndpoint"),
+                        "Actuator health endpoint not available");
+            case BootUiPanels.HTTP_SESSIONS -> availability(httpSessionsAvailable(), httpSessionsUnavailableReason());
+            case BootUiPanels.METRICS ->
+                availability(
+                        classPresent("io.micrometer.core.instrument.MeterRegistry")
+                                && beanPresent(MetricsEndpoint.class),
+                        "Actuator metrics endpoint or MeterRegistry not available");
+            case BootUiPanels.STARTUP ->
+                availability(beanPresent(StartupEndpoint.class), "Actuator startup endpoint not available");
+            case BootUiPanels.SCHEDULED -> availability(scheduledAvailable(), "Scheduling is not enabled");
+            case BootUiPanels.PROFILE_DIFF ->
+                availability(profilesAvailable(), "No active profiles or profile-specific config sources available");
+            case BootUiPanels.LOGGERS ->
+                availability(
+                        beanPresent("org.springframework.boot.actuate.logging.LoggersEndpoint"),
+                        "Actuator loggers endpoint not available");
+            case BootUiPanels.BEANS ->
+                availability(beanPresent(BeansEndpoint.class), "Actuator beans endpoint not available");
+            case BootUiPanels.CONDITIONS ->
+                availability(beanPresent(ConditionsReportEndpoint.class), "Actuator conditions endpoint not available");
+            case BootUiPanels.MAPPINGS ->
+                availability(
+                        beanPresent("org.springframework.boot.actuate.web.mappings.MappingsEndpoint"),
+                        "Actuator mappings endpoint not available");
+            case BootUiPanels.DATA ->
+                availability(
+                        classPresent("org.springframework.data.repository.Repository"),
+                        "Spring Data not on the classpath");
+            case BootUiPanels.CACHE ->
+                availability(beanPresent(CacheManager.class), "No CacheManager beans are available");
+            case BootUiPanels.SPRING_SECURITY ->
+                availability(springSecurityAvailable(), springSecurityUnavailableReason());
+            case BootUiPanels.SECURITY_LOGS ->
+                availability(beanPresent(AuditEventRepository.class), "No AuditEventRepository bean is available");
+            case BootUiPanels.HTTP_EXCHANGES ->
+                availability(
+                        classPresent("org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository")
+                                && beanPresent(HttpExchangeRepository.class),
+                        "HTTP exchange repository not available");
+            case BootUiPanels.TRACES ->
+                availability(properties.getTelemetry().isEnabled(), "Telemetry receiver is disabled");
+            case BootUiPanels.LOG_TAIL ->
+                availability(classPresent("ch.qos.logback.classic.Logger"), "Logback not on the classpath");
+            case BootUiPanels.DEVTOOLS -> availability(devToolsPresent(), "Spring Boot DevTools not on the classpath");
+            case BootUiPanels.DEV_SERVICES ->
+                availability(devServicesPresent(), "Docker Compose or Testcontainers not on the classpath");
+            default -> null;
+        };
+    }
+
+    // Panels backed by a dedicated scanner/service availability check, plus the unknown-panel fallback.
+    private Availability scannerAvailability(String id) {
+        return switch (id) {
+            case BootUiPanels.GITHUB -> availability(githubAvailable(), githubUnavailableReason());
+            case BootUiPanels.HEAP_DUMP ->
+                availability(HeapDumpService.hotspotAvailable(), "Heap dumps are not supported on this JVM");
+            case BootUiPanels.ARCHITECTURE -> availability(architectureAvailable(), architectureUnavailableReason());
+            case BootUiPanels.REST_API -> availability(restApiAvailable(), restApiUnavailableReason());
+            case BootUiPanels.GRAALVM -> availability(graalvmAvailable(), graalvmUnavailableReason());
+            case BootUiPanels.CRAC -> availability(cracAvailable(), cracUnavailableReason());
+            case BootUiPanels.SQL_TRACE ->
+                availability(beanPresent(javax.sql.DataSource.class), "No DataSource bean is available");
+            case BootUiPanels.POSTGRESQL -> availability(postgresAvailable(), postgresUnavailableReason());
+            case BootUiPanels.MYSQL ->
+                availability(
+                        declaredDatabaseAvailable(MySqlDataSourceDetection::isMySqlJdbcUrl, "com.mysql.cj.jdbc.Driver"),
+                        applicationContext.getBeanNamesForType(javax.sql.DataSource.class, true, false).length == 0
+                                ? "No JDBC DataSource bean is available; reactive clients alone are not supported."
+                                : "No MySQL JDBC datasource is configured. MariaDB requires a separate integration.");
+            case BootUiPanels.TRANSACTIONS ->
+                availability(
+                        beanPresent(ConfigurableTransactionManager.class),
+                        "No configurable transaction manager bean is available");
+            case BootUiPanels.REST_CLIENT_TRACE ->
+                availability(restClientTraceAvailable(), restClientTraceUnavailableReason());
+            case BootUiPanels.THREADS ->
+                availability(
+                        java.lang.management.ManagementFactory.getThreadMXBean() != null,
+                        "ThreadMXBean is not available on this JVM");
+            case BootUiPanels.HIBERNATE -> availability(hibernateAvailable(), hibernateUnavailableReason());
+            case BootUiPanels.HIBERNATE_STATISTICS -> availability(hibernateAvailable(), hibernateUnavailableReason());
+            case BootUiPanels.DATABASE_CONNECTION_POOLS -> availability(hikariAvailable(), hikariUnavailableReason());
+            case BootUiPanels.FLYWAY -> availability(flywayAvailable(), flywayUnavailableReason());
+            case BootUiPanels.LIQUIBASE -> availability(liquibaseAvailable(), liquibaseUnavailableReason());
+            case BootUiPanels.EMAIL -> availability(emailAvailable(), "No JavaMailSender bean is available");
+            case BootUiPanels.KAFKA -> availability(kafkaAvailable(), "No KafkaTemplate bean is available");
+            case BootUiPanels.RABBITMQ -> availability(rabbitAvailable(), "No RabbitTemplate bean is available");
+            case BootUiPanels.JMS -> availability(jmsAvailable(), jmsUnavailableReason());
+            case BootUiPanels.FAULT_TOLERANCE ->
+                availability(
+                        faultToleranceAvailable(),
+                        "No supported fault tolerance library is present (Resilience4j or Spring Retry)");
+            case BootUiPanels.WEBSOCKETS -> availability(webSocketsAvailable(), webSocketsUnavailableReason());
+            case BootUiPanels.SECURITY -> availability(securityAvailable(), securityUnavailableReason());
+            case BootUiPanels.AI -> availability(aiAvailable(), aiUnavailableReason());
+            case BootUiPanels.COPILOT ->
+                availability(
+                        cliSessionPanelAvailable(properties.getCopilot()),
+                        cliSessionUnavailableReason(properties.getCopilot()));
+            case BootUiPanels.CLAUDE_CODE ->
+                availability(
+                        cliSessionPanelAvailable(properties.getClaudeCode()),
+                        cliSessionUnavailableReason(properties.getClaudeCode()));
+            default -> availability(false, "Unknown BootUI panel");
+        };
+    }
+
+    private Availability available() {
+        return availability(true, null);
+    }
+
+    private Availability availability(boolean available, String unavailableReason) {
+        return new Availability(available, unavailableReason);
+    }
+
+    private boolean beanPresent(Class<?> type) {
+        return applicationContext.getBeanNamesForType(type).length > 0;
+    }
+
+    private boolean classPresent(String className) {
+        return ClassUtils.isPresent(className, getClass().getClassLoader());
+    }
+
+    private boolean profilesAvailable() {
+        return environment.getActiveProfiles().length > 0 || hasProfileSpecificSources();
+    }
+
+    private boolean hasProfileSpecificSources() {
+        if (!(environment instanceof ConfigurableEnvironment configurableEnvironment)) {
+            return false;
+        }
+        for (PropertySource<?> propertySource : configurableEnvironment.getPropertySources()) {
+            String name = propertySource.getName();
+            if (name != null && PROFILE_SOURCE_PATTERN.matcher(name).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean devToolsPresent() {
+        return classPresent("org.springframework.boot.devtools.RemoteSpringApplication")
+                || classPresent("org.springframework.boot.devtools.restart.Restarter");
+    }
+
+    private boolean devServicesPresent() {
+        return classPresent("org.springframework.boot.docker.compose.core.DockerCompose")
+                || classPresent("org.testcontainers.containers.GenericContainer");
+    }
+
+    private boolean scheduledAvailable() {
+        return beanPresent(ScheduledTaskHolder.class) || beanPresent(ScheduledAnnotationBeanPostProcessor.class);
+    }
+
+    private boolean githubAvailable() {
+        return GitHubRepositoryDetector.detect(
+                        Path.of(System.getProperty("user.dir", ".")),
+                        Arrays.asList(properties.getGithub().getAllowedApiHosts()))
+                .isPresent();
+    }
+
+    private String githubUnavailableReason() {
+        return GitHubRepositoryDetector.unavailableReason(
+                Path.of(System.getProperty("user.dir", ".")),
+                Arrays.asList(properties.getGithub().getAllowedApiHosts()));
+    }
+
+    private boolean aiAvailable() {
+        return properties.getTelemetry().isEnabled() && AiFrameworkDetector.isAnyPresent();
+    }
+
+    private boolean httpSessionsAvailable() {
+        return classPresent("org.springframework.boot.tomcat.TomcatWebServer")
+                && classPresent("org.apache.catalina.Manager")
+                && applicationContext instanceof WebServerApplicationContext webServerApplicationContext
+                && webServerApplicationContext.getWebServer() != null
+                && "org.springframework.boot.tomcat.TomcatWebServer"
+                        .equals(webServerApplicationContext
+                                .getWebServer()
+                                .getClass()
+                                .getName());
+    }
+
+    private String httpSessionsUnavailableReason() {
+        if (isReactive()) {
+            return "Not applicable on Spring WebFlux: HTTP Sessions are the servlet container's HttpSession API,"
+                    + " which has no reactive equivalent (WebSession is a different, non-container-managed model),"
+                    + " so this panel does not apply here.";
+        }
+        if (!classPresent("org.springframework.boot.tomcat.TomcatWebServer")
+                || !classPresent("org.apache.catalina.Manager")) {
+            return "HTTP Sessions require embedded Tomcat";
+        }
+        if (!(applicationContext instanceof WebServerApplicationContext)) {
+            return "HTTP Sessions require an embedded servlet web server";
+        }
+        return "HTTP Sessions require embedded Tomcat";
+    }
+
+    private boolean springSecurityAvailable() {
+        if (isReactive()) {
+            // Inspect actual application SecurityWebFilterChain beans rather than WebFilterChainProxy's
+            // private list. Exclude BootUI's own permit-all chain so the panel cannot make itself available.
+            return classPresent("org.springframework.security.web.server.SecurityWebFilterChain")
+                    && beanPresentExcluding(
+                            "org.springframework.security.web.server.SecurityWebFilterChain",
+                            "bootUiReactiveSecurityWebFilterChain");
+        }
+        return classPresent("org.springframework.security.web.SecurityFilterChain")
+                && beanPresent("org.springframework.security.web.SecurityFilterChain");
+    }
+
+    private String springSecurityUnavailableReason() {
+        if (isReactive()) {
+            if (!classPresent("org.springframework.security.web.server.SecurityWebFilterChain")) {
+                return "Spring Security not on the classpath";
+            }
+            return "No reactive Spring Security filter chains are available"
+                    + " (no SecurityWebFilterChain bean found)";
+        }
+        if (!classPresent("org.springframework.security.web.SecurityFilterChain")) {
+            return "Spring Security not on the classpath";
+        }
+        return "No Spring Security filter chains are available";
+    }
+
+    private boolean mcpServerAvailable() {
+        return true;
+    }
+
+    private String mcpServerUnavailableReason() {
+        return "MCP Server panel is not available.";
+    }
+
+    // RestClientTraceBackendConfiguration declares the RestClientTraceRecorder bean unconditionally (so
+    // both the servlet and reactive adapters can share it for Live Activity capture), so bean presence
+    // alone can't signal whether the application actually configured a client - it is always present when
+    // BootUI is active. Mirror the recorder's own "has anything been instrumented yet" signal (the same
+    // one RestClientTraceController uses to render its empty state) so the panel lands in "Disabled /
+    // unavailable" until a RestClient/RestTemplate/WebClient bean is actually built, exactly like the
+    // Kafka/Email/Cache panels gate on their own beans.
+    private boolean restClientTraceAvailable() {
+        RestClientTraceRecorder recorder = restClientTraceRecorder();
+        return recorder != null && recorder.hasInstrumentedClient();
+    }
+
+    private String restClientTraceUnavailableReason() {
+        RestClientTraceRecorder recorder = restClientTraceRecorder();
+        if (recorder == null) {
+            return "REST client tracing is not configured";
+        }
+        if (!recorder.isEnabled()) {
+            return "REST client tracing is disabled (set bootui.rest-client-trace.enabled=true in a "
+                    + "trusted local profile).";
+        }
+        return "No RestClient, RestTemplate, or WebClient has been instrumented yet.";
+    }
+
+    private RestClientTraceRecorder restClientTraceRecorder() {
+        return applicationContext.getBeanProvider(RestClientTraceRecorder.class).getIfAvailable();
+    }
+
+    /**
+     * The PostgreSQL panel is available only when a PostgreSQL datasource is actually configured: it reads
+     * {@code pg_stat_*}/{@code pg_catalog} and has nothing to say about any other database.
+     *
+     * <p>The check never opens a connection, because rendering the panel must contact nothing: it reads the
+     * JDBC URL each {@code DataSource} bean declares. A datasource that declares no readable URL cannot be
+     * ruled out, so the panel stays available whenever the PostgreSQL driver is also on the classpath, and the
+     * read action then reports the honest per-datasource diagnostic.</p>
+     */
+    private boolean postgresAvailable() {
+        return declaredDatabaseAvailable(PostgresDataSourceDetection::isPostgresJdbcUrl, "org.postgresql.Driver");
+    }
+
+    private boolean declaredDatabaseAvailable(Predicate<String> matches, String driverClass) {
+        DataSourceDeclarations.Snapshot declarations = DataSourceDeclarations.inspect(applicationContext);
+        if (!declarations.present()) {
+            return false;
+        }
+        boolean anyUnknownUrl = declarations.incomplete();
+        for (javax.sql.DataSource dataSource : declarations.sources()) {
+            String url = PostgresDataSourceDetection.jdbcUrlOf(dataSource);
+            if (url == null) {
+                anyUnknownUrl = true;
+            } else if (matches.test(url)) {
+                return true;
+            }
+        }
+        return anyUnknownUrl
+                && (matches.test(environment.getProperty("spring.datasource.url")) || classPresent(driverClass));
+    }
+
+    private String postgresUnavailableReason() {
+        if (!beanPresent(javax.sql.DataSource.class)) {
+            return "No DataSource bean is available";
+        }
+        return "No PostgreSQL datasource is configured";
+    }
+
+    /**
+     * Whether the Database Connection Pools panel has anything to show.
+     *
+     * <p>Answered from objects that already exist, never by creating one: the manifest renders on page load, so
+     * it may not instantiate a lazy {@code DataSource} bean, resolve a dynamic proxy target, or borrow a
+     * connection. That makes "no Hikari pool" undecidable in three real configurations — a lazy or not-yet-created
+     * datasource bean, a wrapper hidden behind a dynamic AOP target source, and a pool that will not answer the
+     * JDBC wrapper query. Each of those stays a <em>candidate</em>: the panel's own read resolves beans and
+     * reports honestly, whereas hiding a configured pool leaves no way to find out. Only a pool that positively
+     * declares it is not Hikari (and an application with no {@code DataSource} bean at all) makes the panel
+     * unavailable.</p>
+     */
+    private boolean hikariAvailable() {
+        if (!classPresent("com.zaxxer.hikari.HikariDataSource")) {
+            return false;
+        }
+        if (applicationContext.getBeanNamesForType(com.zaxxer.hikari.HikariDataSource.class, true, false).length > 0) {
+            return true;
+        }
+        DataSourceDeclarations.Snapshot declarations = DataSourceDeclarations.inspect(applicationContext);
+        if (!declarations.present()) {
+            return false;
+        }
+        // A declaration that could not be observed at all — a lazy bean, or a wrapper that would not describe
+        // its target — is exactly the case that cannot be ruled out without constructing something.
+        boolean undecided = declarations.incomplete();
+        for (javax.sql.DataSource source : declarations.sources()) {
+            switch (HikariDataSourceDiscovery.inspectExisting(source)) {
+                case PRESENT -> {
+                    return true;
+                }
+                case UNKNOWN -> undecided = true;
+                case ABSENT -> {
+                    // A pool that declares it neither is nor wraps Hikari is proven absent.
+                }
+            }
+        }
+        return undecided;
+    }
+
+    private String hikariUnavailableReason() {
+        if (!classPresent("com.zaxxer.hikari.HikariDataSource")) {
+            return "No supported JDBC connection pool implementation is available";
+        }
+        if (applicationContext.getBeanNamesForType(javax.sql.DataSource.class, true, false).length == 0) {
+            return "No database connection pool beans are available";
+        }
+        return "The configured DataSource beans are not backed by a supported connection pool";
+    }
+
+    private boolean flywayAvailable() {
+        return classPresent("org.flywaydb.core.Flyway") && beanPresent("org.flywaydb.core.Flyway");
+    }
+
+    private String flywayUnavailableReason() {
+        if (!classPresent("org.flywaydb.core.Flyway")) {
+            return "Flyway is not on the classpath";
+        }
+        return "No Flyway beans are available";
+    }
+
+    private boolean liquibaseAvailable() {
+        return classPresent("liquibase.integration.spring.SpringLiquibase")
+                && beanPresent("liquibase.integration.spring.SpringLiquibase");
+    }
+
+    private String liquibaseUnavailableReason() {
+        if (!classPresent("liquibase.integration.spring.SpringLiquibase")) {
+            return "Liquibase is not on the classpath";
+        }
+        return "No Liquibase beans are available";
+    }
+
+    private boolean emailAvailable() {
+        return classPresent("org.springframework.mail.javamail.JavaMailSender")
+                && beanPresent("org.springframework.mail.javamail.JavaMailSender");
+    }
+
+    private boolean kafkaAvailable() {
+        return classPresent("org.springframework.kafka.core.KafkaTemplate")
+                && beanPresent("org.springframework.kafka.core.KafkaTemplate");
+    }
+
+    private boolean rabbitAvailable() {
+        return classPresent("org.springframework.amqp.rabbit.core.RabbitTemplate")
+                && beanPresent("org.springframework.amqp.rabbit.core.RabbitTemplate");
+    }
+
+    /**
+     * The Fault Tolerance panel needs a fault tolerance library, not a specific bean: Resilience4j registries are
+     * often created programmatically and Spring Retry has no registry at all. Presence of any supported
+     * entry point is therefore the availability signal, and the panel's own report explains precisely which
+     * providers answered.
+     */
+    private boolean faultToleranceAvailable() {
+        return classPresent("io.github.resilience4j.core.Registry")
+                || classPresent("org.springframework.retry.annotation.Retryable");
+    }
+
+    private boolean jmsAvailable() {
+        return !nativeImageDetected()
+                && classPresent("org.springframework.jms.core.JmsTemplate")
+                && classPresent("jakarta.jms.Message")
+                && beanPresent("org.springframework.jms.core.JmsTemplate");
+    }
+
+    /**
+     * The WebSockets panel is available when a WebSocket stack is present <em>and</em> the application
+     * actually declares an endpoint: the panel describes the application's own endpoints, so an empty
+     * topology means there is nothing to show rather than a degraded panel.
+     */
+    private boolean webSocketsAvailable() {
+        // Availability only, never a full report: the manifest is fetched on every page load and route
+        // change, and assembling the report would scan handler mappings and copy the activity buffer.
+        return webSocketService().map(WebSocketService::isAvailable).orElse(false);
+    }
+
+    private String webSocketsUnavailableReason() {
+        if (webSocketService().isEmpty()) {
+            return "No WebSocket support is on the classpath. Add spring-boot-starter-websocket "
+                    + "(Spring MVC) or a reactive WebSocketHandler mapping (WebFlux).";
+        }
+        return "No WebSocket endpoint is declared by this application";
+    }
+
+    private java.util.Optional<WebSocketService> webSocketService() {
+        try {
+            return applicationContext.getBeansOfType(WebSocketService.class, false, false).values().stream()
+                    .findFirst();
+        } catch (RuntimeException ex) {
+            return java.util.Optional.empty();
+        }
+    }
+
+    private String jmsUnavailableReason() {
+        if (nativeImageDetected()) {
+            return "JMS capture is not available when running as a GraalVM native image";
+        }
+        return "No JmsTemplate bean is available";
+    }
+
+    private boolean beanPresent(String className) {
+        try {
+            Class<?> type = ClassUtils.forName(className, getClass().getClassLoader());
+            return beanPresent(type);
+        } catch (ClassNotFoundException ex) {
+            return false;
+        }
+    }
+
+    private boolean beanPresentExcluding(String className, String excludedBeanName) {
+        try {
+            Class<?> type = ClassUtils.forName(className, getClass().getClassLoader());
+            return Arrays.stream(applicationContext.getBeanNamesForType(type, true, false))
+                    .anyMatch(beanName -> !excludedBeanName.equals(beanName));
+        } catch (ClassNotFoundException ex) {
+            return false;
+        }
+    }
+
+    private boolean hibernateAvailable() {
+        return classPresent("org.hibernate.SessionFactory")
+                && classPresent("jakarta.persistence.EntityManagerFactory")
+                && beanPresent("jakarta.persistence.EntityManagerFactory");
+    }
+
+    private String hibernateUnavailableReason() {
+        if (!classPresent("org.hibernate.SessionFactory")) {
+            return "Hibernate ORM is not on the classpath";
+        }
+        if (!classPresent("jakarta.persistence.EntityManagerFactory")) {
+            return "Jakarta Persistence is not on the classpath";
+        }
+        return "No EntityManagerFactory beans are available";
+    }
+
+    private boolean securityAvailable() {
+        if (isReactive()) {
+            return classPresent("org.springframework.security.web.server.SecurityWebFilterChain")
+                    && beanPresentExcluding(
+                            "org.springframework.security.web.server.SecurityWebFilterChain",
+                            "bootUiReactiveSecurityWebFilterChain");
+        }
+        return classPresent("org.springframework.security.web.FilterChainProxy")
+                && beanPresent("org.springframework.security.web.FilterChainProxy");
+    }
+
+    private String securityUnavailableReason() {
+        if (isReactive()) {
+            if (!classPresent("org.springframework.security.web.server.SecurityWebFilterChain")) {
+                return "Spring Security is not on the classpath";
+            }
+            return "No application SecurityWebFilterChain beans are available";
+        }
+        if (!classPresent("org.springframework.security.web.FilterChainProxy")) {
+            return "Spring Security not on the classpath";
+        }
+        return "No Spring Security filter chains are available";
+    }
+
+    private boolean architectureAvailable() {
+        return !nativeImageDetected()
+                && classPresent("com.tngtech.archunit.core.importer.ClassFileImporter")
+                && AutoConfigurationPackages.has(applicationContext);
+    }
+
+    private String architectureUnavailableReason() {
+        if (nativeImageDetected()) {
+            return "Architecture advisor is not applicable when running as a GraalVM native image";
+        }
+        if (!classPresent("com.tngtech.archunit.core.importer.ClassFileImporter")) {
+            return "ArchUnit is not on the classpath";
+        }
+        return "No application base package was detected";
+    }
+
+    private boolean restApiAvailable() {
+        return !nativeImageDetected()
+                && classPresent("com.tngtech.archunit.core.importer.ClassFileImporter")
+                && AutoConfigurationPackages.has(applicationContext);
+    }
+
+    private String restApiUnavailableReason() {
+        if (nativeImageDetected()) {
+            return "REST API advisor is not applicable when running as a GraalVM native image";
+        }
+        if (!classPresent("com.tngtech.archunit.core.importer.ClassFileImporter")) {
+            return "ArchUnit is not on the classpath";
+        }
+        return "No application base package was detected";
+    }
+
+    private boolean graalvmAvailable() {
+        return !nativeImageDetected()
+                && classPresent("com.tngtech.archunit.core.importer.ClassFileImporter")
+                && AutoConfigurationPackages.has(applicationContext);
+    }
+
+    private String graalvmUnavailableReason() {
+        if (nativeImageDetected()) {
+            return "GraalVM readiness advisor is not applicable when already running as a native image";
+        }
+        if (!classPresent("com.tngtech.archunit.core.importer.ClassFileImporter")) {
+            return "ArchUnit is not on the classpath";
+        }
+        return "No application base package was detected";
+    }
+
+    private boolean cracAvailable() {
+        return !nativeImageDetected();
+    }
+
+    private String cracUnavailableReason() {
+        return "CRaC is not applicable when running as a GraalVM native image";
+    }
+
+    private String aiUnavailableReason() {
+        if (!properties.getTelemetry().isEnabled()) {
+            return "Telemetry receiver is disabled";
+        }
+        return "Spring AI or LangChain4j is not on the classpath";
+    }
+
+    private boolean cliSessionPanelAvailable(BootUiProperties.Copilot settings) {
+        if (settings.getEnabled() == BootUiProperties.Mode.OFF) {
+            return false;
+        }
+        java.nio.file.Path dir = AgentSessionStore.resolveDir(settings);
+        return java.nio.file.Files.isDirectory(dir);
+    }
+
+    private String cliSessionUnavailableReason(BootUiProperties.Copilot settings) {
+        if (settings.getEnabled() == BootUiProperties.Mode.OFF) {
+            return settings.getPanelTitle() + " panel is disabled via configuration";
+        }
+        return settings.getSessionSourceName() + " session directory not found at "
+                + AgentSessionStore.resolveDir(settings);
+    }
+
+    boolean nativeImageDetected() {
+        return NativeDetector.inNativeImage();
+    }
+
+    private record Availability(boolean available, String unavailableReason) {}
+}

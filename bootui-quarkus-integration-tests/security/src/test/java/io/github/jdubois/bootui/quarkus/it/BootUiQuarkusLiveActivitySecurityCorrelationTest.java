@@ -62,6 +62,20 @@ class BootUiQuarkusLiveActivitySecurityCorrelationTest {
                 .as("Part A: an authenticated request's captured exchange must carry the real principal")
                 .isEqualTo("admin");
 
+        // BootUI's own request id (docs/PLAN-v2.md §5.1) is stamped on the exchange and on the security event the
+        // request produced, so the two correlate without any tracing.
+        String secureRequestId = secureExchange.path("requestId").asText(null);
+        assertThat(secureRequestId)
+                .as("the /secure exchange carries a request id")
+                .isNotBlank();
+        boolean stamped = false;
+        for (JsonNode event : probe().get("/bootui/api/security-logs").json().path("events")) {
+            stamped = stamped || secureRequestId.equals(event.path("requestId").asText(null));
+        }
+        assertThat(stamped)
+                .as("a security event /secure produced carries its request id")
+                .isTrue();
+
         // Part B: the Live Activity feed must produce a standalone SECURITY entry, nested by trace id
         // under the REQUEST entry, which must also carry the correlated securedPrincipal.
         Response activity = probe().get("/bootui/api/activity");
@@ -95,8 +109,13 @@ class BootUiQuarkusLiveActivitySecurityCorrelationTest {
                 .as("the SECURITY entry must nest under its owning request")
                 .isEqualTo(requestId);
 
+        // The default feed reads the runtime journal and lists it as its one source; the panel buffers list theirs.
+        Response buffers = probe().get("/bootui/api/activity?source=buffers");
+        assertThat(buffers.status())
+                .as("GET /bootui/api/activity?source=buffers status")
+                .isEqualTo(200);
         boolean securitySourceListed = false;
-        for (JsonNode source : activity.json().path("sources")) {
+        for (JsonNode source : buffers.json().path("sources")) {
             securitySourceListed = securitySourceListed || "security".equals(source.asText());
         }
         assertThat(securitySourceListed)

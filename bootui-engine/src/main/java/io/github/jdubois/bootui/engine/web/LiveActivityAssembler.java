@@ -17,9 +17,11 @@ import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorde
 import io.github.jdubois.bootui.engine.jms.JmsActivityEntries;
 import io.github.jdubois.bootui.engine.jms.JmsActivityRecorder;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityEntries;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
 import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.CapturedMessage;
 import io.github.jdubois.bootui.engine.rabbit.RabbitActivityEntries;
 import io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder;
+import io.github.jdubois.bootui.engine.restclienttrace.RestClientAuthority;
 import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
 import io.github.jdubois.bootui.engine.sqltrace.SqlTraceGrouping;
 import io.github.jdubois.bootui.engine.support.BlankStrings;
@@ -30,10 +32,12 @@ import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Framework-neutral assembly of the Live Activity merged stream + KPI summary from already-masked source
@@ -86,11 +90,10 @@ import java.util.Map;
  * {@code EXCEPTION} child. {@code scheduledTaskFailureCount} counts failed runs currently retained
  * regardless of correlation.</p>
  *
- * <p><strong>Kafka produce/consume outcomes (the {@code MESSAGING} entry type) render top-level, with no
- * request-parent correlation attempted</strong>, unlike SQL/exceptions/security/cache above: BootUI has no
- * trace id available on the producer/consumer thread today, so every {@link KafkaActivityEntries#toEntry}
- * mapping is flat by design (see {@code docs/PLAN.md} §3.20 for the nesting this can grow into once
- * messaging spans carry a correlation id).</p>
+ * <p><strong>Kafka, RabbitMQ, and JMS messages (the {@code MESSAGING} entry type) correlate by BootUI's own ids
+ * only</strong> ({@code docs/PLAN-v2.md} §5.1): a consumed message is an execution of its own, so the signals its
+ * listener produced nest under it by execution id, and an outgoing message nests under the request, scheduled run,
+ * or consumed message that sent it. A message carrying neither id stays top-level.</p>
  *
  * <p><strong>Outbound REST client calls (the {@code REST_CLIENT} entry type / {@code restCallErrorRatePercent}
  * and {@code restCallP95LatencyMs} KPIs) follow that same trace-id-only correlation rule</strong>: the
@@ -345,9 +348,46 @@ public final class LiveActivityAssembler {
         // than one request so an ambiguous (reused) trace never nests a child under the wrong request.
         TraceCorrelationIndex traceIndex = TraceCorrelationIndex.of(exchanges);
 
+        // Requests stamped with BootUI's own request id (docs/PLAN-v2.md §5.1) use it as their entry id, so a
+        // child carrying that id nests under it exactly, with or without tracing, and before any trace-id match.
+        Set<String> stampedRequestIds = new HashSet<>();
+        for (HttpExchangeDto exchange : exchanges) {
+            String stamped = BlankStrings.blankToNull(exchange.requestId());
+            if (stamped != null && stamped.equals(exchange.id())) {
+                stampedRequestIds.add(stamped);
+            }
+        }
+
         // One anchor per captured scheduled-task execution, used as the exception-correlation fallback
         // tier below when no HTTP request claims the exception (see matchScheduledTaskParent).
         List<ScheduledTaskAnchor> scheduledTaskAnchors = buildScheduledTaskAnchors(scheduled);
+
+        // Scheduled runs stamped with BootUI's execution id (docs/PLAN-v2.md §5.1): a child carrying that id nests
+        // under
+        // the run exactly, after the request-id tier and before any trace-id match.
+        Map<String, String> executionEntryById = new HashMap<>();
+        for (ScheduledTaskRunStore.Run run : scheduled) {
+            String executionId = BlankStrings.blankToNull(run.executionId());
+            if (executionId != null) {
+                executionEntryById.putIfAbsent(executionId, scheduledEntryId(run));
+            }
+        }
+        // A consumed message is an execution of its own, anchoring the signals its listener produced.
+        for (CapturedMessage message : kafka) {
+            if (message.direction() == KafkaActivityRecorder.Direction.CONSUME) {
+                putExecution(executionEntryById, message.executionId(), KafkaActivityEntries.entryId(message));
+            }
+        }
+        for (JmsActivityRecorder.CapturedMessage message : jms) {
+            if (message.direction() == JmsActivityRecorder.Direction.CONSUME) {
+                putExecution(executionEntryById, message.executionId(), JmsActivityEntries.entryId(message));
+            }
+        }
+        for (RabbitActivityRecorder.CapturedMessage message : rabbit) {
+            if (message.direction() == RabbitActivityRecorder.Direction.CONSUME) {
+                putExecution(executionEntryById, message.executionId(), RabbitActivityEntries.entryId(message));
+            }
+        }
 
         // Correlate security events to their owning request BEFORE building REQUEST entries (an immutable
         // record can't be patched after construction), so a uniquely-matched event's principal can be
@@ -357,7 +397,7 @@ public final class LiveActivityAssembler {
         // unauthenticated request.
         Map<String, String> securedPrincipalByRequestId = new HashMap<>();
         for (SecurityLogEventDto event : security) {
-            String requestId = traceIndex.parentRequestId(event.traceId());
+            String requestId = parentRequestId(stampedRequestIds, traceIndex, event.requestId(), event.traceId());
             String principal = BlankStrings.blankToNull(event.principal());
             if (requestId != null && principal != null) {
                 securedPrincipalByRequestId.putIfAbsent(requestId, principal);
@@ -370,7 +410,7 @@ public final class LiveActivityAssembler {
         // request.
         Map<String, List<SqlTraceEntryDto>> sqlByRequestId = new HashMap<>();
         for (SqlTraceEntryDto entry : sql) {
-            String requestId = traceIndex.parentRequestId(entry.traceId());
+            String requestId = parentRequestId(stampedRequestIds, traceIndex, entry.requestId(), entry.traceId());
             if (requestId != null) {
                 sqlByRequestId
                         .computeIfAbsent(requestId, id -> new ArrayList<>())
@@ -415,12 +455,26 @@ public final class LiveActivityAssembler {
             if (slowestQueryMicros == null || s.durationMicros() > slowestQueryMicros) {
                 slowestQueryMicros = s.durationMicros();
             }
-            entries.add(toSqlEntry(s, traceIndex.parentRequestId(s.traceId())));
+            entries.add(toSqlEntry(
+                    s,
+                    parentOf(
+                            stampedRequestIds,
+                            executionEntryById,
+                            traceIndex,
+                            s.requestId(),
+                            s.executionId(),
+                            s.traceId())));
         }
         Long slowestQuery = slowestQueryMicros == null ? null : Math.round(slowestQueryMicros / 1_000.0);
 
         for (ExceptionGroupDto g : exceptions) {
-            String parentId = traceIndex.parentRequestId(g.lastTraceId());
+            String parentId = parentOf(
+                    stampedRequestIds,
+                    executionEntryById,
+                    traceIndex,
+                    g.lastRequestId(),
+                    g.lastExecutionId(),
+                    g.lastTraceId());
             if (parentId == null) {
                 // No owning HTTP request: fall back to attributing the exception to the background
                 // @Scheduled execution that produced it (serving-thread + time-window join — the same
@@ -432,11 +486,13 @@ public final class LiveActivityAssembler {
         }
 
         for (SecurityLogEventDto event : security) {
-            entries.add(toSecurityEntry(event, traceIndex.parentRequestId(event.traceId())));
+            entries.add(toSecurityEntry(
+                    event, parentRequestId(stampedRequestIds, traceIndex, event.requestId(), event.traceId())));
         }
 
         for (CacheActivityEvent event : cache) {
-            entries.add(toCacheEntry(event, traceIndex.parentRequestId(event.traceId())));
+            entries.add(toCacheEntry(
+                    event, parentRequestId(stampedRequestIds, traceIndex, event.requestId(), event.traceId())));
         }
 
         for (ScheduledTaskRunStore.Run run : scheduled) {
@@ -444,27 +500,52 @@ public final class LiveActivityAssembler {
         }
 
         for (CapturedMessage message : kafka) {
-            entries.add(KafkaActivityEntries.toEntry(message));
+            boolean sent = message.direction() == KafkaActivityRecorder.Direction.PRODUCE;
+            entries.add(KafkaActivityEntries.toEntry(
+                    message,
+                    sent
+                            ? ownerOf(stampedRequestIds, executionEntryById, message.requestId(), message.executionId())
+                            : null));
         }
 
         for (JmsActivityRecorder.CapturedMessage message : jms) {
-            entries.add(JmsActivityEntries.toEntry(message));
+            boolean sent = message.direction() == JmsActivityRecorder.Direction.PRODUCE;
+            entries.add(JmsActivityEntries.toEntry(
+                    message,
+                    sent
+                            ? ownerOf(stampedRequestIds, executionEntryById, message.requestId(), message.executionId())
+                            : null));
         }
 
         for (RabbitActivityRecorder.CapturedMessage message : rabbit) {
-            entries.add(RabbitActivityEntries.toEntry(message));
+            boolean sent = message.direction() == RabbitActivityRecorder.Direction.PUBLISH;
+            entries.add(RabbitActivityEntries.toEntry(
+                    message,
+                    sent
+                            ? ownerOf(stampedRequestIds, executionEntryById, message.requestId(), message.executionId())
+                            : null));
         }
 
         for (EmailMessageDto message : emails) {
-            entries.add(toEmailEntry(message, traceIndex.parentRequestId(message.traceId())));
+            entries.add(toEmailEntry(
+                    message, parentRequestId(stampedRequestIds, traceIndex, message.requestId(), message.traceId())));
         }
 
         for (RestClientTraceEntryDto entry : rest) {
-            entries.add(toRestEntry(entry, traceIndex.parentRequestId(entry.traceId())));
+            entries.add(toRestEntry(
+                    entry,
+                    parentOf(
+                            stampedRequestIds,
+                            executionEntryById,
+                            traceIndex,
+                            entry.requestId(),
+                            entry.executionId(),
+                            entry.traceId())));
         }
 
         for (FaultToleranceEventRecorder.CapturedEvent event : faultTolerance) {
-            entries.add(FaultToleranceActivityEntries.toEntry(event, traceIndex.parentRequestId(event.traceId())));
+            entries.add(FaultToleranceActivityEntries.toEntry(
+                    event, parentRequestId(stampedRequestIds, traceIndex, event.requestId(), event.traceId())));
         }
 
         entries.sort((a, b) -> Long.compare(b.timestamp(), a.timestamp()));
@@ -574,6 +655,109 @@ public final class LiveActivityAssembler {
     }
 
     /**
+     * Marks each {@code REQUEST} entry profileable when its exchange carries a trace id or a BootUI request id, the
+     * exact signals {@link ExecutionProfileAssembler} correlates on for an adapter without serving-thread or
+     * time-window tiers (Spring WebFlux and Quarkus). Every other entry is returned unchanged.
+     *
+     * @param report the assembled report
+     * @param exchanges the captured exchanges the report was assembled from
+     */
+    public static LiveActivityReport withExactProfiles(LiveActivityReport report, List<HttpExchangeDto> exchanges) {
+        Set<String> stampedRequestIds = new HashSet<>();
+        for (HttpExchangeDto exchange : exchanges == null ? List.<HttpExchangeDto>of() : exchanges) {
+            String stamped = BlankStrings.blankToNull(exchange.requestId());
+            if (stamped != null && stamped.equals(exchange.id())) {
+                stampedRequestIds.add(stamped);
+            }
+        }
+        List<ActivityEntryDto> entries = new ArrayList<>(report.entries().size());
+        for (ActivityEntryDto entry : report.entries()) {
+            boolean profileable = TYPE_REQUEST.equals(entry.type())
+                    && (BlankStrings.blankToNull(entry.correlationId()) != null
+                            || stampedRequestIds.contains(entry.id()));
+            entries.add(profileable && !entry.profileable() ? profileable(entry) : entry);
+        }
+        return new LiveActivityReport(
+                report.available(), entries, report.typeCounts(), report.kpis(), report.sources(), report.warnings());
+    }
+
+    private static ActivityEntryDto profileable(ActivityEntryDto entry) {
+        return new ActivityEntryDto(
+                entry.id(),
+                entry.type(),
+                entry.timestamp(),
+                entry.severity(),
+                entry.summary(),
+                entry.detail(),
+                entry.durationMs(),
+                entry.correlationId(),
+                entry.method(),
+                entry.path(),
+                entry.status(),
+                entry.thread(),
+                true,
+                entry.parentId(),
+                entry.securedPrincipal(),
+                entry.sqlNPlusOneSuspected(),
+                entry.badges(),
+                entry.exceptionGroupId());
+    }
+
+    private static void putExecution(Map<String, String> byExecutionId, String executionId, String entryId) {
+        String execution = BlankStrings.blankToNull(executionId);
+        if (execution != null) {
+            byExecutionId.putIfAbsent(execution, entryId);
+        }
+    }
+
+    /** The entry that owns a signal by BootUI's ids alone: its request, else its execution, else none. */
+    private static String ownerOf(
+            Set<String> stampedRequestIds,
+            Map<String, String> executionEntryById,
+            String requestId,
+            String executionId) {
+        String stamped = BlankStrings.blankToNull(requestId);
+        if (stamped != null && stampedRequestIds.contains(stamped)) {
+            return stamped;
+        }
+        String execution = BlankStrings.blankToNull(executionId);
+        return execution == null ? null : executionEntryById.get(execution);
+    }
+
+    /**
+     * The entry a child nests under: the request whose BootUI request id it carries, else the scheduled run or
+     * consumed message whose execution id it carries, else the single request sharing its trace id, else none.
+     */
+    private static String parentOf(
+            Set<String> stampedRequestIds,
+            Map<String, String> executionEntryById,
+            TraceCorrelationIndex traceIndex,
+            String requestId,
+            String executionId,
+            String traceId) {
+        String stamped = BlankStrings.blankToNull(requestId);
+        if (stamped != null && stampedRequestIds.contains(stamped)) {
+            return stamped;
+        }
+        String execution = BlankStrings.blankToNull(executionId);
+        String scheduledEntry = execution == null ? null : executionEntryById.get(execution);
+        return scheduledEntry != null ? scheduledEntry : traceIndex.parentRequestId(traceId);
+    }
+
+    /**
+     * The REQUEST entry a child nests under: the request whose BootUI request id it carries, which is exact, else the
+     * single request sharing its trace id, else none.
+     */
+    private static String parentRequestId(
+            Set<String> stampedRequestIds, TraceCorrelationIndex traceIndex, String requestId, String traceId) {
+        String stamped = BlankStrings.blankToNull(requestId);
+        if (stamped != null && stampedRequestIds.contains(stamped)) {
+            return stamped;
+        }
+        return traceIndex.parentRequestId(traceId);
+    }
+
+    /**
      * Build a {@code CACHE} entry for a captured cache access. Mirrors the Spring servlet
      * {@code LiveActivityService.toCacheEntry} mapping: a {@code MISS} is a {@code WARN} (worth a glance),
      * every other operation ({@code HIT}/{@code PUT}/{@code EVICT}/{@code CLEAR}) is {@code OK}. Only a
@@ -616,7 +800,7 @@ public final class LiveActivityAssembler {
         } else {
             severity = SEVERITY_OK;
         }
-        String host = entry.host() == null ? "" : entry.host();
+        String host = RestClientAuthority.of(entry.host(), entry.uri());
         String path = entry.path() == null ? "" : entry.path();
         String outcome = entry.success() ? String.valueOf(entry.status()) : "failed";
         String summary = (entry.method() == null ? "" : entry.method() + " ") + host + path + " → " + outcome;
@@ -693,7 +877,9 @@ public final class LiveActivityAssembler {
                 false,
                 parentId,
                 null,
-                false);
+                false,
+                List.of(),
+                group.id());
     }
 
     /**
@@ -763,6 +949,10 @@ public final class LiveActivityAssembler {
      * into the shared exception log buffer — it additionally nests as a full {@code EXCEPTION} child entry
      * under this one, exactly like a request's failure does today; see {@link #matchScheduledTaskParent}.
      */
+    private static String scheduledEntryId(ScheduledTaskRunStore.Run run) {
+        return "sched-" + run.sequence();
+    }
+
     private ActivityEntryDto toScheduledTaskEntry(ScheduledTaskRunStore.Run run) {
         String severity;
         if (!run.success()) {
@@ -774,7 +964,7 @@ public final class LiveActivityAssembler {
         }
         String detail = run.success() ? null : run.exceptionClassName() + messageSuffix(run.message());
         return new ActivityEntryDto(
-                "sched-" + run.sequence(),
+                scheduledEntryId(run),
                 TYPE_SCHEDULED,
                 run.startTimestamp(),
                 severity,

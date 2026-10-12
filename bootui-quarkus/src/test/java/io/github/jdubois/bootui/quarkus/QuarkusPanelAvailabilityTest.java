@@ -62,6 +62,9 @@ class QuarkusPanelAvailabilityTest {
                     .doesNotContain("Not yet available")
                     .containsIgnoringCase("Not applicable on Quarkus");
         }
+        assertThat(panels.get(BootUiPanels.HTTP_SESSIONS).unavailableReason())
+                .contains("embedded Tomcat's session managers", "Spring MVC")
+                .doesNotContain("Spring Session");
     }
 
     @Test
@@ -166,6 +169,17 @@ class QuarkusPanelAvailabilityTest {
                 .as("Vulnerabilities is lit up on Quarkus (local inventory + user-initiated OSV scan)")
                 .isTrue();
         assertThat(vulnerabilities.unavailableReason()).isNull();
+    }
+
+    @Test
+    void runtimeInsightsFollowsTheRuntimeJournal() {
+        assertThat(manifestById().get(BootUiPanels.RUNTIME_INSIGHTS).available())
+                .isTrue();
+
+        PanelDto disabled = manifestById(new StubConfig(Map.of("bootui.runtime-journal.enabled", "false")))
+                .get(BootUiPanels.RUNTIME_INSIGHTS);
+        assertThat(disabled.available()).isFalse();
+        assertThat(disabled.unavailableReason()).contains("bootui.runtime-journal.enabled=true");
     }
 
     @Test

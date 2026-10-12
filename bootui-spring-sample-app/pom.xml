@@ -17,6 +17,7 @@
     <properties>
         <maven.deploy.skip>true</maven.deploy.skip>
         <spring-ai.version>2.0.1</spring-ai.version>
+        <commons-exec.version>1.6.0</commons-exec.version>
     </properties>
 
     <dependencyManagement>
@@ -36,6 +37,11 @@
             <groupId>com.julien-dubois.bootui</groupId>
             <artifactId>bootui-spring-boot-starter</artifactId>
         </dependency>
+        <!-- The application chooses its web stack; the BootUI starter brings none. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -47,6 +53,15 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-websocket</artifactId>
+        </dependency>
+        <!--
+            Code Inventory's seed (docs/PLAN-v2.md §5.15): a declared dependency nothing in the sample, Spring, or BootUI
+            ever loads a class from, so the Dependencies tab lists it as not loaded in this run. Do not use it.
+        -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-exec</artifactId>
+            <version>${commons-exec.version}</version>
         </dependency>
         <!--
             Fault tolerance libraries the BootUI Fault Tolerance panel reads. Neither is managed by the Spring Boot
@@ -190,6 +205,11 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-junit-jupiter</artifactId>
             <scope>test</scope>
@@ -202,6 +222,17 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            The BootUI agent, for SpringAgentScenarioIT, which starts the sample in its own JVM with -javaagent and this
+            jar's path (${com.julien-dubois.bootui:bootui-agent:jar}). Kept off every test class path: an agent jar is
+            only ever loaded by -javaagent.
+        -->
+        <dependency>
+            <groupId>com.julien-dubois.bootui</groupId>
+            <artifactId>bootui-agent</artifactId>
+            <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
         <!-- The packaged-reader test deliberately supplies an older host ASM than ArchUnit's embedded copy. -->
@@ -218,6 +249,42 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <!--
+                        The agents the BootUI agent's companion browser legs attach beside it (PLAN-v2 §5.13, M5-12):
+                        e2e/agent-config.js reads them from target/agent-companions, so no workflow downloads a jar.
+                    -->
+                    <execution>
+                        <id>agent-companions</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/agent-companions</outputDirectory>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>io.opentelemetry.javaagent</groupId>
+                                    <artifactId>opentelemetry-javaagent</artifactId>
+                                    <version>${opentelemetry-javaagent.version}</version>
+                                    <destFileName>opentelemetry-javaagent.jar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>org.jacoco</groupId>
+                                    <artifactId>org.jacoco.agent</artifactId>
+                                    <version>${jacoco-agent.version}</version>
+                                    <classifier>runtime</classifier>
+                                    <destFileName>jacocoagent.jar</destFileName>
+                                </artifactItem>
+                            </artifactItems>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <!-- The agent's heap walk, for SpringAgentDevToolsRestartIT. -->
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
             </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
@@ -243,6 +310,9 @@
                 <configuration>
                     <!-- A secret-named system property the API conformance suite asserts is masked in JVM input arguments. -->
                     <argLine>@{argLine} -javaagent:${org.mockito:mockito-core:jar} -Dbootui.conformance.jvm-password=conformance-raw-jvm-secret</argLine>
+                    <classpathDependencyExcludes>
+                        <classpathDependencyExclude>com.julien-dubois.bootui:bootui-agent</classpathDependencyExclude>
+                    </classpathDependencyExcludes>
                 </configuration>
             </plugin>
             <plugin>
@@ -258,10 +328,22 @@
                     </execution>
                 </executions>
                 <configuration>
+                    <!-- Failsafe 3.6 no longer binds -DskipTests on its own; keep it skipping these ITs too. -->
+                    <skipITs>${skipTests}</skipITs>
+                    <!-- Same as the root Surefire configuration: test output goes to target/failsafe-reports. -->
+                    <redirectTestOutputToFile>true</redirectTestOutputToFile>
+                    <!-- The classes, not the repackaged jar, whose BOOT-INF layout a plain class path cannot read. -->
+                    <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                    <!-- SpringAgentDevToolsRestartIT walks a heap dump of eleven runs of the sample in this JVM. -->
+                    <argLine>@{argLine} -Xmx2g</argLine>
                     <systemPropertyVariables>
                         <sample.jar>${project.build.directory}/${project.build.finalName}.jar</sample.jar>
                         <host.asm.jar>${org.ow2.asm:asm:jar}</host.asm.jar>
+                        <bootui.agent.jar>${com.julien-dubois.bootui:bootui-agent:jar}</bootui.agent.jar>
                     </systemPropertyVariables>
+                    <classpathDependencyExcludes>
+                        <classpathDependencyExclude>com.julien-dubois.bootui:bootui-agent</classpathDependencyExclude>
+                    </classpathDependencyExcludes>
                 </configuration>
             </plugin>
         </plugins>

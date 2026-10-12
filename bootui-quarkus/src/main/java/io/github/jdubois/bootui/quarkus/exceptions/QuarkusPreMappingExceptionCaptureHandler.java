@@ -1,8 +1,9 @@
 package io.github.jdubois.bootui.quarkus.exceptions;
 
+import io.github.jdubois.bootui.engine.correlation.TraceIdSource;
 import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
 import io.github.jdubois.bootui.quarkus.QuarkusBootUiPaths;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.quarkus.correlation.QuarkusRequestCorrelation;
 import io.quarkus.arc.Arc;
 import io.quarkus.arc.ArcContainer;
 import io.quarkus.arc.InstanceHandle;
@@ -40,7 +41,7 @@ import org.jboss.resteasy.reactive.server.spi.ServerRestHandler;
  * <p>Built at <strong>build time</strong> as a plain object (no CDI annotations, no constructor
  * dependencies) — mirroring {@code AttachExceptionHandler} exactly — because {@code
  * PreExceptionMapperHandlerBuildItem} embeds the handler instance directly rather than resolving one through
- * CDI. Its CDI-backed dependencies ({@link ExceptionStore}, the optional {@link TraceIdProvider}, and {@code
+ * CDI. Its CDI-backed dependencies ({@link ExceptionStore}, the optional {@link TraceIdSource}, and {@code
  * CurrentVertxRequest}) are therefore resolved lazily, per invocation, via {@link Arc#container()} — cheap for
  * {@code @Singleton}/request-scoped beans and safe even before the container is fully up (guarded to a silent
  * no-op). The live MicroProfile {@code Config} that decides which paths are BootUI's own is read through
@@ -67,7 +68,14 @@ public final class QuarkusPreMappingExceptionCaptureHandler implements ServerRes
                 return;
             }
             RoutingContext rc = currentRoutingContext(container);
-            String path = rc == null ? null : rc.normalizedPath();
+            if (rc == null) {
+                rc = routingContextOf(requestContext);
+            }
+            // Before routing reaches a resource on the event loop, such as a 406 from content negotiation, no
+            // request scope is active yet: the request line attached to the request's duplicated context still is.
+            QuarkusRequestCorrelation.RequestLine line =
+                    rc == null ? QuarkusRequestCorrelation.currentRequestLine() : null;
+            String path = rc != null ? rc.normalizedPath() : line == null ? null : line.path();
             if (QuarkusBootUiPaths.isBootUiRequest(currentConfig(), path)) {
                 return; // never capture BootUI's own traffic
             }
@@ -75,7 +83,7 @@ public final class QuarkusPreMappingExceptionCaptureHandler implements ServerRes
             if (!storeHandle.isAvailable()) {
                 return;
             }
-            String method = rc == null ? null : rc.request().method().name();
+            String method = rc != null ? rc.request().method().name() : line == null ? null : line.method();
             String handler = QuarkusResourceHandlers.describe(requestContext.getResteasyReactiveResourceInfo());
             storeHandle
                     .get()
@@ -106,6 +114,18 @@ public final class QuarkusPreMappingExceptionCaptureHandler implements ServerRes
     }
 
     /**
+     * The routing context the RESTEasy Reactive request runs on, read from the request itself: on the event loop, a
+     * failure raised before a resource is matched has no active request scope for {@code CurrentVertxRequest}.
+     */
+    private static RoutingContext routingContextOf(ResteasyReactiveRequestContext requestContext) {
+        try {
+            return requestContext.serverRequest().unwrap(RoutingContext.class);
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    /**
      * The live MicroProfile {@link Config}, or {@code null} when it cannot be resolved. Read through
      * {@link ConfigProvider} rather than an Arc lookup because the config bean is {@code @Dependent}: a
      * programmatic lookup would hand back a handle this handler has no lifecycle hook to close, while
@@ -122,12 +142,12 @@ public final class QuarkusPreMappingExceptionCaptureHandler implements ServerRes
     }
 
     /**
-     * The active span's trace id, or {@code null} when OpenTelemetry is absent (no {@link TraceIdProvider}
+     * The active span's trace id, or {@code null} when OpenTelemetry is absent (no {@link TraceIdSource}
      * bean) or no span is in context. Fully guarded so capture never disrupts request handling.
      */
     private static String currentTraceId(ArcContainer container) {
         try {
-            InstanceHandle<TraceIdProvider> handle = container.instance(TraceIdProvider.class);
+            InstanceHandle<TraceIdSource> handle = container.instance(TraceIdSource.class);
             return handle.isAvailable() ? handle.get().currentTraceId() : null;
         } catch (RuntimeException ex) {
             return null;

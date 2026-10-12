@@ -10,15 +10,24 @@ running console is always the authoritative answer for your own application.
 
 Spring WebFlux (reactive, Netty / `DispatcherHandler`) Spring Boot 4 applications are a first-class BootUI target,
 alongside the Spring MVC (servlet) and Quarkus adapters. WebFlux reuses the same shared engine
-(`bootui-engine` / `bootui-core`), the same Vue UI, and the same JSON contract (`/bootui/api/**` by default). Panels
+(`bootui-engine`), the same Vue UI, and the same JSON contract (`/bootui/api/**` by default). Panels
 reach parity wherever a reactive analog genuinely exists, and report an honest *not yet ported* or *not applicable*
 status where they don't.
 
 ## 2. Current status
 
-The WebFlux adapter serves the large majority of the panel surface — the same 60-panel manifest the servlet adapter
-reports, minus the one panel (**HTTP Sessions**, §6.7) that stays unavailable for stack reasons. Every available
+The WebFlux adapter serves the large majority of the panel surface — the same 65-panel manifest the servlet adapter
+reports, including the action-capable **Java Agent** panel with its runtime sensor switches, the view-only
+**Side Effects** panel whose sensor controls use the Java Agent policy,
+the view-only **Code Inventory** panel, and **Code Paths** with its method probes, minus the one panel
+(**HTTP Sessions**, §6.7) that stays unavailable for stack reasons. Every available
 action-capable panel behaves identically to the servlet adapter, behind the same shared `LocalhostGuard` write floor.
+
+**R2DBC statements are not recorded.** BootUI records SQL through a traced JDBC `DataSource`, so an application
+that reaches its database through R2DBC shows no statements, connections, or SQL timings in the runtime journal: the
+SQL Trace panel stays empty, Runtime Insights names this first among its limitations, and its checks that read SQL
+report `UNAVAILABLE` rather than finding nothing. An application with both a traced JDBC pool and R2DBC sees only its
+JDBC statements counted. R2DBC capture is planned after 2.0, with the other non-JDBC data stores.
 
 **MySQL uses the same shared controller/report on MVC and WebFlux** when the application has a supported **JDBC**
 datasource. Oracle MySQL 8.4 LTS and 9.7 LTS are the tested lines, with 8.4.6 and 9.7.2 live coverage using
@@ -32,10 +41,12 @@ Connector/J is read but unsupported. See [MySQL](features/database.md#mysql).
 | Loggers              | set level                            |
 | HTTP Probe           | probe                                |
 | Cache                | clear                                |
+| Java Agent           | enable / disable runtime sensors     |
 | Hibernate Statistics | runtime enable                       |
 | Flyway               | migrate / clean                      |
 | Liquibase            | update                               |
 | Heap Dump            | capture / analyze / delete / download |
+| Live Memory          | free BootUI memory                   |
 | Threads              | download                             |
 | Traces               | clear                                |
 | SQL Trace            | toggle recording / clear             |
@@ -60,10 +71,10 @@ turn, the sidebar tooltip and the panel's own alert banner (§6.7). `docs/featur
 
 ## 3. Why this is feasible — evidence from the current codebase
 
-- `bootui-core` / `bootui-engine` / `bootui-ui` were already 100% framework-neutral before this work started. They
-  needed **zero changes** beyond adding one new platform constant (`PanelsReport.PLATFORM_SPRING_BOOT_REACTIVE`). Every
-  advisor engine, DTO, and Vue view is reused byte-for-byte from the servlet adapter — the same reuse story the Quarkus
-  adapter proved out.
+- The DTOs (then `bootui-core`, now the engine's core package), `bootui-engine`, and `bootui-ui` were already 100%
+  framework-neutral before this work started. They needed **zero changes** beyond adding one new platform constant
+  (`PanelsReport.PLATFORM_SPRING_BOOT_REACTIVE`). Every advisor engine, DTO, and Vue view is reused byte-for-byte from
+  the servlet adapter — the same reuse story the Quarkus adapter proved out.
 - Most of the servlet adapter's `@RestController`s use the shared `org.springframework.web.bind.annotation` model,
   return plain DTO records, and never reference `HttpServletRequest`/`HttpServletResponse` directly. `DispatcherHandler`
   (WebFlux's dispatcher) invokes them exactly as `DispatcherServlet` does, unmodified.
@@ -75,18 +86,24 @@ turn, the sidebar tooltip and the panel's own alert banner (§6.7). `docs/featur
 ## 4. Module topology
 
 ```text
-bootui-core / bootui-engine / bootui-ui        Unchanged — reused by all three adapters
-bootui-spring-autoconfigure                    Shared Spring module: servlet AND reactive bindings both live here
+bootui-engine / bootui-ui                      Unchanged — reused by all three adapters
+bootui-spring-boot-starter                     The one Spring module and starter: servlet AND reactive bindings both live here
   ...autoconfigure.web                         Servlet @RestControllers (framework-neutral; reused unmodified by both)
   ...autoconfigure.reactive                    Reactive-only bindings: WebFilters, the two new @Configuration classes,
                                                 and the handful of Reactive* controllers that needed a genuine rewrite
-bootui-spring-boot-starter                     Drop-in servlet starter (Tomcat + MVC) — unchanged
-bootui-spring-boot-starter-reactive            New drop-in reactive starter (Netty + WebFlux), this effort's Phase 0
-bootui-spring-webflux-sample-app               New reference WebFlux app for demos + conformance + e2e (Phase 5)
+bootui-spring-webflux-sample-app               Reference WebFlux app for demos + conformance + e2e (Phase 5)
 ```
 
+Until 2.0, the auto-configuration was its own `bootui-spring-autoconfigure` module, with a servlet starter that pulled in
+`spring-boot-starter-web` and a `bootui-spring-boot-starter-reactive` that pulled in `spring-boot-starter-webflux`.
+BootUI 2.0 publishes one `bootui-spring-boot-starter` that pulls in neither: the application's own web starter decides,
+so a WebFlux application can no longer become a servlet one by adding BootUI. Both stacks are `provided` in the
+starter, and a `no-web-stack` enforcer rule fails its build if any servlet or reactive web-server artifact reaches its
+compile or runtime dependencies. `WebFluxApplicationTypeIntegrationTest` and the release consumer smoke tests pin a
+WebFlux application to `REACTIVE` on Netty with no Servlet API or Tomcat on its classpath.
+
 `BootUiAutoConfiguration` (servlet) and `BootUiReactiveAutoConfiguration` (reactive) are two separate autoconfigurations
-in the same `bootui-spring-autoconfigure` module — not two modules — because nearly all of the underlying
+in the same module — not two modules — because nearly all of the underlying
 `@RestController`s, safety decisions, and engine wiring are identical. Only the request/response binding and the
 streaming primitive genuinely differ per stack. Spring Boot's `WebApplicationType` deduction makes the two mutually
 exclusive: a running application is either `SERVLET` or `REACTIVE`, never both, so exactly one activates.
@@ -155,18 +172,77 @@ WebFlux blocking-execution policy, and requests rejected by the preceding safety
 | `Not yet ported` | Deliberately deferred, no reactive implementation wired yet                      |
 | `Not applicable` | No faithful reactive analog exists for this panel's concept                      |
 
-### 6.1 Ported as-is (44 panels)
+### 6.1 Ported as-is (49 panels)
 
 Bulk-imported from the servlet adapter's `@RestController`s with no code changes at all — confirming these controllers
 were already framework-neutral in practice, not just in the engine underneath them.
 
 | Panels ported unchanged |
 | ----------------------- |
-| Overview, GitHub, Beans, Conditions, Configuration, Mappings, Health, Loggers, Startup Timeline, Spring Data |
+| Scorecard, GitHub, Beans, Conditions, Configuration, Mappings[^mappings-reactive], Health, Loggers, Startup Timeline, Spring Data |
 | Database, Hibernate, Hibernate Statistics, PostgreSQL, MySQL, Flyway, Liquibase, Database Connection Pools, Cache, Dev Services |
 | Vulnerabilities, Scheduled Tasks, Fault Tolerance, HTTP Probe, Pentesting, Heap Dump, Architecture, REST API advisor |
 | Profile Diff, Spring advisor[^spring-advisor-reactive], Live Memory, JVM Tuning, Metrics, Spring DevTools, Traces, AI Framework |
-| GraalVM, CRaC, Threads, Memory, Email, Kafka, RabbitMQ, JMS |
+| GraalVM, CRaC, Threads, Memory, Email, Kafka, RabbitMQ, JMS, Runtime Insights[^runtime-insights-reactive], Java Agent |
+| Code Inventory[^code-inventory-reactive], Code Paths[^code-paths-reactive], Side Effects[^side-effects-reactive] |
+
+[^mappings-reactive]: The Actuator-backed provider reads WebFlux's `dispatcherHandlers` descriptions as well as Spring
+    MVC's `dispatcherServlets`, each only when its web module is present: annotated controllers by their conditions,
+    and functional routes by a predicate naming one method and one path, such as `(GET && /api/items/{id})`. Other
+    functional predicates are listed whole.
+
+[^code-inventory-reactive]: The shared `CodeInventoryController` and engine service: available while the BootUI agent's
+    inventory sensor records the run, otherwise unavailable with the Java Agent panel's reason, as on Spring MVC. The
+    scan reads the class files the application context's class loader sees.
+
+[^code-paths-reactive]: The shared `CodePathsController` and engine service: available while the BootUI agent's
+    code-paths sensor records the run. The reactive correlation filter brackets each request's subscription, where
+    WebFlux runs its filters and invokes the handler up to its first asynchronous boundary, as the request's fragment on
+    the subscribing thread, so the tree times the pipeline's assembly, not the work its publisher does later: every
+    WebFlux route is **assembly only**, and `route-time-breakdown` never splits its handler by method. The reactive
+    configuration marks every tree once, when it creates the Code Paths service, so nothing is recorded per request on
+    the event loop, and the subscription sees the thread's correlation exactly as it does without the agent. A
+    WebClient call takes its code-paths stamp where its exchange is subscribed: in a WebFlux pipeline that is after
+    the handler's methods returned, so it is counted as issued outside every instrumented method, or carries no stamp
+    when subscribed on another thread, and shows under no method; Beans at runtime still lists the calls assembly made
+    between beans.
+
+[^side-effects-reactive]: The shared `SideEffectsController` and engine service: available while the BootUI agent is
+    armed for the run and the bridge supports Side Effects. The WebFlux adapter records a process attributed through
+    the request's context when it starts on a thread carrying BootUI's context, captured at the start since the
+    request scope's owner slot is not filled on the schedulers Reactor restores the context on; otherwise the row is
+    attributed under its thread family. The `network` sensor records connects, datagrams, and lookups the same way;
+    a WebClient's connect on a Reactor Netty event loop
+    is unowned and captured by a REST client call at the same time. The `files` and the opt-in `environment` sensors
+    capture the owner when no slot names one, too. The `blocking` sensor records too: the WebFlux
+    adapter registers Reactor Netty's event loops with it from the first request each serves, and, for a WebClient built
+    from Spring Boot's `WebClient.Builder` with REST client tracing on, from the first response each delivers; Reactor's `parallel` and `boundedElastic` threads are never event loops. The opt-in
+    `thread-activity` sensor records too, capturing the owner the same way; a request's end, which it checks
+    for what the request left running, is when its filter chain terminates. Reactor's and Reactor Netty's own threads
+    are a library's. The `resources` sensor, on by default, hears the same request end, whether `thread-activity` is on
+    or not. The opt-in `thread-locals` sensor never scans an event loop: a Reactor schedule hook scans
+    around each task a `boundedElastic` worker (or another scheduler's) runs, owned once Reactor's automatic context
+    propagation makes a request's context current inside it, so it needs `spring.reactor.context-propagation=auto`, the
+    default, and platform threads: with
+    `spring.threads.virtual.enabled` on Java 21 and later, `boundedElastic` runs on virtual threads, never scanned. The
+    nine Side Effects sensor groups all ship in this version. The opt-in `security-sinks` sensor's JDK checks
+    (deserialization without a filter, weak algorithms, trust managers) record on WebFlux as on Spring MVC; its request-value
+    matching holds the query parameters WebFlux already parsed and reads the path variables from the exchange
+    once its handler mapping set them, at the request's first check; it never subscribes to the form data, so form
+    values are not matched on WebFlux. SQL text is not checked with R2DBC, which SQL Trace does not capture; file paths,
+    commands, and WebClient URLs are, on a thread carrying the request's context.
+
+[^runtime-insights-reactive]: The shared `RuntimeInsightsController` reads the same runtime journal. WebFlux marks no
+    handler or response phase, so `route-time-breakdown` names the authentication time Spring Security observed and
+    reports the rest of the time around a request's calls as unattributed, and a route whose requests named nothing at
+    all, neither a recorded call nor authentication time, is insufficient rather than one unattributed span;
+    `lazy-sql-after-handler` is not applicable. BootUI records
+    JDBC, not R2DBC, so in an application without a traced `DataSource` the checks that read SQL report `UNAVAILABLE`
+    with that reason; a reactive transaction is placed in a request only when its pipeline carried the request's
+    context to the thread it began on. With the BootUI agent attached,
+    `work-after-response` applies as on Spring MVC. Reactor's own schedulers already carry BootUI's context when
+    `spring.reactor.context-propagation=auto`, so the agent's executors sensor then skips their `parallel-`,
+    `boundedElastic-`, and `single-` threads; raw executors and `CompletableFuture` are propagated by the agent.
 
 These controllers keep their synchronous servlet-facing signatures. On WebFlux, the centralized
 `ReactiveBootUiHandlerAdapter` dispatches their argument resolution and handler invocation on bounded-elastic threads,
@@ -237,8 +313,8 @@ assets still target a JVM process and Spring's checkpoint lifecycle; they do not
 
 | Panel          | Reactive binding                                                                                          |
 | -------------- | ---------------------------------------------------------------------------------------------------------- |
-| HTTP Exchanges | `ReactiveHttpExchangeRepositoryConfiguration` supplies BootUI's failure-preserving `BootUiHttpExchangeRepository` and `BootUiHttpExchangesWebFilter`, a subclass of Actuator's reactive `HttpExchangesWebFilter`, instead of the servlet filter — same DTO, same UI, same capture semantics, including skipping BootUI's own requests below the WebFlux base path and the shared `bootui.activity.request-slow-threshold-ms`. Route rankings take the WebFlux handler pattern from `HttpExchangeTraceRegistry`, which `ReactiveHttpExchangeTraceFilter` fills only when OpenTelemetry is present, as it is with the reactive starter. The Mappings provider reads servlet mappings only, so without OpenTelemetry WebFlux routes fall back to masked paths, and the rankings state that limitation |
-| MCP Server     | `ReactiveBootUiMcpController` — same `BootUiMcpService`, `McpServerState`, and `McpProtocol` as the servlet `BootUiMcpController`; only the transport differs (`DataBuffer` payload assembly with the same `bootui.mcp.max-payload-bytes` limit, and tool execution offloaded to `Schedulers.boundedElastic()`) |
+| HTTP Exchanges | `ReactiveHttpExchangeRepositoryConfiguration` supplies BootUI's failure-preserving `BootUiHttpExchangeRepository` and `BootUiHttpExchangesWebFilter`, a subclass of Actuator's reactive `HttpExchangesWebFilter`, instead of the servlet filter — same DTO, same UI, same capture semantics, including skipping BootUI's own requests below the WebFlux base path and the shared `bootui.activity.request-slow-threshold-ms`. Route rankings take the WebFlux handler pattern from `HttpExchangeTraceRegistry`, which `ReactiveHttpExchangeTraceFilter` fills only when OpenTelemetry is present, as it is with the BootUI starter. Without OpenTelemetry, a path is matched against the WebFlux routes the Mappings provider reads from Actuator's `dispatcherHandlers` descriptions, as on Spring MVC; a path no declared route matches falls back to a masked path, and the rankings state that limitation |
+| MCP Server     | `ReactiveBootUiMcpController` — same `BootUiMcpService`, `McpServerState`, and `McpProtocol` as the servlet `BootUiMcpController`; only the transport differs (`DataBuffer` payload assembly with the same `bootui.mcp.max-payload-bytes` limit, and tool execution offloaded to `Schedulers.boundedElastic()`); a modern progress call streams a `Flux<ServerSentEvent<String>>` whose cancelled subscription cancels the call |
 | Command Line   | `ReactiveBootUiCliController` — same `CliService` and the same `/bootui/api/cli` contract and statuses as the servlet `BootUiCliController`, with tool invocation offloaded to `Schedulers.boundedElastic()` because BootUI's tools call blocking diagnostics |
 
 ::: details REST API declared error contract needs no reactive binding
@@ -275,7 +351,7 @@ depended on `SseEmitter` (SQL Trace, Log Tail, Security Logs, Exceptions, REST C
 | Transactions  | `ReactiveTransactionsController` over `ReactiveBootUiChangeStream`, feeding the same `TransactionRecorder`. See the fidelity note below. |
 | Log Tail      | `ReactiveLogTailController` — same `LogTailBuffer`/Logback appender, SSE via `ReactiveBootUiChangeStream`.                |
 | Security Logs | `ReactiveSecurityLogsController` over a fallback `InMemoryAuditEventRepository` (Spring's audit-event bus is framework-neutral, so no reactive-specific capture code was needed). |
-| Exceptions    | `ReactiveExceptionsController` + new `ReactiveBootUiExceptionHandler` (a `WebExceptionHandler` at `HIGHEST_PRECEDENCE`, replacing the servlet `HandlerExceptionResolver`); see the fidelity note below. |
+| Exceptions    | `ReactiveExceptionsController` + new `ReactiveBootUiExceptionHandler` (a `WebExceptionHandler` at `HIGHEST_PRECEDENCE`, replacing the servlet `HandlerExceptionResolver`); see the fidelity note below. The **Caught in application code** section (`GET /exceptions/caught`) is shared; a cancelled request, published with status 0 before the error handlers run, keeps its caught exceptions unknown, and a log written on a Reactor thread without a request id counts only on the catching thread. |
 | Copilot       | `ReactiveCopilotController` over the same `AgentSessionStore`, SSE via `ReactiveBootUiChangeStream`.                      |
 | Claude Code   | `ReactiveClaudeCodeController` over the same `AgentSessionStore`, SSE via `ReactiveBootUiChangeStream`.                   |
 | REST Client   | `ReactiveRestClientTraceController` — same `RestClientTraceRecorder`, SSE via `ReactiveBootUiChangeStream`. See the fidelity note below. |
@@ -299,12 +375,19 @@ candidate list. Statement rankings are unaffected.
 
 **Transactions.** Capture is identical to the servlet adapter: BootUI contributes a `TransactionExecutionListener`
 through Spring Boot's standard transaction-manager customization and completes registration for user-defined
-`ConfigurableTransactionManager` beans after singleton initialization, observing any configurable blocking transaction
-manager a WebFlux application still uses (e.g. JDBC repositories behind a thread-blocking data access layer). *Fidelity
-gap, accepted:* a WebFlux application backed only by a `ReactiveTransactionManager` (R2DBC) has no
-`ConfigurableTransactionManager` bean to observe — Spring's transaction-execution listener hook exists solely on the
-blocking SPI — so the panel reports "No configurable PlatformTransactionManager bean is available" rather than silently
-showing an empty table.
+`ConfigurableTransactionManager` beans after singleton initialization. That covers the blocking transaction managers a
+WebFlux application still uses, such as `@Transactional` JDBC work run on a Reactor `boundedElastic` worker, and a
+`ReactiveTransactionManager` such as R2DBC's, which implements the same listener SPI: each callback names its
+transaction by the execution Spring passes to every callback of one boundary, so a reactive transaction that begins on
+one thread and commits on another is recorded once, with the right outcome. A reactive transaction has no thread-bound
+parent or JDBC isolation, so it is recorded as a new transaction with an `UNKNOWN` isolation. An application with no
+configurable transaction manager reports "No configurable transaction manager bean is available" rather than
+silently showing an empty table. The sample's `GET /api/sample/transaction-samples` runs a commit, a slow commit, and a
+rollback, which `WebFluxTransactionsIntegrationTest` and `tests-webflux/transactions.spec.js` check.
+Reactive support covers physical transaction begin/commit/rollback callbacks, not a complete reactive transaction
+hierarchy: parent relationships and nested/savepoint boundaries are not inferred. SQL and connection counts remain
+JDBC-only, matched by the begin thread and time window; they do not capture R2DBC statements or JDBC work moved to
+another thread. Zero counts therefore do not prove that a reactive transaction performed no database work.
 
 **Exceptions.** *Known fidelity gap, accepted, documented in code (`ReactiveBootUiExceptionHandler`'s Javadoc):* a
 `@RestController`'s own local `@ExceptionHandler` method consumes an exception *inside* the WebFlux dispatch pipeline,
@@ -324,24 +407,36 @@ only sees `WebClient` customization on this stack — the correct signal.
 so the reactive report sets `frameCaptureSupported=false` with that reason and the panel shows endpoints only — it never
 fabricates a frame log or an empty capture buffer. There is likewise no reactive session registry, so
 `sessionTrackingSupported=false` and the Sessions table reads *not supported on this stack* rather than implying no
-client is connected.
+client is connected. Each message a `WebSocketHandler` receives is still an execution in the runtime journal: BootUI
+takes the place of WebFlux's own `WebSocketHandlerAdapter` (an application subclass is left alone) and opens a context
+around the synchronous delivery of each data message, so a blocking query in a `map` nests under it, while work moved to
+another scheduler joins the context Reactor restores there.
 
 :::
 
 ### 6.4 Rebuilt as a merge over already-reactive signals (1 panel)
 
-Live Activity needed no new *capture* pipeline for any of its **nine** merged signal types — they were all already
-captured reactively or by framework-neutral engine buffers.
+Live Activity needed no new *capture* pipeline for any of its **ten** panel-buffer signal types — they were all already
+captured reactively or by framework-neutral engine buffers. By default (`bootui.activity.feed-source=journal`) the feed
+renders the runtime journal's retained events, as on every stack. The merge below serves the fallback when
+`bootui.runtime-journal.enabled=false`, or an explicit diagnostic `?source=buffers` request. Configuring
+`bootui.activity.feed-source=buffers` is no longer supported and fails startup; the property accepts only `journal`.
+
+The runtime datasource switch shares MVC and Quarkus's journal admission: an absent, disabled, or closed journal returns
+HTTP `409` before schema or store mutation, while configured startup capture may still wait for journal injection.
+A successful switch owns one subscriber writing directly to the candidate durable store before it is published.
+Capture-start failure leaves in-memory storage active and reports that schema verification may already have created
+the table ([Durable history](features/overview.md#durable-history)).
 
 | Panel         | Reactive source                                                                                                          |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Live Activity | `ReactiveLiveActivityController`, merging `HttpExchangesController` (requests), `SqlTraceRecorder` (SQL), `ExceptionStore` (exceptions), `ReactiveSecurityLogsController` (security), `CacheActivityRecorder` (cache), `ScheduledTaskRunStore` (scheduled tasks), `KafkaActivityRecorder`/`RabbitActivityRecorder`/`JmsActivityRecorder` (messaging), `EmailCaptureService`/`EmailController` (mail), and `RestClientTraceRecorder` (REST/WebClient calls) via the shared engine `LiveActivityAssembler`, with the per-request profile served by the shared `ExecutionProfileAssembler` with trace-id-only capabilities (REST client calls and cache accesses included; the serving-thread and time-window tiers reported unavailable) — the same classes the Quarkus adapter uses; refreshed over `ReactiveBootUiChangeStream`, signaled by a new lightweight `ReactiveActivitySignalFilter` `WebFilter` after each non-BootUI request completes. |
+| Live Activity | `ReactiveLiveActivityController` merges requests, SQL, exceptions, security, cache, scheduled tasks, messaging, mail, REST client calls and fault-tolerance events through `LiveActivityAssembler`. The journal-first path also shows journal-only types, including transactions, logs and ORM observations. `ExecutionProfileAssembler` supplies exact request-id and optional trace-id profiles; serving-thread/time-window tiers are unavailable. The shared `ReactiveBootUiChangeStream` refreshes on source changes and completed application requests. |
 
-::: details Where each of the nine signals comes from
+::: details Where each of the ten panel-buffer signals comes from
 
 The original four — HTTP Exchanges, SQL Trace, Exceptions, and Security Logs — are already captured reactively by the
-panels in §6.2/§6.3. The five newer entry types added by the Live Activity event-type extension workstream (see
-[Live Activity](features/overview.md#the-ten-signals)) reuse the same framework-neutral engine buffers regardless of
+panels in §6.2/§6.3. The six additional entry types (see
+[Live Activity](features/overview.md#feed-types)) reuse the same framework-neutral engine buffers regardless of
 stack, because their capture wiring (`BootUiEngineConfiguration`) is gated purely on classpath/bean presence, never on
 `ConditionalOnWebApplication`:
 
@@ -352,6 +447,8 @@ stack, because their capture wiring (`BootUiEngineConfiguration`) is gated purel
   buffers, fed by the same template/listener-factory `BeanPostProcessor` wrapping the servlet adapter uses.
 - REST/WebClient calls are read from the same `RestClientTraceRecorder` fed by `BootUiEngineConfiguration`'s
   `WebClientCustomizer`; capture is active on both stacks, and the standalone panel is now wired reactively too (§6.3).
+- Fault-tolerance events come from the shared `FaultToleranceEventRecorder`, fed by Resilience4j and optional Spring
+  Retry observations; the reactive Live Activity stream subscribes to that recorder too.
 
 The servlet adapter's `LiveActivityController` additionally depends on two things with no reactive equivalent. One is a
 `ServletRequestHandledEvent` listener, which exists purely as an SSE-refresh trigger, not a data source. The other is a
@@ -375,7 +472,7 @@ is reported as an available source only after the shared post-processor successf
 
 The map's opaque `ServiceMapInteractionDto.flowId` — derived one-way from whatever trace id was active when an
 interaction completed — needed no reactive-specific work either. `BootUiReactiveAutoConfiguration` already installs the
-same `ReactiveOtelTraceIdProvider` on the HTTP exchange, SQL, REST-client, and cache recorders. `ServiceMapAssembler`
+same `ReactiveOtelTraceIdSource` on the HTTP exchange, SQL, REST-client, and cache recorders. `ServiceMapAssembler`
 only ever reads whatever trace id those recorders already captured, so causal flow correlation on this adapter is
 byte-identical to Spring MVC and Quarkus wherever OpenTelemetry is configured.
 
@@ -390,11 +487,12 @@ resolves (and creates) the controller bean once the panel is opened.
 
 ::: details Trace-id correlation, stamped identically to Quarkus
 
-A reactive-only `ReactiveOtelTraceIdProvider` reads `Span.current()` unconditionally at every capture point: HTTP
+A reactive-only `ReactiveOtelTraceIdSource` reads `Span.current()` unconditionally at every capture point: HTTP
 exchange (via a new `ReactiveHttpExchangeTraceFilter` feeding a side-buffer `HttpExchangeTraceRegistry`, since
-Actuator's `HttpExchange` model has no trace-id field), SQL (`SqlTraceRecorder.setTraceIdProvider`), exceptions
-(`ReactiveBootUiExceptionHandler.setTraceIdProvider`), and security events (`ReactiveSecurityLogsController.setTraceIdProvider`
-+ `ReactiveSecurityEventTraceRegistry`). This replaces the earlier inbound-header/SLF4J-MDC-only reliance. All four are
+Actuator's `HttpExchange` model has no trace-id field), and, through one `ScopedCorrelationContextProvider` installed with
+`setCorrelationContextProvider`, SQL, REST client, cache, email, fault tolerance, exceptions
+(`ReactiveBootUiExceptionHandler`), and security events (`ReactiveSecurityLogsController` +
+`ReactiveSecurityEventTraceRegistry`). This replaces the earlier inbound-header/SLF4J-MDC-only reliance. All four are
 wired by `BootUiReactiveAutoConfiguration.ReactiveOpenTelemetryCorrelationConfiguration`, gated only on the OpenTelemetry
 SDK being present (matching Quarkus's own `Capability.OPENTELEMETRY_TRACER` gate). It is deliberately *not* also gated on
 `bootui.telemetry.enabled`, which governs BootUI's own span export for the Traces/AI Framework panels — a separate
@@ -408,19 +506,29 @@ resolves correctly across those hops when Reactor's *automatic context propagati
 wired correctly but reads an empty/invalid span everywhere except by coincidence on the thread the request started on.
 `BootUiActuatorDefaultsEnvironmentPostProcessor` now contributes `spring.reactor.context-propagation=auto` as an
 overridable default (the same "library default, host always wins" pattern used for
-`management.tracing.sampling.probability`) whenever the application is reactive and the OpenTelemetry SDK is present —
-see §7 for how this was found.
+`management.tracing.sampling.probability`) whenever the application is reactive and Micrometer context propagation
+(`io.micrometer.context.ContextRegistry`, which Micrometer Tracing brings) is present — see §7 for how this was found.
+
+**BootUI's own request id.** `ReactiveRequestCorrelationFilter` gives every application request BootUI's request id
+with or without OpenTelemetry. It is an `HttpHandlerDecoratorFactory`, so it wraps WebFlux's
+exception handlers and the response commit as well as the filter chain. It writes the id into the Reactor context, and
+`BootUiCorrelationThreadLocalAccessor` exposes it to Micrometer context propagation, so the same `auto` mode restores it
+on every scheduler hop. As a WebFilter it also keeps it on the `ServerWebExchange`. BootUI's exchange repository stamps
+each exchange with it when `HttpExchangesWebFilter` records it in `beforeCommit`, which makes the id the exchange's `id`.
+The SQL, cache, REST client, email, and fault-tolerance recorders stamp it on each capture, and
+`ReactiveSecurityLogsController` stamps each audit event when it is published, so Live Activity nests those signals under
+the exact request that produced them.
 
 **Known, accepted residual limitations:**
 
-- Correlation is still trace-id-primary, exactly like Quarkus. A request with no active tracing span at all (for
-  example, OpenTelemetry entirely absent) still shows every signal flat/uncorrelated rather than nested, since there is
-  no id to key on. This is not WebFlux-specific — the same is true of the Quarkus adapter today.
+- Without a tracing span, SQL, exceptions, security events, cache accesses, REST client calls, emails, and
+  fault-tolerance events still nest by BootUI's request id. The feed shows one entry per exception group, nested under
+  the request its latest occurrence came from; the profile attributes each occurrence to its own request.
 - `HttpExchangeTraceRegistry#match` (and its servlet sibling `RequestCorrelationRegistry`) deliberately requires a
   *unique* method+path+time-window candidate. Two genuinely concurrent identical requests (the same endpoint hit twice
   within roughly the same tens of milliseconds, with no other distinguishing signal) correlate to *neither* rather than
-  risk attributing one request's trace id to the other. Both still show in the feed; they simply render without a nested
-  SQL/exception child until a less ambiguous signal is added.
+  risk attributing one request's trace id to the other. Both still show in the feed, each with its own SQL, cache,
+  REST client, exception, and other stamped children nested by request id.
 - The servlet adapter's thread-based correlation (`LiveActivityCorrelator`) is not ported — it has no reactive
   equivalent.
 
@@ -540,7 +648,7 @@ response, but A01 servlet coverage is `NOT_APPLICABLE` and no-finding mixed-cate
 `INFO` wording. The reactive Security advisor owns `SecurityWebFilterChain`, reactive CORS, and route-policy review. The
 collector uses `spring.webflux.base-path` for the validated loopback target instead of the servlet-only
 `server.servlet.context-path`, and inactive servlet session settings do not produce findings. This is the same defensive
-pattern the rest of the codebase uses for optional-dependency adapters — the reactive starter was simply the first
+pattern the rest of the codebase uses for optional-dependency adapters — WebFlux was simply the first
 Spring-side consumer where an MVC type can be genuinely absent from
 the classpath, not just absent as a bean.
 
@@ -569,8 +677,8 @@ scheduler hops a WebFlux request constantly makes (Netty event loop → `bounded
 JDBC → `parallel`), so `Span.current()` returned a valid span only by coincidence, on whichever thread a request
 happened to still be on. Every new trace-stamping capture point read `null`/an invalid span in practice despite being
 wired correctly. Fixed by having `BootUiActuatorDefaultsEnvironmentPostProcessor` contribute
-`spring.reactor.context-propagation=auto` as an overridable default whenever the application is reactive and the
-OpenTelemetry SDK is present. Confirmed by hitting the running sample app directly (`/api/notes`, `/api/sample/boom`)
+`spring.reactor.context-propagation=auto` as an overridable default whenever the application is reactive and
+Micrometer context propagation (`io.micrometer.context.ContextRegistry`) is present. Confirmed by hitting the running sample app directly (`/api/notes`, `/api/sample/boom`)
 and checking `/bootui/api/http-exchanges`, `/bootui/api/sql-trace`, `/bootui/api/exceptions`, and `/bootui/api/activity`
 for populated, correctly-nested (`parentId`) trace ids — none of which a unit test asserts.
 
@@ -579,17 +687,18 @@ for populated, correctly-nested (`parentId`) trace ids — none of which a unit 
 ## 8. Sample app & end-to-end testing
 
 - **`bootui-spring-webflux-sample-app`** is a minimal WebFlux app (Netty, `spring-boot-starter-webflux`, deliberately no
-  `spring-boot-starter-web`) with `notes`/`scheduling`/`greeting` packages, seeded with a scheduled task and an H2
-  datasource (Flyway + Liquibase migrations on separate baselined schemas) so the data-source-backed panels (Flyway,
+  `spring-boot-starter-web`) with `notes`/`scheduling`/`greeting`/`transactions` packages, seeded with a scheduled task
+  and an H2 datasource (Flyway + Liquibase migrations on separate baselined schemas) so the data-source-backed panels (Flyway,
   Liquibase, Database Connection Pools, SQL Trace, PostgreSQL) have something real to show or a truthful wrong-vendor
   skip.
 - **`bootui-conformance`** gained `expected-panels-webflux.json` — identical to `expected-panels-spring.json` except
   `platform: "spring-boot-reactive"`, itself evidence the shared-contract thesis holds even in the golden fixture — and
   the sample app's `WebFluxApiConformanceTest extends AbstractBootUiApiConformanceTest` reuses the entire shared HTTP
   contract suite for free, exactly as the Quarkus adapter does.
-- **`bootui-spring-sample-app/e2e/playwright.webflux.config.js`** and `tests-webflux/webflux-smoke.spec.js` are a second,
-  separate Playwright config and test directory (not a new npm project), so the default `npm test` run against the
-  servlet sample app is untouched. The WebFlux suite checks the platform manifest, navbar branding, a representative
+- **`bootui-spring-sample-app/e2e/playwright.webflux.config.js`** and `tests-webflux/` are a second, separate Playwright
+  config and test directory (not a new npm project), so the default `npm test` run against the servlet sample app is
+  untouched. Besides per-panel specs for the advisors, PostgreSQL, MySQL, Runtime Insights, and the Java agent panels,
+  `webflux-smoke.spec.js` checks the platform manifest, navbar branding, a representative
   sample of ported panels rendering cleanly (now including Live Activity and the MCP Server panel), that `http-sessions`
   shows its WebFlux-specific reason in both the sidebar and the panel alert, and that the Security advisor (`security`)
   is available and can be scanned.
@@ -618,6 +727,5 @@ sample app — but is easy to trip over when smoke-testing a freshly built react
 
 ## 10. Future work
 
-- Deeper Live Activity correlation for requests with no active tracing span at all (today: trace-id-primary only, now
-  matching the Quarkus adapter exactly since `Span.current()` is stamped unconditionally at every capture point — see
-  §6.4).
+- R2DBC statement capture (§2): BootUI records SQL through a traced JDBC `DataSource` only, so R2DBC statements are not
+  yet recorded.

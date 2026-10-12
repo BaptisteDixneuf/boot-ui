@@ -1,17 +1,21 @@
 package io.github.jdubois.bootui.quarkus.restclienttrace;
 
 import io.github.jdubois.bootui.core.SecretMasker;
+import io.github.jdubois.bootui.engine.javaagent.AgentCodePaths;
+import io.github.jdubois.bootui.engine.javaagent.AgentRequestValues;
+import io.github.jdubois.bootui.engine.javaagent.RequestInputSinks;
 import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
 import io.github.jdubois.bootui.engine.support.CredentialRedaction;
 import io.github.jdubois.bootui.engine.support.SensitiveNames;
 import io.github.jdubois.bootui.engine.support.UriMasking;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.ThreadKind;
 import jakarta.ws.rs.client.ClientRequestContext;
 import jakarta.ws.rs.client.ClientRequestFilter;
 import jakarta.ws.rs.client.ClientResponseContext;
 import jakarta.ws.rs.client.ClientResponseFilter;
 import java.net.URI;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import org.jboss.logging.Logger;
 
 /**
@@ -39,8 +43,20 @@ public final class QuarkusRestClientTraceFilter implements ClientRequestFilter, 
     @Override
     public void filter(ClientRequestContext requestContext) {
         try {
+            // Whether request input reached this call's URL unchanged, where it is issued (docs/PLAN-v2.md §5.16,
+            // M5-6b): only while request-value matching is on.
+            if (AgentRequestValues.enabled()) {
+                RequestInputSinks.url(requestContext.getUri(), recorder.currentCorrelation());
+            }
             requestContext.setProperty(
-                    CAPTURE_PROPERTY, new RequestCapture(System.nanoTime(), recorder.currentTraceId()));
+                    CAPTURE_PROPERTY,
+                    new RequestCapture(
+                            System.nanoTime(),
+                            recorder.currentTraceId(),
+                            recorder.currentCorrelation(),
+                            recorder.currentThreadKind(),
+                            // The request filter runs where the call is issued; its response may arrive elsewhere.
+                            AgentCodePaths.stamp()));
         } catch (RuntimeException failure) {
             logCaptureFailure(failure);
         }
@@ -50,25 +66,28 @@ public final class QuarkusRestClientTraceFilter implements ClientRequestFilter, 
     public void filter(ClientRequestContext requestContext, ClientResponseContext responseContext) {
         try {
             RequestCapture capture = requestCapture(requestContext.getProperty(CAPTURE_PROPERTY));
-            long durationMillis = elapsedMillis(capture);
+            long durationNanos = elapsedNanos(capture);
             CapturedUri uri = sanitize(requestContext.getUri());
             int status = responseContext.getStatus();
             boolean responseReceived = status > 0;
             // Any received HTTP response is a successful transport exchange. Quarkus reports pre-response
             // transport failures to client filters with status 0.
-            recorder.record(
+            recorder.recordNanos(
                     requestContext.getMethod(),
                     uri.value(),
                     uri.host(),
                     uri.path(),
                     responseReceived ? status : null,
-                    durationMillis,
+                    durationNanos,
                     responseReceived,
                     responseReceived ? null : "REST client transport failed before receiving an HTTP response",
                     CLIENT_TYPE,
                     Map.of(),
                     Thread.currentThread().getName(),
-                    capture.traceId());
+                    capture.traceId(),
+                    capture.caller(),
+                    capture.threadKind(),
+                    capture.codePathStamp());
         } catch (RuntimeException failure) {
             // Capture must not change the response observed by the application.
             logCaptureFailure(failure);
@@ -78,11 +97,11 @@ public final class QuarkusRestClientTraceFilter implements ClientRequestFilter, 
     private static RequestCapture requestCapture(Object capture) {
         return capture instanceof RequestCapture requestCapture
                 ? requestCapture
-                : new RequestCapture(System.nanoTime(), null);
+                : new RequestCapture(System.nanoTime(), null, CorrelationContext.NONE, null, 0L);
     }
 
-    private static long elapsedMillis(RequestCapture capture) {
-        return Math.max(0L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - capture.startNanos()));
+    private static long elapsedNanos(RequestCapture capture) {
+        return Math.max(0L, System.nanoTime() - capture.startNanos());
     }
 
     /**
@@ -190,5 +209,6 @@ public final class QuarkusRestClientTraceFilter implements ClientRequestFilter, 
 
     record CapturedUri(String value, String host, String path) {}
 
-    private record RequestCapture(long startNanos, String traceId) {}
+    private record RequestCapture(
+            long startNanos, String traceId, CorrelationContext caller, ThreadKind threadKind, long codePathStamp) {}
 }

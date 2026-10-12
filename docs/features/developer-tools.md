@@ -14,6 +14,9 @@ loopback unless non-loopback access is explicitly enabled, which requires authen
 
 Enable it with `bootui.mcp.enabled=ON`, or use the toggle at the top of the panel. The toggle overrides the configured
 property for the lifetime of the running application, and the panel shows when the live state is an override.
+The toggle acknowledges only a valid MCP status report. An empty or malformed reply reports an unknown action
+outcome, preserves the last accepted status, and re-reads without retrying the toggle. A poll started before the action
+cannot overwrite its acknowledgement.
 
 ### Connecting a client
 
@@ -30,7 +33,10 @@ Point your client at the loopback HTTP endpoint of the running application:
 }
 ```
 
-The panel shows the transport, the protocol revision, and the `bootui.mcp.max-results` cap, alongside a ready-to-use
+The panel shows the transport, the protocol revisions the endpoint serves (MCP 2026-07-28 and 2025-06-18), the
+`bootui.mcp.max-results` cap, and how many tool calls ran, timed out, or were cancelled (any call a cancellation
+reached while it ran, such as a client closing its progress stream), and, when there are any, how many progress
+notifications were dropped for exceeding `bootui.mcp.max-response-bytes`, alongside a ready-to-use
 configuration for this running application. There is one tab per client, because clients do not agree on a shape:
 **VS Code** uses a `servers` block in `.vscode/mcp.json`, **Claude Code** uses a
 `claude mcp add --transport http` command, **Cursor** uses an `mcpServers` entry keyed on `url` with no `type` in
@@ -38,15 +44,18 @@ configuration for this running application. There is one tab per client, because
 skip this with the [BootUI plugin](../AI-AGENTS.md#install-the-bootui-claude-code-plugin), which registers the server
 for them.
 
-A loopback agent needs no credentials. An agent reaching the application from anywhere else, most often a container
-reached through a published port, is a remote API caller: every MCP call answers `401` until it sends BootUI's token in
-the `Authorization` header. Tick **Agent connects from another host or container** to add that header to every snippet.
+A loopback agent needs no credentials. Sources explicitly trusted through `bootui.trusted-proxies` or
+`bootui.trust-container-gateway` are also authentication-free. When `bootui.allow-non-localhost=true` permits an
+otherwise untrusted source, every MCP call answers `401` until it sends BootUI's token in the `Authorization` header.
+Tick **Agent connects from another host or container** to add that header to every snippet when the source is untrusted.
 The panel never prints the token. It is the value of `bootui.authentication.token`, and when that is blank BootUI
 generates one at each start and logs it once.
 
 ### Available tools
 
-Tools reuse the existing controllers and DTOs, so every tool returns the same masked, bounded shape as the REST API.
+Tools reuse the existing services and captured evidence, with the same masking and panel policy as the REST API.
+Many agent reads and action acknowledgements are intentionally compact rather than the complete browser report;
+see [compact answers](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls).
 Tools whose backing panel or controller is absent are not advertised. The live panel is the authoritative catalog for
 your stack.
 
@@ -58,15 +67,30 @@ makes outbound calls to OSV.dev.
 `get_database_advisor_report`, `get_memory_report`, `get_security_report`, `get_pentest_report`, `get_rest_api_report`,
 `get_graalvm_report`, `get_crac_report`, and `get_vulnerabilities_report`.
 
+**Cached per-rule violations** — `get_architecture_rule_violations`, `get_spring_rule_violations`,
+`get_hibernate_rule_violations`, `get_database_advisor_rule_violations`, `get_memory_rule_violations`,
+`get_security_rule_violations`, and `get_rest_api_rule_violations` page the details a cached report retained, without
+scanning again. On Quarkus, the `spring` tools run and read the Quarkus application advisor.
+
+**Runtime Insights reads** — `get_runtime_insights`, `get_runtime_insight`, `get_runtime_impact`, and
+`get_runtime_run_comparison`: the [Runtime Insights](overview.md#runtime-insights) report, one observation, change
+impact, and the run comparison, compacted for agents, with `INSUFFICIENT` and `NOT_COMPARABLE` never read as success.
+
 **Diagnostics reads** — `get_live_activity`, `get_request_profile`, `get_exceptions`, `get_exception_detail`,
 `get_security_logs`,
 `get_sql_traces`, `get_transactions` (Spring MVC and WebFlux only), `get_traces`, `get_log_tail`,
 `get_http_exchanges`, `get_http_routes`, and
 `get_rest_client_traces`. `get_live_activity` returns the correlated feed of HTTP requests, SQL statements, exceptions,
-security events, scheduled-task runs, and, on Spring, cache accesses, grouped by request or trace.
-`get_request_profile` takes a profileable `REQUEST` entry's id and returns its
-[per-request profile](overview.md#the-per-request-profiler), the same masked DTO as the profile drawer, with each
-exception's `exceptionGroupId`. `get_exception_detail` returns a group's stack trace, causes, and occurrences.
+security events, scheduled-task runs, messaging, and the other retained journal signal types described in
+[Live Activity](overview.md#feed-types), grouped by request or execution id; the panel-buffer fallback uses its
+available exact ids and, on MVC, the documented weaker tiers.
+`get_request_profile` takes a profileable request or execution id and returns a selection with `available`,
+`unavailableReason`, `source`, `journal`, and `buffers`. It consults the retained journal first; when an HTTP exchange
+is also retained, `buffers` carries the richer [per-request profile](overview.md#the-per-request-profiler), including
+each exception's `exceptionGroupId`. An unknown, cleared, or expired id returns an explicit tool error rather than a successful empty profile.
+`source: "none"` instead accompanies an unavailable selection, such as evidence hidden by panel policy or an
+uncorrelatable request.
+`get_exception_detail` returns a group's stack trace, causes, and occurrences.
 
 **Runtime and integration reads** — `get_overview`, `get_health`, `get_config`, `get_beans`, `get_mappings`,
 `get_loggers`, `get_conditions`, `get_http_sessions`, `get_scheduled_tasks`, `get_fault_tolerance`, `get_cache_stats`,
@@ -74,8 +98,29 @@ exception's `exceptionGroupId`. `get_exception_detail` returns a group's stack t
 `get_jvm_tuning`, `get_heap_dump_report`, `get_threads`, `get_startup_timeline`, `get_profile_diff`,
 `get_spring_data_repositories`, `get_flyway_migrations`, `get_liquibase_changesets`, `get_spring_security`,
 `get_ai_overview`, `get_emails`, `get_kafka_activity`, `get_rabbitmq_activity`, `get_jms_activity`,
-`get_devtools_status`, `get_dev_services`, `get_github_dashboard`, `get_copilot_sessions`, and
-`get_claude_code_sessions`.
+`get_agent_status`, `get_devtools_status`, `get_dev_services`, `get_github_dashboard`,
+`get_copilot_sessions`, `get_claude_code_sessions`, `get_hibernate_statistics`, and `get_websockets`.
+
+**Code Inventory read** — `get_code_inventory`: with the BootUI agent, whether the methods changed since the previous run
+executed in this run, then the never-executed, not-tracked, executed, or dependency rows a query asks for (see
+[Code Inventory](java-agent.md#code-inventory)).
+
+**Code Paths read** — `get_code_paths`: with the BootUI agent, the routes ranked by warm median with the application
+methods they spend their time in, or one route's hottest method nodes (see [Code Paths](java-agent.md#code-paths)).
+
+**Method probes** — `start_method_probe`, an action needing the user's separate approval that read-only policy refuses,
+records one application method's next 20 invocations for at most 60 seconds, metadata only, and `get_method_probe`
+reads them (see [Method probes](java-agent.md#method-probes)).
+**Side Effects read** — `get_side_effects`: with the BootUI agent, the side-effect sensor coverage and most frequent
+rows matching a process sensor, route, target, or call site (see [Side Effects](java-agent.md#side-effects)).
+
+**Java Agent sensor switches** — `enable_agent_sensor` and `disable_agent_sensor`, or
+`bootui agent sensor enable|disable <id>`, apply the panel's bounded runtime switches on all three stacks.
+Read `get_agent_status` and `get_side_effects` first, explain the sensor's collection and performance trade-offs,
+and obtain the user's approval before switching. These actions use the Java Agent panel's enabled/read-only policy
+and require an attached, armed agent with runtime-switch support. Overrides last only for this JVM and are not
+persisted; request-value matching still requires `bootui.agent.security-sinks.request-values=true` at startup.
+Read `get_agent_status` again to verify the result (see [Runtime switches](java-agent.md#switching-sensors-at-run-time)).
 
 **Bounded controls** — `clear_exceptions`, `clear_sql_traces`, `pause_sql_trace_recording`, `resume_sql_trace_recording`,
 `clear_transactions`, `pause_transaction_recording`, `resume_transaction_recording`, `clear_traces`,
@@ -85,7 +130,7 @@ exception's `exceptionGroupId`. `get_exception_detail` returns a group's stack t
 Destructive, database-mutating, arbitrary-command, heap-capture and download, HTTP-probe, GitHub-write, and
 dev-service-restart operations are not exposed.
 
-Clients with prompt support can also select `diagnose_runtime_issue`, `review_application`, or `assess_application`.
+Clients with prompt support can also select `diagnose_runtime_issue`, `verify_after_change`, `review_application`, or `assess_application`.
 These are instructions for the external agent, not new scan tools. The assessment workflow collects bounded evidence,
 reports coverage, and proposes a versioned action plan before stopping for approval of specific action IDs. See
 [assess an application and approve an action plan](../AI-AGENTS.md#assess-an-application-and-approve-an-action-plan).
@@ -99,14 +144,17 @@ The server inherits BootUI's full safety model:
   `bootui.enabled=ON` overrides that.
 - The endpoint sits behind `LocalhostOnlyFilter`, with its loopback source check, `Host` allow-list, and cross-site
   write protection. It is exempt from BootUI's SPA CSRF token, which only browsers can present, so non-browser clients
-  connect on loopback with no credentials while the cross-site defenses still block browser-driven writes. When
-  non-loopback access is enabled, the client must send the BootUI bearer token like any other remote caller.
+  connect from loopback or explicitly trusted sources without credentials while the cross-site defenses still block
+  browser-driven writes. Other permitted non-loopback clients must send the BootUI bearer token.
 - Read tools require their backing panel to be enabled. Action tools are additionally refused when the panel is
   read-only or `bootui.read-only=true`, returning a clear tool error rather than running.
 - Values pass through the same secret masking and `bootui.expose-values` mode as the REST API, and paginated reads are
   capped by `bootui.mcp.max-results`.
 - Request bytes, concurrent calls, tool execution time, and rendered response bytes have configurable hard limits.
-  Capacity, timeout, and response-limit refusals use explicit JSON-RPC errors, and the status endpoint exposes call
+  Capacity, timeout, and response-limit refusals use bounded JSON-RPC errors; when even the response-limit error with
+  the original id cannot fit, the transport answers bodyless HTTP `413` before dispatch rather than running a tool
+  without a bounded answer. The response budget counts UTF-8 JSON payload bytes, not SSE framing or heartbeats.
+  The status endpoint exposes call
   count, aggregate latency, and each refusal count.
 - Unexpected server failures return only JSON-RPC `-32603` with the message `Internal error`. Exception messages, stack
   traces, paths, queries, and credentials are never included, and BootUI logs the original throwable once on the
@@ -127,7 +175,8 @@ engine. Each adapter supplies only a thin Jackson envelope codec, Jackson 2 on Q
 requests and responses are byte-identical across backends.
 
 **Quarkus** runs the same JSON-RPC bridge at the same endpoint with the same runtime toggle, reading the `bootui.mcp.*`
-keys from MicroProfile Config. Its catalog declares 75 tools against Spring MVC's 91, because the tools behind
+keys from MicroProfile Config. Its catalog declares 89 tools against Spring MVC's 105, before runtime capability
+filtering. It withholds tools behind
 Spring-only panels are withheld: the GraalVM and CRaC scans and reports, Conditions, Startup Timeline, HTTP Sessions,
 Spring Data, Spring Security, JMS, DevTools, and every transaction tool. `get_overview` is offered, and `spring_scan`
 runs the Quarkus-native idiom advisor.
@@ -161,13 +210,17 @@ maps to, its backing panel, and whether that panel is disabled or read-only. Tha
 `2`: BootUI declining to run a tool is a statement about how the target is configured, not a failed request.
 
 The spellings come from the running application through `GET /bootui/api/cli`, not from the CLI's own build, so the
-panel shows what *this* instance answers to even when the CLI on your path was built against another BootUI version.
+panel shows what _this_ instance answers to even when the CLI on your path was built against another BootUI version.
 
 Call counters — calls, mean latency, capacity refusals, and timeouts — are tracked separately from the MCP server's, so
 this panel reports what terminals and CI jobs did. There is no response-limit counter, because the command-line facade
 applies no response byte budget.
 
 ## Spring DevTools
+
+LiveReload and restart controls require their documented JSON acknowledgements; an empty, malformed, or unrecognized
+reply reports an unknown outcome and re-reads status without retrying. Restart reconnect polling starts only after
+the application acknowledges that the restart was scheduled.
 
 ![BootUI Spring DevTools panel](../images/bootui-devtools.webp)
 
@@ -272,3 +325,44 @@ the panel when no projects directory is found. Data is read-only: BootUI never m
 
 Because Claude Code writes sessions inside per-project subdirectories, this panel refreshes through the shared
 visibility-aware polling used by the other live panels rather than a directory watch.
+
+## GitHub
+
+![BootUI GitHub panel](../images/bootui-github.webp)
+
+Summarizes the current project's GitHub state, read from the local `origin` remote. It auto-refreshes on BootUI's
+standard one-minute interval while the tab is visible; the initial refresh and each interval are bounded and blocked by
+the panel's read-only settings.
+
+`GET /bootui/api/github` never contacts GitHub; it returns the cached report. Only `POST /bootui/api/github/refresh`
+reaches the API, gated by `bootui.github.api-enabled` and the host allow-list.
+
+Opening the panel does issue that refresh, as does each auto-refresh tick, unless the panel is read-only. In read-only
+mode the panel falls back to the cached `GET` and never contacts GitHub.
+
+The panel shows repository metadata and an eight-card summary grid, each card opening a detail drawer:
+
+- **Open pull requests** and **open issues** — the issues drawer summarizes label and staleness buckets, then lists the
+  bounded set of open issues with author, labels, comment count, and last-updated time. Pull requests returned by the
+  issues endpoint are excluded.
+- **GitHub Actions** — rows link to the matching run and show workflow, branch, event, status, and duration. The failure
+  count considers only the latest execution per workflow and branch, so older failures drop out once a later run fixes
+  that workflow on that branch.
+- **Quotas** — the card shows the lowest remaining percentage on a red-to-green palette. The drawer is hidden by
+  default, renders every resource from GitHub's `/rate_limit` response dynamically, and highlights anything at or below
+  10% remaining. Best-effort cards for Actions cache, artifacts, and Actions billing appear when the credential can
+  reach those endpoints.
+- **Copilot usage** — the report window and link count only, from GitHub's organization report metadata endpoint. Signed
+  report URLs are never downloaded or exposed.
+- **Three security signals** — drawers link to the matching alert pages. Dependabot additionally lists open alerts with
+  package, ecosystem, severity, advisory ID, summary, affected range, and fixed version, capped by
+  `bootui.github.max-security-alerts`. Code scanning and secret scanning stay count-only and never inline secret values
+  or vulnerable code snippets.
+
+Credentials are read from the current device only: `GITHUB_TOKEN`, `GH_TOKEN`, or an existing `gh auth token` login. The
+token is never sent to the browser, persisted by BootUI, or included in warnings. Without a token, public repositories
+use GitHub's unauthenticated rate limits. Refreshes are bounded by per-request timeouts, a maximum API-call budget, and
+a quota safety threshold that skips optional sections before exhausting the core API quota.
+
+The panel is identical on Quarkus, over the same engine and the same `/bootui/api/github` contract. The only difference
+is internal: Quarkus supplies a Jackson 2 client implementation where Spring Boot 4 uses Jackson 3.

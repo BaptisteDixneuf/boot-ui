@@ -45,6 +45,7 @@ const isQuarkusPlatform = process.env.BOOTUI_SCREENSHOT_PLATFORM === 'quarkus'
 // Panels with no Quarkus equivalent (rendered in the sidebar "Disabled / unavailable" group).
 const quarkusUnavailablePanels = new Set([
   'graalvm',
+  'crac',
   'conditions',
   'startup',
   'http-sessions',
@@ -52,70 +53,42 @@ const quarkusUnavailablePanels = new Set([
   'spring-security',
   'devtools',
   'jms',
-  'email',
-  'rest-client-trace',
   'transactions'
 ])
 
-const panelOrder = [
-  ['overview', 'Overview'],
-  ['github', 'GitHub'],
-  ['health', 'Health'],
-  ['http-sessions', 'HTTP Sessions'],
-  ['metrics', 'Metrics'],
-  ['live-memory', 'Live Memory'],
-  ['jvm-tuning', 'JVM Tuning'],
-  ['heap-dump', 'Heap Dump'],
-  ['threads', 'Threads'],
-  ['startup', 'Startup Timeline'],
-  ['graalvm', 'GraalVM'],
-  ['config', 'Configuration'],
-  ['profile-diff', 'Profile Diff'],
-  ['loggers', 'Loggers'],
-  ['beans', 'Beans'],
-  ['conditions', 'Conditions'],
-  ['mappings', 'Mappings'],
-  ['database-connection-pools', 'Database Connection Pools'],
-  ['postgresql', 'PostgreSQL'],
-  ['mysql', 'MySQL'],
-  ['transactions', 'Transactions'],
-  ['sql-trace', 'SQL Trace'],
-  ['hibernate-statistics', 'Hibernate Statistics'],
-  ['data', 'Spring Data'],
-  ['hibernate', 'Hibernate'],
-  ['flyway', 'Flyway'],
-  ['liquibase', 'Liquibase'],
-  ['spring-security', 'Spring Security'],
-  ['security-logs', 'Security Logs'],
-  ['security', 'Security'],
-  ['pentesting', 'Pentesting'],
-  ['vulnerabilities', 'Vulnerabilities'],
-  ['scheduled', 'Scheduled Tasks'],
-  ['rest-client-trace', 'REST Client'],
-  ['fault-tolerance', 'Fault Tolerance'],
-  ['websockets', 'WebSockets'],
-  ['ai', 'AI Framework'],
-  ['cache', 'Cache'],
-  ['activity', 'Live Activity'],
-  ['traces', 'Traces'],
-  ['log-tail', 'Log Tail'],
-  ['exceptions', 'Exceptions'],
-  ['http-exchanges', 'HTTP Exchanges'],
-  ['http-probe', 'HTTP Probe'],
-  ['email', 'Email'],
-  ['kafka', 'Kafka'],
-  ['rabbitmq', 'RabbitMQ'],
-  ['jms', 'JMS'],
-  ['architecture', 'Architecture'],
-  ['rest-api', 'REST API'],
-  ['database-advisor', 'Database'],
-  ['mcp-server', 'MCP Server'],
-  ['cli', 'Command Line'],
-  ['devtools', 'Spring DevTools'],
-  ['dev-services', 'Dev Services'],
-  ['copilot', 'Copilot'],
-  ['claude-code', 'Claude Code']
-]
+const panelManifest = JSON.parse(
+  await fs.readFile(
+    path.join(
+      repoRoot,
+      'bootui-conformance/src/main/resources/io/github/jdubois/bootui/conformance/expected-panels-spring.json'
+    ),
+    'utf8'
+  )
+)
+const agentRequirements = {
+  'code-paths': "Requires the BootUI agent's code-paths sensor",
+  'code-inventory': "Requires the BootUI agent's inventory sensor",
+  'side-effects': 'Requires the BootUI agent'
+}
+const panels = panelManifest.panels.map((panel) => {
+  const agentRequired = agentRequirements[panel.id]
+  const unavailable = isQuarkusPlatform && quarkusUnavailablePanels.has(panel.id)
+  return {
+    ...panel,
+    enabled: true,
+    available: !agentRequired && !unavailable,
+    readOnly: isQuarkusPlatform && panel.id === 'config',
+    readOnlyReason:
+      isQuarkusPlatform && panel.id === 'config' ? 'Runtime overrides are not supported on Quarkus.' : null,
+    unavailableReason: agentRequired
+      ? `${agentRequired}: this JVM runs without the BootUI agent.`
+      : unavailable
+        ? panel.id === 'jms'
+          ? 'Not yet available on Quarkus'
+          : 'Not applicable on Quarkus'
+        : null
+  }
+})
 
 const overview = {
   bootUiVersion,
@@ -156,7 +129,7 @@ const quarkusOverview = {
   startupTimeMillis: 940,
   activation: {
     enabled: true,
-    localhostOnly: false,
+    localhostOnly: true,
     reason: 'Dev mode (quarkus:dev) — BootUI is wired for LaunchMode.DEVELOPMENT',
     warnings: []
   },
@@ -950,148 +923,35 @@ const mcpTool = (name, description, panel, action) => ({
   panel,
   action,
   panelEnabled: true,
-  panelReadOnly: false
+  panelReadOnly: panels.find((candidate) => candidate.id === panel)?.readOnly === true
 })
 
-const mcpServerTools = [
-  mcpTool(
-    'architecture_scan',
-    'Run the Architecture advisor and return layering/dependency findings to fix.',
-    'architecture',
-    true
-  ),
-  mcpTool(
-    'spring_scan',
-    'Run the Spring advisor and return Spring configuration/bean findings to fix.',
-    'spring',
-    true
-  ),
-  mcpTool(
-    'hibernate_scan',
-    'Run the Hibernate advisor and return JPA/Hibernate mapping and query findings.',
-    'hibernate',
-    true
-  ),
-  mcpTool(
-    'memory_scan',
-    'Run the Memory advisor (triggers a class histogram) and return memory findings.',
-    'memory',
-    true
-  ),
-  mcpTool(
-    'security_scan',
-    'Run the Security advisor and return application security findings to fix.',
-    'security',
-    true
-  ),
-  mcpTool('pentest_scan', 'Run the Pentesting advisor and return probing-based security findings.', 'pentesting', true),
-  mcpTool(
-    'rest_api_scan',
-    'Run the REST API advisor and return REST controller/design findings to fix.',
-    'rest-api',
-    true
-  ),
-  mcpTool(
-    'graalvm_scan',
-    'Run the GraalVM readiness advisor and return native-image readiness findings.',
-    'graalvm',
-    true
-  ),
-  mcpTool(
-    'crac_scan',
-    'Run the CRaC readiness advisor and return checkpoint/restore readiness findings.',
-    'crac',
-    true
-  ),
-  mcpTool(
-    'vulnerabilities_scan',
-    'Actively query OSV.dev for known vulnerabilities in dependencies and return severity-ranked findings.',
-    'vulnerabilities',
-    true
-  ),
-  mcpTool(
-    'get_exceptions',
-    'List recent unhandled exceptions captured at runtime (most recent first).',
-    'exceptions',
-    false
-  ),
-  mcpTool(
-    'get_security_logs',
-    'List recent security audit events (authentication, authorization, etc.).',
-    'security-logs',
-    false
-  ),
-  mcpTool(
-    'get_sql_traces',
-    'Return recently recorded SQL statements and timings from the SQL Trace recorder.',
-    'sql-trace',
-    false
-  ),
-  mcpTool('get_traces', 'Return recent distributed/local traces captured by BootUI.', 'traces', false),
-  mcpTool('get_log_tail', 'Return the most recent buffered application log lines.', 'log-tail', false),
-  mcpTool(
-    'get_http_exchanges',
-    'List recent HTTP request/response exchanges handled by the application.',
-    'http-exchanges',
-    false
-  ),
-  mcpTool(
-    'get_overview',
-    'Return the application overview: name, versions, profiles, and BootUI status.',
-    'overview',
-    false
-  ),
-  mcpTool('get_health', 'Return the aggregated application health tree (Actuator health).', 'health', false),
-  mcpTool('get_config', 'Return effective configuration properties (secret values masked).', 'config', false),
-  mcpTool('get_beans', 'List Spring beans. Optional query filters by bean name or type.', 'beans', false),
-  mcpTool(
-    'get_mappings',
-    'List request mappings (URL patterns to handlers). Optional query filters them.',
-    'mappings',
-    false
-  ),
-  mcpTool(
-    'get_loggers',
-    'Search configured loggers by name and return their configured and effective levels.',
-    'loggers',
-    false
-  ),
-  mcpTool(
-    'get_conditions',
-    'Search Spring auto-configuration condition evaluation outcomes by name.',
-    'conditions',
-    false
-  ),
-  mcpTool(
-    'get_scheduled_tasks',
-    'Return the current scheduled task inventory and recent run history.',
-    'scheduled',
-    false
-  ),
-  mcpTool(
-    'get_cache_stats',
-    'Return current cache manager and cache statistics for each configured cache.',
-    'cache',
-    false
-  ),
-  mcpTool(
-    'get_database_connection_pools',
-    'Return current connection pool configuration and live metrics for each configured datasource.',
-    'database-connection-pools',
-    false
+const cliManifestPath = path.join(repoRoot, 'bootui-cli', 'src', 'main', 'resources', 'bootui-tools.json')
+const cliManifest = JSON.parse(await fs.readFile(cliManifestPath, 'utf8'))
+const catalogStack = isQuarkusPlatform ? 'QUARKUS' : 'SPRING_MVC'
+const mcpServerTools = cliManifest.tools
+  .filter(
+    (tool) => tool.stacks.includes(catalogStack) && panels.some((panel) => panel.id === tool.panel && panel.available)
   )
-]
+  .map((tool) => mcpTool(tool.name, tool.summary, tool.panel, tool.action))
 
 const mcpServer = {
   enabled: true,
   configuredMode: 'ON',
   overridden: false,
   serverName: 'bootui',
-  serverVersion: '0.5.0',
+  serverVersion: bootUiVersion,
   transport: 'http',
   endpoint: '/bootui/api/mcp',
-  protocolVersion: '2025-06-18',
+  protocolVersion: '2026-07-28',
+  supportedProtocolVersions: ['2026-07-28', '2025-06-18'],
   maxResults: 200,
+  callCount: 42,
+  totalLatencyMillis: 9180,
+  capacityRefusals: 0,
+  timeouts: 0,
+  responseLimitRefusals: 0,
+  cancellations: 1,
   toolCount: mcpServerTools.length,
   tools: mcpServerTools
 }
@@ -1099,10 +959,16 @@ const mcpServer = {
 // The CLI facade is the same registry projected onto subcommands, so the mock derives every command
 // spelling from the manifest the CLI and the engine actually share. A screenshot cannot then show a
 // command the product does not have, and a renamed command fails this capture instead of going stale.
-const cliManifestPath = path.join(repoRoot, 'bootui-cli', 'src', 'main', 'resources', 'bootui-tools.json')
-const cliManifest = JSON.parse(await fs.readFile(cliManifestPath, 'utf8'))
 const cliManifestTools = new Map(cliManifest.tools.map((tool) => [tool.name, tool]))
-const cliSchemaArguments = {NONE: [], ID: ['id'], LIMIT: ['limit'], QUERY_LIMIT: ['query', 'limit']}
+const cliSchemaArguments = {
+  NONE: [],
+  ID: ['id'],
+  OPTIONAL_ID: ['id'],
+  LIMIT: ['limit'],
+  QUERY: ['query'],
+  QUERY_LIMIT: ['query', 'limit'],
+  RULE_VIOLATIONS: ['id', 'scanId', 'offset', 'limit']
+}
 
 const cliTools = mcpServerTools.map((tool) => {
   const entry = cliManifestTools.get(tool.name)
@@ -1485,17 +1351,21 @@ const cache = {
   clearEnabled: true,
   managerCount: 1,
   cacheCount: 3,
+  tierCount: 3,
   operationCount: 4,
   warnings: [],
   managers: [
     {
       name: 'redisCacheManager',
       type: 'org.springframework.data.redis.cache.RedisCacheManager',
+      composition: 'SIMPLE',
+      dynamicCaches: 'YES',
+      delegateTypes: [],
       noOp: false,
       caches: [
-        cacheEntry('redisCacheManager', 'sample-products', 24, 512, 48, 0.91),
-        cacheEntry('redisCacheManager', 'sample-greetings', 8, 210, 19, 0.92),
-        cacheEntry('redisCacheManager', 'ai-response-snippets', 12, 94, 37, 0.72)
+        cacheEntry('redisCacheManager', 'sample-products', 42, 512, 48),
+        cacheEntry('redisCacheManager', 'sample-greetings', 26, 210, 19),
+        cacheEntry('redisCacheManager', 'ai-response-snippets', 30, 94, 37)
       ]
     }
   ],
@@ -1556,7 +1426,7 @@ const springSecurity = {
   chains: [
     {
       order: 0,
-      requestMatcher: '/bootui/**',
+      requestMatcher: '/admin/** or /api/secure/**',
       requestMatcherType: 'MvcRequestMatcher',
       csrfEnabled: false,
       corsEnabled: true,
@@ -1662,7 +1532,7 @@ const securityEndpoints = {
 
 const pentesting = {
   localOnly: true,
-  checksRun: 80,
+  checksRun: 77,
   findingsFound: 4,
   disclaimer:
     'Heuristic local checks only against the host application; BootUI /bootui paths are excluded. ' +
@@ -1674,7 +1544,7 @@ const pentesting = {
     message:
       'Local OWASP hygiene checks completed against bounded host-application metadata and two direct loopback requests outside BootUI.',
     scannedAt: nowMillis - 45_000,
-    checksRun: 80,
+    checksRun: 77,
     findingsFound: 4
   },
   severityCounts: [
@@ -1797,7 +1667,7 @@ const architecture = {
     'These checks complement, but do not replace, a project-specific ArchUnit test suite or an architecture review.',
   basePackages: ['io.github.jdubois.bootui.sample'],
   classesAnalyzed: 42,
-  rulesEvaluated: 37,
+  rulesEvaluated: 40,
   violationsFound: 4,
   severityCounts: [
     {severity: 'HIGH', count: 1},
@@ -1810,7 +1680,7 @@ const architecture = {
     status: 'SCANNED',
     message: 'Architecture rules completed against 42 application class(es) under the detected base package(s).',
     scannedAt: nowMillis - 35_000,
-    rulesEvaluated: 37,
+    rulesEvaluated: 40,
     classesAnalyzed: 42,
     violationsFound: 4
   },
@@ -1991,7 +1861,7 @@ const restApi = {
   basePackages: ['io.github.jdubois.bootui.sample'],
   controllersAnalyzed: 6,
   handlersAnalyzed: 18,
-  rulesEvaluated: 36,
+  rulesEvaluated: 60,
   violationsFound: 4,
   severityCounts: [
     {severity: 'HIGH', count: 1},
@@ -2005,7 +1875,7 @@ const restApi = {
     message:
       'REST API rules completed against 6 controller(s) and 18 handler method(s) under the detected base package(s).',
     scannedAt: nowMillis - 30_000,
-    rulesEvaluated: 36,
+    rulesEvaluated: 60,
     controllersAnalyzed: 6,
     handlersAnalyzed: 18,
     violationsFound: 4
@@ -2178,26 +2048,25 @@ const security = {
     "Heuristic Spring Security rules run against the host application's registered filter chains and security beans only. " +
     "These checks are review prompts, not verdicts, and should be validated against the application's threat model.",
   filterChains: [
-    'Or [PathPattern [/bootui], PathPattern [/bootui/**], PathPattern [/bootui/api], PathPattern [/bootui/api/**]]',
     'Or [PathPattern [/admin/**], PathPattern [/api/secure], PathPattern [/api/secure/**]]',
     'any request'
   ],
-  filterChainsAnalyzed: 3,
-  rulesEvaluated: 46,
+  filterChainsAnalyzed: 2,
+  rulesEvaluated: 54,
   violationsFound: 5,
   severityCounts: [
     {severity: 'HIGH', count: 2},
-    {severity: 'MEDIUM', count: 1},
-    {severity: 'LOW', count: 1},
+    {severity: 'MEDIUM', count: 2},
+    {severity: 'LOW', count: 0},
     {severity: 'INFO', count: 1}
   ],
   scan: {
     analyzer: 'BootUI Spring Security Advisor',
     status: 'SCANNED',
-    message: 'Security Advisor completed against 3 filter chains.',
+    message: 'Security Advisor completed against 2 application filter chains.',
     scannedAt: nowMillis - 36_000,
-    rulesEvaluated: 46,
-    filterChainsAnalyzed: 3,
+    rulesEvaluated: 54,
+    filterChainsAnalyzed: 2,
     violationsFound: 5
   },
   results: [
@@ -2222,7 +2091,7 @@ const security = {
       'HIGH',
       'Detects a chain whose authorization grants every request to anonymous callers.',
       1,
-      ['Chain #2 (any request) permits every request anonymously even though it configures authentication.'],
+      ['Chain #1 (any request) permits every request anonymously even though it configures authentication.'],
       'Restrict sensitive paths and finish with anyRequest().authenticated(); keep permitAll only for public endpoints.'
     ),
     securityResult(
@@ -2232,18 +2101,18 @@ const security = {
       'MEDIUM',
       'Detects web-exposed actuator endpoints an anonymous caller can reach.',
       1,
-      ['Actuator endpoints are exposed at /actuator but Chain #2 (any request) permits anonymous access to that path.'],
+      ['Actuator endpoints are exposed at /actuator but Chain #1 (any request) permits anonymous access to that path.'],
       'Require authentication for the actuator base path, in the chain that matches it or a dedicated one.'
     ),
     securityResult(
-      'SEC-AUTH-005',
-      'Avoid the auto-generated login page in production',
+      'SEC-AUTH-008',
+      'hideUserNotFoundExceptions should stay enabled',
       'Authentication',
-      'LOW',
-      "Detects the framework's DefaultLoginPageGeneratingFilter while a production profile is active.",
+      'MEDIUM',
+      'An active supported DAO provider retains distinct internal unknown-user exceptions. Response handlers and externally visible errors are not observed.',
       1,
-      ['Chain #2 (any request) serves the auto-generated Spring Security login page in production.'],
-      'Provide a custom login page via formLogin().loginPage(...) for production.'
+      ['An active provider sets hideUserNotFoundExceptions=false; review externally visible failure handling.'],
+      'Prefer hideUserNotFoundExceptions=true and verify that failure handlers do not disclose account existence.'
     ),
     securityResult(
       'SEC-ACT-006',
@@ -2263,12 +2132,12 @@ const spring = {
   disclaimer:
     'Heuristic, project-agnostic Spring rules run against the running application context and Environment only. ' +
     'These checks are review prompts, not verdicts, and should be validated against the application design and tests.',
-  rulesEvaluated: 31,
+  rulesEvaluated: 41,
   violationsFound: 4,
   componentsAnalyzed: 168,
   inspected: [
     'Active profiles: dev',
-    'JSON mapper beans: objectMapper, jsonMapper',
+    'JSON mapper beans of the same type: primaryMapper, auditMapper',
     'RestTemplate beans: restTemplate',
     'spring.application.name: (unset)',
     'debug flag: true',
@@ -2277,65 +2146,67 @@ const spring = {
   severityCounts: [
     {severity: 'HIGH', count: 0},
     {severity: 'MEDIUM', count: 1},
-    {severity: 'LOW', count: 3},
-    {severity: 'INFO', count: 0}
+    {severity: 'LOW', count: 2},
+    {severity: 'INFO', count: 1}
   ],
   scan: {
     analyzer: 'BootUI Spring Advisor',
     status: 'SCANNED',
-    message: 'Spring Advisor evaluated 31 rules against the running application context.',
+    message: 'Spring Advisor evaluated 41 rules against bounded, non-eager application metadata.',
     scannedAt: nowMillis - 28_000,
-    rulesEvaluated: 31,
+    rulesEvaluated: 41,
     componentsAnalyzed: 168,
     violationsFound: 4
   },
   results: [
     restApiResult(
-      'SPRING-PROFILE-002',
-      'Spring Boot DevTools should be scoped to development',
-      'Profiles and environment',
+      'SPRING-WIRING-001',
+      'Review bean definition overriding permission',
+      'Bean wiring',
       'MEDIUM',
-      'Spring Boot DevTools is on the classpath. It enables automatic restart, a live-reload server, and relaxed caching, and must never be bundled into a production artifact.',
+      'The observed bean factory permits replacement of same-name definitions; this does not prove an override occurred.',
       'VIOLATION',
       1,
-      ['spring-boot-devtools is present on the classpath.'],
-      'Scope spring-boot-devtools to development only (Maven <optional>true</optional> / Gradle developmentOnly) so it is excluded from production builds.',
-      'https://docs.spring.io/spring-boot/reference/using/devtools.html'
+      ['The current bean factory permits bean definition overriding; no actual replacement was inferred.'],
+      'Keep overriding disabled unless replacement is deliberate. Review effective factory configuration, not only spring.main properties.',
+      'https://docs.spring.io/spring-boot/reference/features/spring-application.html'
     ),
     restApiResult(
       'SPRING-WIRING-003',
-      'Avoid multiple JSON mapper beans',
+      'Review default JSON mapper selection',
       'Bean wiring',
-      'LOW',
-      'Detects more than one Jackson JSON mapper bean with none marked @Primary, which can lead to inconsistent JSON (de)serialization depending on which one is injected.',
+      'INFO',
+      'Checks Jackson 2 ObjectMapper and Jackson 3 JsonMapper groups independently for unresolved default candidate metadata.',
       'VIOLATION',
-      2,
-      ['JSON mapper bean: objectMapper', 'JSON mapper bean: jsonMapper'],
-      'Keep a single primary JSON mapper. With Jackson 3 (the Spring Boot 4 default) customise the auto-configured mapper via a JsonMapperBuilderCustomizer, or mark one bean @Primary.',
+      1,
+      [
+        'Same-type JSON mapper default candidate metadata is unresolved: primaryMapper, auditMapper. Qualified injection may be intentional.'
+      ],
+      'Review qualifiers, aliases, primary/default/fallback flags and intended mapper use. Multiple mappers can be legitimate.',
       'https://docs.spring.io/spring-boot/reference/features/json.html'
     ),
     restApiResult(
       'SPRING-WIRING-007',
-      'Prefer RestClient over RestTemplate',
+      'Review RestTemplate migration',
       'Bean wiring',
       'LOW',
-      'A RestTemplate bean is defined. RestTemplate is in maintenance mode; Spring Boot 4 favours the fluent, modern RestClient for synchronous HTTP access.',
+      'A RestTemplate bean is declared, not necessarily used. Review actual call sites before migration.',
       'VIOLATION',
       1,
       ['RestTemplate bean: restTemplate'],
-      'Migrate RestTemplate usage to RestClient (RestClient.create() or an injected RestClient.Builder). Keep RestTemplate only where a dependency still requires it.',
+      "When migrating active call sites, inject Boot's RestClient.Builder to retain shared customizations. Keep dependency-required RestTemplate usage deliberate.",
       'https://docs.spring.io/spring-framework/reference/integration/rest-clients.html'
     ),
     restApiResult(
       'SPRING-CONFIG-002',
-      'Disable global debug or trace logging',
+      'Review broad verbose logging configuration',
       'Configuration',
       'LOW',
-      'Detects debug=true or trace=true, which switch on verbose auto-configuration logging and can leak internal details or slow down the application.',
+      'Configured debug/trace intent may increase output and expose internals. It does not establish current runtime logger levels.',
       'VIOLATION',
       1,
-      ['debug=true is set in the environment.'],
-      'Remove the debug/trace flags and configure logging levels per package instead.',
+      ["debug is configured for selected diagnostic loggers, not every logger's effective level."],
+      'Review the diagnostic need and configure targeted logger levels. Runtime logging changes require separate observation.',
       'https://docs.spring.io/spring-boot/reference/features/logging.html'
     )
   ]
@@ -2346,7 +2217,7 @@ const quarkusAdvisor = {
   disclaimer:
     'Heuristic, project-agnostic Quarkus rules run against the running application and its MicroProfile Config only. ' +
     'These checks are review prompts, not verdicts, and should be validated against the application design and tests.',
-  rulesEvaluated: 10,
+  rulesEvaluated: 14,
   violationsFound: 4,
   componentsAnalyzed: 54,
   inspected: [
@@ -2366,60 +2237,60 @@ const quarkusAdvisor = {
   scan: {
     analyzer: 'BootUI Quarkus Advisor',
     status: 'SCANNED',
-    message: 'Quarkus Advisor evaluated 10 rules against the running application.',
+    message: 'Quarkus Advisor evaluated 14 rules against the running application.',
     scannedAt: nowMillis - 28_000,
-    rulesEvaluated: 10,
+    rulesEvaluated: 14,
     componentsAnalyzed: 54,
     violationsFound: 4
   },
   results: [
     restApiResult(
       'QA-PROD-002',
-      'Destructive Hibernate schema strategy in the prod profile',
-      'Production readiness',
+      'Automatic schema changes in observed production configuration',
+      'Production',
       'HIGH',
-      'The prod profile sets quarkus.hibernate-orm.schema-management.strategy to drop-and-create, which drops and recreates the database schema on every startup. In production this destroys data.',
+      'Observed production configuration requests drop-and-create. These declarations do not prove a future deployment’s effective configuration.',
       'VIOLATION',
       1,
       ['%prod quarkus.hibernate-orm.schema-management.strategy = drop-and-create'],
-      'Use validate (or none) in the prod profile and manage schema changes with Flyway or Liquibase.',
+      'Review schema creation and alteration before production use; prefer reviewed migrations where appropriate.',
       'https://quarkus.io/guides/hibernate-orm#schema-generation'
     ),
     restApiResult(
-      'QA-CDI-001',
-      'Shared mutable state on an @ApplicationScoped bean',
-      'CDI and concurrency',
+      'QA-CDI-004',
+      'Public field on a normal-scoped bean',
+      'CDI',
       'MEDIUM',
-      'An @ApplicationScoped bean exposes a mutable instance field. Application-scoped beans are shared singletons accessed concurrently, so unsynchronized mutable state risks race conditions.',
+      'Direct public-field access through a normal-scoped client proxy does not reach the contextual instance. Field accesses have not been observed.',
       'VIOLATION',
       1,
-      ['CatalogService.requestCount (int) is a mutable field on an @ApplicationScoped bean.'],
-      'Make the field immutable, move request state to a @RequestScoped bean or method parameters, or guard it (e.g. AtomicInteger).',
+      ['CatalogService.requestCount is a public non-static field on a resolved @ApplicationScoped bean.'],
+      'Make the field private and access it through methods that delegate to the current contextual instance.',
       'https://quarkus.io/guides/cdi-reference'
     ),
     restApiResult(
       'QA-CFG-002',
-      'Hibernate SQL logging enabled in the prod profile',
+      'SQL logging in observed production configuration',
       'Configuration',
       'MEDIUM',
-      'The prod profile enables quarkus.hibernate-orm.log.sql, which logs every SQL statement. In production this floods logs and can leak sensitive data.',
+      'Observed production configuration enables SQL logging. This does not establish bind-parameter logging or prove a deployed setting.',
       'VIOLATION',
       1,
       ['%prod quarkus.hibernate-orm.log.sql = true'],
-      'Disable SQL logging in the prod profile; keep it in %dev only.',
+      'Review whether SQL logging is appropriate for production and its log handling requirements.',
       'https://quarkus.io/guides/hibernate-orm#logging-sql'
     ),
     restApiResult(
-      'QA-CFG-001',
-      'No type-safe configuration mapping',
-      'Configuration',
+      'QA-WEB-002',
+      'HTTP request-draining timeout is zero',
+      'Web',
       'LOW',
-      'Configuration is read through individual @ConfigProperty injections with no @ConfigMapping interface. Type-safe @ConfigMapping groups related keys, validates them at startup, and documents the configuration surface.',
+      'The configured zero shutdown timeout disables waiting for in-flight HTTP requests; zero does not mean waiting without limit.',
       'VIOLATION',
       1,
-      ['No @ConfigMapping interface found; 6 @ConfigProperty injection points detected.'],
-      'Group related configuration keys into a @ConfigMapping interface for type-safe, validated access.',
-      'https://quarkus.io/guides/config-mappings'
+      ['quarkus.shutdown.timeout=0s disables HTTP request draining.'],
+      'Set a positive duration if HTTP request draining is needed. Removing the override does not enable draining.',
+      'https://quarkus.io/guides/http-reference'
     )
   ]
 }
@@ -2435,7 +2306,7 @@ const quarkusSecurity = {
     '@RolesAllowed → SecureResource#secured [USER]'
   ],
   filterChainsAnalyzed: 3,
-  rulesEvaluated: 25,
+  rulesEvaluated: 45,
   violationsFound: 5,
   severityCounts: [
     {severity: 'CRITICAL', count: 1},
@@ -2448,7 +2319,7 @@ const quarkusSecurity = {
     status: 'SCANNED',
     message: 'Security Advisor completed against 3 permission policies.',
     scannedAt: nowMillis - 36_000,
-    rulesEvaluated: 25,
+    rulesEvaluated: 45,
     filterChainsAnalyzed: 3,
     violationsFound: 5
   },
@@ -2511,7 +2382,7 @@ const memoryAdvisor = {
   disclaimer:
     'Heuristic JVM memory, GC, and thread rules run against the live management beans only. ' +
     'Findings are review prompts; validate against the application workload and a profiler before acting.',
-  rulesEvaluated: 22,
+  rulesEvaluated: 32,
   violationsFound: 3,
   summary: {
     heapUsedPercent: 82,
@@ -2533,9 +2404,9 @@ const memoryAdvisor = {
   scan: {
     analyzer: 'BootUI Memory Advisor',
     status: 'SCANNED',
-    message: 'Memory Advisor evaluated 22 rules against the live management beans.',
+    message: 'Memory Advisor evaluated 32 rules against the live management beans.',
     scannedAt: nowMillis - 24_000,
-    rulesEvaluated: 22,
+    rulesEvaluated: 32,
     violationsFound: 3
   },
   results: [
@@ -2585,7 +2456,7 @@ const graalVm = {
   basePackages: ['io.github.jdubois.bootui.sample'],
   includeDependencies: true,
   classesAnalyzed: 42,
-  checksRun: 9,
+  checksRun: 30,
   findingsFound: 3,
   dependenciesAnalyzed: 17,
   dependenciesWithoutMetadata: 12,
@@ -2598,9 +2469,9 @@ const graalVm = {
   },
   severityCounts: [
     {severity: 'HIGH', count: 0},
-    {severity: 'MEDIUM', count: 2},
+    {severity: 'MEDIUM', count: 1},
     {severity: 'LOW', count: 1},
-    {severity: 'INFO', count: 0}
+    {severity: 'INFO', count: 1}
   ],
   metadata: {
     reflectionEntries: 4,
@@ -2614,8 +2485,8 @@ const graalVm = {
   ],
   findings: [
     graalVmFinding(
-      'GRAAL-REFLECTION-001',
-      'Reflective constructor access needs metadata',
+      'GRAAL-REFLECT-001',
+      'Reflective API usage may need reflection metadata',
       'Reflection',
       'MEDIUM',
       'SampleService reflectively creates a plugin class.',
@@ -2627,17 +2498,17 @@ const graalVm = {
       'Review whether the target type needs reflection metadata or can be registered through Spring AOT.'
     ),
     graalVmFinding(
-      'GRAAL-SERIALIZATION-001',
-      'Serializable domain type may need registration',
+      'GRAAL-SER-001',
+      'Serializable types may need serialization metadata',
       'Serialization',
-      'MEDIUM',
+      'INFO',
       'A Serializable type is visible in application code.',
       1,
       ['io.github.jdubois.bootui.sample.ChatAudit implements java.io.Serializable'],
       'Register serialization metadata only if the type is serialized at runtime.'
     ),
     graalVmFinding(
-      'GRAAL-RESOURCE-001',
+      'GRAAL-RES-001',
       'Runtime resource lookup detected',
       'Resources',
       'LOW',
@@ -2655,18 +2526,18 @@ const crac = {
     'Heuristic checkpoint/restore readiness checks run against the host application only and complement, but do not replace, an actual checkpoint/restore run on a CRaC-enabled JDK.',
   runtime: {
     cracApiPresent: true,
-    cracCapableJvm: true,
-    jvmName: 'OpenJDK 64-Bit Server VM Zulu-CRaC',
-    checkpointOnRefresh: true,
-    checkpointTo: '/var/run/bootui/cr',
+    cracCapableJvm: false,
+    jvmName: 'OpenJDK 64-Bit Server VM',
+    checkpointOnRefresh: false,
+    checkpointTo: null,
     restoreFrom: null,
-    cracJvmArgs: ['-XX:CRaCCheckpointTo=/var/run/bootui/cr'],
+    cracJvmArgs: [],
     summary:
-      'A CRaC-enabled JVM is running with the org.crac API on the classpath and automatic checkpoint-on-refresh enabled.'
+      'The org.crac API is on the classpath; this JVM reports no CRaC implementation or checkpoint configuration. Readiness findings are review prompts, not proof of a working checkpoint.'
   },
   basePackages: ['io.github.jdubois.bootui.sample'],
   classesAnalyzed: 42,
-  checksRun: 7,
+  checksRun: 19,
   findingsFound: 3,
   warnings: [],
   scan: {
@@ -2676,10 +2547,10 @@ const crac = {
     scannedAt: new Date(nowMillis - 42_000).toISOString()
   },
   severityCounts: [
-    {severity: 'HIGH', count: 2},
+    {severity: 'HIGH', count: 1},
     {severity: 'MEDIUM', count: 1},
     {severity: 'LOW', count: 0},
-    {severity: 'INFO', count: 0}
+    {severity: 'INFO', count: 1}
   ],
   findings: [
     cracFinding(
@@ -2693,14 +2564,14 @@ const crac = {
       'Implement org.crac.Resource and close the resource in beforeCheckpoint(), re-opening it in afterRestore().'
     ),
     cracFinding(
-      'CRAC-RANDOM-001',
-      'Static Random/SecureRandom state is frozen into the checkpoint',
+      'CRAC-RANDOM-002',
+      'SecureRandom restore behavior depends on construction and provider',
       'Randomness',
-      'HIGH',
-      'A static SecureRandom field is captured at checkpoint time, so every restored instance replays the same sequence.',
+      'INFO',
+      'A SecureRandom field is present, but its constructor, algorithm and security provider are not known. Restore behavior must be verified on the deployed runtime.',
       1,
       ['io.github.jdubois.bootui.sample.TokenFactory declares a static java.security.SecureRandom'],
-      'Re-seed or recreate the generator in an org.crac.Resource.afterRestore() callback.'
+      'Keep security generators unseeded unless the application deliberately owns reseeding, and test the exact JDK, algorithm and provider.'
     ),
     cracFinding(
       'CRAC-THREAD-001',
@@ -4128,6 +3999,312 @@ const sqlTraceInsights = {
 
 const activityRequestId = 'act-req-1'
 
+const insightCheck = (kind, title, eligibleRequests, findings, status = 'EVALUATED', reason = null) => ({
+  kind,
+  title,
+  status,
+  eligibleRequests,
+  findings,
+  reason
+})
+
+const runtimeInsightsReport = {
+  available: true,
+  unavailableReason: null,
+  window: {
+    runId: 'run-5',
+    firstEventAt: nowMillis - 9 * 60_000,
+    lastEventAt: nowMillis - 4_000,
+    retainedEvents: 18412,
+    requests: 1240,
+    evictedEvents: 0,
+    droppedEvents: 0
+  },
+  coverage: [
+    {source: 'sql', events: 9620, byRequestId: 9410, byExecutionId: 160, byTraceId: 0, unlinked: 50, dropped: 0},
+    {source: 'connection', events: 2480, byRequestId: 2440, byExecutionId: 32, byTraceId: 0, unlinked: 8, dropped: 0},
+    {source: 'http', events: 1240, byRequestId: 1240, byExecutionId: 0, byTraceId: 0, unlinked: 0, dropped: 0},
+    {source: 'transaction', events: 1180, byRequestId: 1150, byExecutionId: 30, byTraceId: 0, unlinked: 0, dropped: 0},
+    {source: 'rest-client', events: 310, byRequestId: 304, byExecutionId: 6, byTraceId: 0, unlinked: 0, dropped: 0},
+    {source: 'ai', events: 96, byRequestId: 0, byExecutionId: 0, byTraceId: 96, unlinked: 0, dropped: 0},
+    {source: 'log', events: 42, byRequestId: 31, byExecutionId: 2, byTraceId: 0, unlinked: 9, dropped: 0}
+  ],
+  checks: [
+    insightCheck('route-time-breakdown', 'Route time breakdown', 1220, 9),
+    insightCheck('exception-hotspots', 'Exception hotspots', 1240, 2),
+    insightCheck('errors-behind-2xx', 'Errors behind 2xx responses', 1108, 1),
+    insightCheck('repeated-selects', 'Repeated SELECTs', 1240, 1),
+    insightCheck('connections-per-request', 'Connections per request', 1240, 1),
+    insightCheck('safe-method-dml', 'Writes in GET requests', 980, 0),
+    insightCheck('split-transaction-writes', 'Writes split across transactions', 210, 0),
+    insightCheck('transaction-across-remote-call', 'Transactions open across remote calls', 96, 1),
+    insightCheck('lazy-sql-after-handler', 'SQL after the handler returned', 1240, 0),
+    insightCheck(
+      'event-loop-blocking',
+      'Blocking on event loops',
+      0,
+      0,
+      'NOT_APPLICABLE',
+      'Spring MVC serves requests on worker threads, not on event loops.'
+    ),
+    insightCheck('ai-usage-by-route', 'AI usage by route', 1240, 1),
+    insightCheck('framework-warnings-by-route', 'Framework warnings by route', 1240, 1)
+  ],
+  observations: [
+    {
+      id: 'route-time-breakdown:4c1f9a20b7',
+      kind: 'route-time-breakdown',
+      listed: false,
+      unlistedReason: 'Shown in the request profile in Live Activity.',
+      subject: 'GET /api/secure/products',
+      status: 'OBSERVED',
+      sentence:
+        '`GET /api/secure/products`: warm median 101 ms over 30 requests; Authentication 95 %, SQL 3 %, Response write 1 %. First request 412 ms (cold).',
+      eligible: 30,
+      affected: 30,
+      minimumTier: 'REQUEST_ID',
+      whatToCheck: [
+        'Most of the time is authentication: check how credentials are verified.',
+        'Open the slowest exemplar request in Live Activity to see its timeline.'
+      ],
+      exemplarRequestIds: ['8f2c4be19d7a3e61', '1a77c0de5b9f2e30', 'c4e9a1f0b7d26853'],
+      evidenceRows: 5,
+      limitations: []
+    },
+    {
+      id: 'route-time-breakdown:0b9e7d1c55',
+      kind: 'route-time-breakdown',
+      listed: false,
+      unlistedReason: 'Shown in the request profile in Live Activity.',
+      subject: 'GET /api/sample/products',
+      status: 'OBSERVED',
+      sentence: '`GET /api/sample/products`: warm median 11 ms over 412 requests; SQL 61 %, Handler, other work 24 %.',
+      eligible: 412,
+      affected: 412,
+      minimumTier: 'REQUEST_ID',
+      whatToCheck: ['Most of the time is SQL: compare its statements in SQL Trace, and see Repeated SELECTs.'],
+      exemplarRequestIds: ['5d0e8c2a91f7b436'],
+      evidenceRows: 6,
+      limitations: []
+    },
+    {
+      id: 'repeated-selects:7ec8a0575e',
+      kind: 'repeated-selects',
+      listed: false,
+      unlistedReason: 'Reached with Show all routes, a search, or a query naming the kind.',
+      subject: 'GET /api/owners/{id}',
+      status: 'OBSERVED',
+      sentence:
+        '`GET /api/owners/{id}` ran `select * from pet where owner_id = ?` 5 or more times after another statement in 18 of 24 requests, up to 40 times in one.',
+      eligible: 24,
+      affected: 18,
+      minimumTier: 'REQUEST_ID',
+      whatToCheck: ['If each row loads its own children, fetch them with the parent in one query.'],
+      exemplarRequestIds: ['9b3d1e7f24a0c865'],
+      evidenceRows: 18,
+      limitations: []
+    },
+    {
+      id: 'connections-per-request:2d8f61a9c3',
+      kind: 'connections-per-request',
+      listed: false,
+      unlistedReason: 'Shown in Database Connection Pools.',
+      subject: 'POST /api/orders',
+      status: 'OBSERVED',
+      sentence: '`POST /api/orders` held 2 connections of `dataSource` at the same time in 12 of 40 requests.',
+      eligible: 40,
+      affected: 12,
+      minimumTier: 'REQUEST_ID',
+      whatToCheck: ['If a nested transaction opens its own connection, check that the pool can hold both per request.'],
+      exemplarRequestIds: ['e1f04c7b9a2d6538'],
+      evidenceRows: 12,
+      limitations: []
+    },
+    {
+      id: 'transaction-across-remote-call:ae2379168d',
+      kind: 'transaction-across-remote-call',
+      listed: true,
+      unlistedReason: null,
+      subject: 'POST /api/orders',
+      status: 'OBSERVED',
+      sentence: '`POST /api/orders` kept a transaction open while calling `inventory.internal`; median call 96 ms.',
+      eligible: 40,
+      affected: 12,
+      minimumTier: 'REQUEST_ID',
+      whatToCheck: [
+        'Check whether the remote call can run before or after the transaction without changing correctness.'
+      ],
+      exemplarRequestIds: ['e1f04c7b9a2d6538'],
+      evidenceRows: 12,
+      limitations: []
+    },
+    {
+      id: 'ai-usage-by-route:6a2e0f9b14',
+      kind: 'ai-usage-by-route',
+      listed: false,
+      unlistedReason: 'Shown in the AI Framework panel.',
+      subject: 'POST /api/chat',
+      status: 'OBSERVED',
+      sentence:
+        '`POST /api/chat` made 96 AI operations in 24 of 24 requests: 72 model calls, up to 5 in one request, a median 840 ms each.',
+      eligible: 24,
+      affected: 24,
+      minimumTier: 'TRACE_ID',
+      whatToCheck: [
+        'Several model calls in one request suggest an agent or tool loop: check that it ends and caps its iterations.'
+      ],
+      exemplarRequestIds: ['7a19c3e0f5b2d846'],
+      evidenceRows: 20,
+      limitations: []
+    }
+  ],
+  limitations: [],
+  notExercised: ['DELETE /api/orders/{id}', 'PUT /api/owners/{id}', 'POST /api/sample/mail'],
+  notExercisedOmitted: 0
+}
+
+const runtimeRunComparison = {
+  status: 'COMPARED',
+  reason: null,
+  current: {runId: 'run-5', ordinal: 5, startedAt: nowMillis - 240_000, endedAt: null, requests: 64, source: 'CURRENT'},
+  previous: {
+    runId: 'run-4',
+    ordinal: 4,
+    startedAt: nowMillis - 900_000,
+    endedAt: nowMillis - 250_000,
+    requests: 58,
+    source: 'MEMORY'
+  },
+  runs: [
+    {
+      runId: 'run-4',
+      ordinal: 4,
+      startedAt: nowMillis - 900_000,
+      endedAt: nowMillis - 250_000,
+      requests: 58,
+      source: 'MEMORY'
+    },
+    {
+      runId: 'run-3',
+      ordinal: 3,
+      startedAt: nowMillis - 1_800_000,
+      endedAt: nowMillis - 910_000,
+      requests: 41,
+      source: 'MEMORY'
+    }
+  ],
+  notComparableReasons: [],
+  behavior: [
+    {
+      kind: 'new-statement',
+      subject: 'GET /api/sample/products',
+      detail: 'select p.id, p.name from sample_product_review p where p.product_id = ?',
+      change: 'ADDED',
+      before: null,
+      after: 12,
+      beforeSamples: 12,
+      afterSamples: 12,
+      sentence:
+        '`GET /api/sample/products` ran `select p.id, p.name from sample_product_review p where p.product_id = ?` 12 times, which its 12 requests in run 4 never ran.'
+    },
+    {
+      kind: 'statements-per-request',
+      subject: 'GET /api/sample/products',
+      detail: null,
+      change: 'INCREASED',
+      before: 1,
+      after: 2,
+      beforeSamples: 12,
+      afterSamples: 12,
+      sentence: '`GET /api/sample/products` ran 2.0 statements per request, up from 1.0 in run 4 (12 and 12 requests).'
+    }
+  ],
+  edges: [
+    {
+      kind: 'edge',
+      subject: 'GET /api/sample/products',
+      detail: 'READS TABLE sample_product_review',
+      change: 'ADDED',
+      before: null,
+      after: 12,
+      beforeSamples: 0,
+      afterSamples: 12,
+      sentence: '`GET /api/sample/products` reads table `sample_product_review`, 12 times, and not in run 4.'
+    }
+  ],
+  restartCost: {
+    status: 'COMPARED',
+    reason: null,
+    readyMsBefore: 2140,
+    readyMsAfter: 1870,
+    beans: []
+  },
+  latency: [],
+  limitations: []
+}
+
+const runtimeResourceProfile = {
+  state: 'COMPLETED',
+  reason: null,
+  sampler: 'jdk.ExecutionSample',
+  startedAt: nowMillis - 95_000,
+  endsAt: nowMillis - 65_000,
+  finishedAt: nowMillis - 65_000,
+  maxDurationSeconds: 30,
+  cpuSamples: 1840,
+  outsideSamples: 410,
+  requests: 96,
+  routes: [
+    {
+      route: 'GET /api/sample/products',
+      requests: 64,
+      cpuSamples: 1012,
+      allocatedBytes: 186_400_000,
+      virtualThreads: true,
+      hotFrames: [
+        {frame: 'io.github.jdubois.bootui.sample.ProductService.findAll:58', samples: 604},
+        {frame: 'io.github.jdubois.bootui.sample.ProductController.list:41', samples: 211}
+      ]
+    },
+    {
+      route: 'GET /api/secure/products',
+      requests: 30,
+      cpuSamples: 398,
+      allocatedBytes: 41_200_000,
+      virtualThreads: true,
+      hotFrames: [{frame: 'io.github.jdubois.bootui.sample.SecurityConfig.passwordEncoder:33', samples: 352}]
+    },
+    {
+      route: 'POST /api/orders',
+      requests: 2,
+      cpuSamples: 20,
+      allocatedBytes: 2_100_000,
+      virtualThreads: false,
+      hotFrames: []
+    }
+  ],
+  routesOmitted: 0,
+  limitations: [
+    'CPU is counted in samples of running threads every 10 ms (jdk.ExecutionSample), not as a measured time; JFR samples a bounded number of threads each time.',
+    "Allocated bytes are JFR's estimate from its allocation samples."
+  ]
+}
+
+const runtimeInsightDetail = {
+  available: true,
+  unavailableReason: null,
+  observation: runtimeInsightsReport.observations[0],
+  columns: ['Phase', 'Total (ms)', 'Share', 'Median per request (ms)'],
+  rows: [
+    {cells: ['Authentication', '2878', '95 %', '96']},
+    {cells: ['Other filters', '18', '1 %', '0.6']},
+    {cells: ['Connection wait', '3.0', '0 %', '0.1']},
+    {cells: ['SQL', '91', '3 %', '3.0']},
+    {cells: ['Response write', '30', '1 %', '1.0']}
+  ],
+  truncated: 0
+}
+
 const activityReport = {
   available: true,
   entries: [
@@ -4233,7 +4410,7 @@ const activityReport = {
       timestamp: nowMillis - 2200,
       severity: 'OK',
       summary: '← orders.created [0]',
-      detail: 'key=order-1042 offset=1041',
+      detail: 'key 8b5f2d31… · offset 1041',
       durationMs: 8,
       correlationId: null,
       method: null,
@@ -4248,7 +4425,7 @@ const activityReport = {
       timestamp: nowMillis - 2300,
       severity: 'OK',
       summary: '→ orders.created [0]',
-      detail: 'key=order-1042',
+      detail: 'key 8b5f2d31…',
       durationMs: null,
       correlationId: null,
       method: null,
@@ -4458,7 +4635,7 @@ const activityReport = {
     restCallErrorRatePercent: 50.0,
     restCallP95LatencyMs: 3002
   },
-  sources: ['requests', 'exceptions', 'sql', 'security', 'cache', 'scheduled-tasks', 'kafka', 'email', 'rest-client'],
+  sources: ['Runtime journal'],
   warnings: []
 }
 
@@ -4655,11 +4832,11 @@ const databaseAdvisor = {
     'Database checks inspect schema metadata only. Review findings against your application workload before changing indexes or mappings.',
   dataSourceNames: ['dataSource (HikariPool-1)'],
   tablesAnalyzed: 14,
-  rulesEvaluated: 15,
+  rulesEvaluated: 28,
   violationsFound: 3,
   severityCounts: [
-    {severity: 'HIGH', count: 1},
-    {severity: 'MEDIUM', count: 1},
+    {severity: 'HIGH', count: 0},
+    {severity: 'MEDIUM', count: 2},
     {severity: 'LOW', count: 1},
     {severity: 'INFO', count: 0}
   ],
@@ -4668,23 +4845,25 @@ const databaseAdvisor = {
     status: 'SCANNED',
     message: 'Database Advisor completed.',
     scannedAt: nowMillis - 42_000,
-    rulesEvaluated: 15,
+    rulesEvaluated: 28,
     entitiesAnalyzed: 14,
     violationsFound: 3
   },
   results: [
     {
-      id: 'DB-HIB-001',
-      name: 'Mapped foreign key column has no physical index',
-      category: 'Hibernate cross-reference',
-      severity: 'HIGH',
-      description:
-        'Cross-references mapped @ManyToOne/@OneToOne @JoinColumn foreign keys against the physical schema indexes.',
+      id: 'DB-SCHEMA-002',
+      name: 'Foreign-key access-path review',
+      category: 'Physical schema',
+      severity: 'MEDIUM',
+      description: 'Identifies foreign keys with no observed ordinary index leading on the full child column set.',
       status: 'VIOLATION',
       violationCount: 1,
-      sampleViolations: ['Entity OrderItem maps ORDER_ID, but table ORDER_ITEMS has no index beginning with ORDER_ID.'],
-      recommendation: 'Add a database index through a migration whose leading column is ORDER_ID.',
-      learnMoreUrl: 'https://vladmihalcea.com/how-to-map-a-onetomany-jpa-and-hibernate-association/'
+      sampleViolations: [
+        'Foreign key FK_ORDER_ITEMS_ORDER on ORDER_ITEMS has no observed ordinary leading access path.'
+      ],
+      recommendation:
+        'Review parent-key updates/deletes and representative query plans before adding an index; no table scan is proven.',
+      learnMoreUrl: 'https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK'
     },
     {
       id: 'DB-SCHEMA-001',
@@ -4703,14 +4882,17 @@ const databaseAdvisor = {
     },
     {
       id: 'DB-SCHEMA-003',
-      name: 'Duplicate/redundant indexes',
+      name: 'Exact duplicate index candidates',
       category: 'Physical schema',
       severity: 'LOW',
-      description: 'Detects indexes whose column lists are exact duplicates or share the same leading columns.',
+      description: 'Compares fully known ordinary index keys, payload, ordering, collation, method and state.',
       status: 'VIOLATION',
       violationCount: 1,
-      sampleViolations: ['Index IDX_PRODUCTS_SKU duplicates the leading columns of UK_PRODUCTS_SKU.'],
-      recommendation: 'Confirm query plans, then remove the redundant index.',
+      sampleViolations: [
+        'Indexes IDX_PRODUCTS_SKU and IDX_PRODUCTS_SKU_COPY have identical observed ordinary definitions.'
+      ],
+      recommendation:
+        'Review both definitions, constraint dependencies, index hints and workload before considering removal.',
       learnMoreUrl: 'https://use-the-index-luke.com/sql/dml'
     }
   ]
@@ -5847,8 +6029,8 @@ const postgresql = {
 
 const screenshots = [
   [
-    'overview',
-    'Overview',
+    'scorecard',
+    'Scorecard',
     'bootui-overview.webp',
     async (page) => {
       await page.getByRole('button', {name: /Re-run all scanners/}).click()
@@ -5898,7 +6080,7 @@ const screenshots = [
   ],
   ['threads', 'Threads', 'bootui-threads.webp', waitForText('http-nio-8080-exec-1')],
   ['startup', 'Startup Timeline', 'bootui-startup-timeline.webp', waitForText('spring.context.refresh')],
-  ['graalvm', 'GraalVM', 'bootui-graalvm.webp', waitForText('Reflective constructor access needs metadata')],
+  ['graalvm', 'GraalVM', 'bootui-graalvm.webp', waitForText('Reflective API usage may need reflection metadata')],
   ['crac', 'CRaC', 'bootui-crac.webp', waitForText('Open resources held in fields must be released at checkpoint')],
   ['config', 'Configuration', 'bootui-configuration.webp', waitForText('sample.greeting')],
   ['profile-diff', 'Profile Diff', 'bootui-profile-diff.webp', waitForText('classpath:/application-dev.properties')],
@@ -5979,7 +6161,7 @@ const screenshots = [
     'bootui-database-advisor.webp',
     async (page) => {
       await page.getByText('Tables without a primary key').waitFor()
-      await page.getByText('Mapped foreign key column has no physical index').waitFor()
+      await page.getByText('Foreign-key access-path review').waitFor()
     }
   ],
   [
@@ -6089,6 +6271,28 @@ const screenshots = [
       await page.getByText('Cache hit ratio').waitFor()
     }
   ],
+  [
+    'runtime-insights',
+    'Runtime Insights',
+    'bootui-runtime-insights.webp',
+    async (page) => {
+      await page.getByPlaceholder(/Search checks, routes/).fill('/api/secure/products')
+      await page.locator('.insight-item', {hasText: '/api/secure/products'}).click()
+      await page.locator('#insight-sentence', {hasText: 'warm median 101 ms'}).waitFor()
+      await page.locator('.insight-evidence').getByText('Authentication').waitFor()
+    }
+  ],
+  [
+    'runtime-insights',
+    'Runtime Insights',
+    'bootui-run-comparison.webp',
+    async (page) => {
+      await page.getByRole('tab', {name: /^Changes/}).click()
+      await page.getByRole('heading', {name: 'Compared with the previous run'}).waitFor()
+      await page.locator('[data-testid="comparison-status"]').getByText('Compared', {exact: true}).waitFor()
+      await page.getByRole('heading', {name: /^What the routes and executions did/}).waitFor()
+    }
+  ],
   ['traces', 'Traces', 'bootui-traces.webp', waitForText('/api/chat')],
   ['log-tail', 'Log Tail', 'bootui-log-tail.webp', waitForText('Started BootUI sample application')],
   [
@@ -6162,10 +6366,26 @@ const screenshots = [
   ],
   ['architecture', 'Architecture', 'bootui-architecture.webp', waitForText('Packages should be free of cycles')],
   ['rest-api', 'REST API', 'bootui-rest-api.webp', waitForText("Don't expose JPA entities in responses")],
-  ['spring', 'Spring', 'bootui-spring.webp', waitForText('Prefer RestClient over RestTemplate')],
+  ['spring', 'Spring', 'bootui-spring.webp', waitForText('Review RestTemplate migration')],
   ['memory', 'Memory', 'bootui-memory.webp', waitForText('Old generation is near its maximum')],
   ['mcp-server', 'MCP Server', 'bootui-mcp-server.webp', waitForText('Client configuration')],
-  ['cli', 'Command Line', 'bootui-cli.webp', waitForText('Commands available')],
+  [
+    'cli',
+    'Command Line',
+    'bootui-cli.webp',
+    async (page) => {
+      await page.getByText('Commands available', {exact: false}).waitFor()
+      for (const name of ['enable_agent_sensor', 'disable_agent_sensor', 'get_agent_status']) {
+        await page.getByText(name, {exact: true}).waitFor()
+      }
+      const statusRow = page
+        .locator('li.list-group-item')
+        .filter({has: page.getByText('get_agent_status', {exact: true})})
+      if ((await statusRow.innerText()).includes('--limit')) {
+        throw new Error('The agent status command accepts query only, never limit.')
+      }
+    }
+  ],
   ['devtools', 'Spring DevTools', 'bootui-devtools.webp', waitForText('Trigger LiveReload')],
   ['dev-services', 'Dev Services', 'bootui-dev-services.webp', waitForText('postgres')],
   [
@@ -6197,7 +6417,7 @@ const quarkusScreenshots = [
     'spring',
     'Quarkus',
     'bootui-quarkus.webp',
-    waitForText('Destructive Hibernate schema strategy in the prod profile')
+    waitForText('Automatic schema changes in observed production configuration')
   ],
   ['security', 'Security', 'bootui-quarkus-security.webp', waitForText('QS-CORS-002')]
 ]
@@ -6610,13 +6830,8 @@ async function handleApiRoute(route) {
   if (endpoint === 'github' || endpoint === 'github/refresh') return fulfillJson(route, github)
   if (endpoint === 'panels')
     return fulfillJson(route, {
-      ...(isQuarkusPlatform ? {platform: 'quarkus'} : {}),
-      panels: panelOrder.map(([id, title]) => ({
-        id,
-        title,
-        available: isQuarkusPlatform ? !quarkusUnavailablePanels.has(id) : true,
-        unavailableReason: isQuarkusPlatform && quarkusUnavailablePanels.has(id) ? 'Not applicable on Quarkus' : null
-      }))
+      platform: isQuarkusPlatform ? 'quarkus' : 'spring-boot',
+      panels
     })
   if (endpoint === 'startup') return fulfillJson(route, startup)
   if (endpoint.startsWith('live-memory') || endpoint.startsWith('jvm-tuning')) return fulfillJson(route, memory)
@@ -6643,6 +6858,10 @@ async function handleApiRoute(route) {
   if (endpoint === 'exceptions') return fulfillJson(route, exceptions)
   if (endpoint === 'activity/service-map') return fulfillJson(route, activityServiceMap)
   if (endpoint === 'activity') return fulfillJson(route, activityReport)
+  if (endpoint === 'runtime-insights') return fulfillJson(route, runtimeInsightsReport)
+  if (endpoint.startsWith('runtime-insights/insights/')) return fulfillJson(route, runtimeInsightDetail)
+  if (endpoint === 'runtime-insights/comparison') return fulfillJson(route, runtimeRunComparison)
+  if (endpoint === 'runtime-insights/resource-profile') return fulfillJson(route, runtimeResourceProfile)
   if (endpoint === `activity/request/${activityRequestId}`) return fulfillJson(route, activityProfile)
   if (endpoint.startsWith('exceptions/'))
     return fulfillJson(route, exceptionDetail(endpoint.slice('exceptions/'.length)))
@@ -6820,7 +7039,7 @@ async function handleApiRoute(route) {
 }
 
 function waitForText(text) {
-  return (page) => page.getByText(text).first().waitFor()
+  return (page) => page.locator('main').getByText(text).first().waitFor()
 }
 
 function serviceMapNode(overrides) {
@@ -6966,19 +7185,57 @@ function aiChat(spanId, provider, model, inputTokens, outputTokens, durationNano
   }
 }
 
-function cacheEntry(managerName, name, size, hits, misses, hitRatio) {
+function cacheEntry(managerName, name, puts, hits, misses) {
+  const hitRatio = hits / (hits + misses)
+  const statistics = {
+    available: true,
+    source: 'NATIVE',
+    provider: 'Spring Data Redis',
+    scope: 'CACHE',
+    window: 'APPLICATION_LIFETIME',
+    since: new Date(nowMillis - 23 * 60_000).toISOString(),
+    unavailableReason: null,
+    requests: hits + misses,
+    hits,
+    misses,
+    hitRatio,
+    missRatio: 1 - hitRatio,
+    puts,
+    evictions: null,
+    removals: 1,
+    loadSuccesses: null,
+    loadFailures: null,
+    size: null,
+    ratioUnavailableReason: null
+  }
   return {
     managerName,
     name,
-    nativeType: 'org.springframework.data.redis.cache.RedisCache',
-    size,
+    nativeType: 'org.springframework.data.redis.cache.DefaultRedisCacheWriter',
+    size: null,
+    opaque: false,
+    opaqueReason: null,
+    tiers: [
+      {
+        id: 'redis',
+        name: 'Redis',
+        level: 0,
+        implementationType: 'org.springframework.data.redis.cache.RedisCache',
+        locality: 'DISTRIBUTED',
+        maximumSize: null,
+        expiryPolicy: 'Time to live: 5 minutes',
+        policyNote: null,
+        statistics: {...statistics, scope: 'TIER'}
+      }
+    ],
+    statistics,
     metrics: {
       available: true,
       hits,
       misses,
       hitRatio,
-      puts: size + 18,
-      evictions: 3,
+      puts,
+      evictions: null,
       removals: 1
     }
   }

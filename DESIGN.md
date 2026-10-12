@@ -1,6 +1,6 @@
 ---
 name: BootUI
-description: The local-only developer console for Spring Boot — a calm control room over a running app.
+description: The local-only developer console for Spring Boot and Quarkus — a calm control room over a running app.
 colors:
   spring-green: "#198754"
   spring-green-deep: "#146c43"
@@ -123,6 +123,11 @@ components:
     textColor: "{colors.surface-white}"
     rounded: "{rounded.sm}"
     padding: "0.55rem 0.7rem"
+  tab-active:
+    backgroundColor: "{colors.spring-green}"
+    textColor: "{colors.surface-white}"
+    rounded: "{rounded.sm}"
+    padding: "0.4rem 0.8rem"
   pill:
     backgroundColor: "{colors.surface-frost}"
     textColor: "{colors.ink}"
@@ -142,7 +147,7 @@ components:
 
 **Creative North Star: "The Calm Control Room"**
 
-BootUI is the mission console for a single Spring Boot app running on `localhost` — a green-and-blue control room where dense telemetry (beans, config, health, traces, advisor findings) is made *unalarming* through restraint and soft depth. The developer arrives mid-task with a sharp question and an app already running; the room's job is to make the runtime legible in a couple of minutes and then disappear back into their workflow. Every surface is a translucent instrument panel floating a few millimeters above a quiet gradient field; nothing flashes, nothing shouts, and a red light means something is genuinely wrong.
+BootUI is the mission console for a single application in either of its supported frameworks, Spring Boot and Quarkus, running on `localhost` — a green-and-blue control room where dense telemetry (beans, config, health, traces, advisor findings) is made *unalarming* through restraint and soft depth. The developer arrives mid-task with a sharp question and an app already running; the room's job is to make the runtime legible in a couple of minutes and then disappear back into their workflow. Every surface is a translucent instrument panel floating a few millimeters above a quiet gradient field; nothing flashes, nothing shouts, and a red light means something is genuinely wrong.
 
 The system's defining tension is productive: BootUI is *built on Bootstrap 5.3 and must never look like it.* Stock Bootstrap is the raw electrical wiring behind the wall, never the visible finish. The finish is a coherent token system — Spring green (`#198754`) and signal blue (`#0d6efd`) carried through a frosted-glass shell, large diffuse ambient shadows, generously rounded corners (0.5–1.25rem), and a green→blue gradient that signals "active / selected." Because BootUI's own advisor panels critique *other* apps for accessibility, architecture, and craft, the console is held to the standard it preaches: this UI is the proof of competence, not a backdrop for it.
 
@@ -264,10 +269,55 @@ BootUI is a **layered** system, not a flat one — but the elevation is calm. Fr
 - **Placeholder:** must meet the same 4.5:1 contrast as body text; never the faint Slate Subtle gray.
 
 ### Navigation
+- **Panel destinations and actions:** standalone cross-panel links, request identifiers that open detail, setup/help
+  destinations, advisor references, and disclosure/filter/copy actions use `btn btn-outline-secondary btn-sm`, as in
+  Runtime Insights' Performance deep dives. Keep navigation as anchors or router links and actions as buttons; do not
+  change destinations, query identity, confirmation gates, or disabled/loading/read-only behavior for styling.
+  Secondary labels, hover/active fills, borders, and focus rings inherit shared theme tokens; skin files own geometry.
+  Machine identifiers inside a button stay monospace but inherit its state color. Long destinations wrap.
+- **Inline references stay inline:** product/library names, attribution, and references embedded in explanatory
+  sentences remain conventional links. Sidebar rows, tabs, interactive KPI cards, and the footer retain their own
+  established affordances rather than becoming a second button toolbar.
 - **Style:** a frosted, blurred left sidebar (`backdrop-filter: blur(22px)`) grouped under uppercase nav-group labels; collapses to a 5.25rem icon rail and to an off-canvas drawer below 992px.
 - **Default / Hover:** slate link text; hover tints the row green (`rgba(25,135,84,0.08)` bg, green text).
 - **Active:** the green→blue gradient pill with white text — the one place the gradient appears.
 - **Focus:** custom nav toggles and the command-palette trigger must carry a visible focus ring, not rely on the UA default.
+
+### Tabs
+- **One component:** every panel tab strip is `PanelTabs` (`views/components/PanelTabs.vue`). It owns the WAI-ARIA
+  tablist (labelled list, roving tabindex, ArrowLeft/ArrowRight/Home/End, `aria-selected`/`aria-controls`); the panel
+  owns its tab panels, names each by its tab with `aria-labelledby`, and decides what selecting a tab loads. Never
+  Bootstrap's `.nav-tabs`/`.nav-pills`, which paint unselected tabs as link-blue text and ignore every skin.
+- **Style:** a sunken tray that hugs its tabs (surface-alt fill, hairline border, md radius) holding sm-radius tabs.
+  Tabs wrap rather than scroll, so no section hides off-screen, and fill the row evenly below 576px.
+- **States:** unselected labels are muted ink (never link blue, never underlined); hover takes the nav-row tint; the
+  selected tab is the nav's active fill (the green→blue gradient in light and dark) with white text. Focus is the shared
+  branded ring via `.bootui-keyboard-target`. Disabled labels use Slate Subtle. Optional count chips (`.bootui-tabs__count`)
+  take a soft `currentColor` wash.
+- **Tokens:** `--bootui-tab-*` in `App.vue` default to the nav-link states, so a skin that repaints its nav repaints its
+  tabs. A skin overrides a token only where its tab idiom differs and adds geometry in its own `theme-<id>.css`:
+  Graphite adds an accent underline to the selected fill, Cyberpunk a neon glow and a cyan hover scanline, Minimal an
+  ink underline on a hairline rule, France the DSFR `fr-tabs` (blue-tinted tabs; the selected one white with a Blue France
+  top bar), and Windows 95 raised property-sheet flaps with the selected flap joined to the page.
+- **Contrast:** `themeContrast.test.js` holds every theme's labels to 4.5:1 at rest, hovered, selected, and disabled,
+  and the selected tab's own indicator to 3:1 against its tray, so selection never rests on text color alone.
+
+### Findings Panels
+- **Verdict first:** a panel that reports findings, such as Runtime Insights, opens on one sentence that answers the
+  developer's question, "9 things to check across 147 requests", followed by the facts that qualify it (how many are
+  proven, how many the default list leaves out, coverage, the comparison). The verdict counts the whole run, never the
+  current filter.
+- **One list, opened in place:** findings are one bordered list whose rows open their detail beneath themselves
+  (`aria-expanded`/`aria-controls`), so the detail never leaves its row on a narrow screen. Nothing opens on its own; a
+  deep link opens the row it names. Filters with counts sit above the list as `aria-pressed` buttons, not a second tab
+  strip.
+- **Everything else in tabs:** tools and caveats about the run (comparison, change impact, profiling, coverage, check
+  limits) move to `PanelTabs` beside the findings rather than stacking under them. A tool that answers its own question,
+  such as change impact's search, gets its own tab with its field first, never a card below a long report; the report
+  links into it (a changed method's "See its impact").
+- **Calm caveats:** a qualifier such as "Not listed by default" is a muted inline mark, with its reason in the open
+  row, never a filled badge competing with the finding's own title. Internal process, such as how a check was
+  validated or plan identifiers, never reaches the screen.
 
 ### Signature: Brand Mark & Ambient Orbs
 - **Brand mark:** a solid Spring-green rounded square (1rem radius, 2.75rem) holding a white coffee-cup glyph (`bi-cup-hot-fill`), with a green glow (`0 0.6rem 1.2rem rgba(25,135,84,0.28)`). The "BootUI" wordmark sits beside it.
@@ -377,6 +427,7 @@ console is exactly the kind of tool that earns a joke, and it is honest about be
 - **Don't** use a warm near-white (cream, sand, parchment) as any background in light or dark. Backgrounds stay cool, tinted toward the brand green/blue. The opt-in skins (§6) are the explicitly scoped exception, and only inside their own `theme-<id>.css`.
 - **Don't** use `background-clip: text` gradient fills, `border-left`/`border-right` color stripes thicker than 1px, or glassmorphism as a default card treatment.
 - **Don't** nest cards, and don't reach for a card when a table, list, or plain section is the better affordance.
+- **Don't** hand-roll a tablist or reach for Bootstrap `.nav-tabs`; every tab strip is `PanelTabs` (§5 Tabs).
 - **Don't** set `outline: none` on any control without an equally visible branded replacement.
 - **Don't** let a skin (§6) leak past surface, chrome, typography, and geometry — no skin may change layout, semantics, focus order, panel availability, or what a status color means, and every skin's palette must stay inside its own `theme-<id>.css`. Adding a shell means adding a registry entry and a file, never editing another skin.
 - **Don't** add page-entrance reveal animations — no `fade-up`/slide-in applied to every panel or section. Navigation carries one gentle ~180ms route transition; panels otherwise appear instantly. Motion is reserved for hover feedback, loading, and live-status indicators, never decorative reveals or perpetual background drift.

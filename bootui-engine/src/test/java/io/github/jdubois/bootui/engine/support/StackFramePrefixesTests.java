@@ -24,7 +24,8 @@ class StackFramePrefixesTests {
     private static final String BOOTUI_ROOT_PACKAGE = "io.github.jdubois.bootui";
 
     /** Second-level packages that hold the sample applications, which are application code on purpose. */
-    private static final Set<String> SAMPLE_PACKAGES = Set.of("sample", "webfluxsample");
+    /** Sample applications, and the test-only routes the correlation scenario adds to one. */
+    private static final Set<String> SAMPLE_PACKAGES = Set.of("sample", "webfluxsample", "scenario");
 
     private static final Path BOOTUI_SOURCE_PATH = Path.of("java", "io", "github", "jdubois", "bootui");
 
@@ -87,6 +88,19 @@ class StackFramePrefixesTests {
                 .isTrue();
         assertThat(StackFramePrefixes.isFrameworkClass("io.github.jdubois.bootui.conformance.BootUiApiContractCatalog"))
                 .isTrue();
+        assertThat(StackFramePrefixes.isFrameworkClass("io.github.jdubois.bootui.agent.bridge.AgentBridge"))
+                .isTrue();
+        // The code-paths sensor's bridge and engine side sit on application stacks too (PLAN-v2 M5-4a).
+        assertThat(StackFramePrefixes.isFrameworkClass("io.github.jdubois.bootui.agent.bridge.CodePaths"))
+                .isTrue();
+        assertThat(StackFramePrefixes.isFrameworkClass("io.github.jdubois.bootui.engine.codepaths.CodePathsService"))
+                .isTrue();
+        // The side-effect sensors' bridge and engine side too (PLAN-v2 M5-5a).
+        assertThat(StackFramePrefixes.isFrameworkClass("io.github.jdubois.bootui.agent.bridge.SideEffects"))
+                .isTrue();
+        assertThat(StackFramePrefixes.isFrameworkClass(
+                        "io.github.jdubois.bootui.engine.sideeffects.SideEffectsService"))
+                .isTrue();
     }
 
     @Test
@@ -98,6 +112,23 @@ class StackFramePrefixesTests {
                 .isFalse();
         assertThat(StackFramePrefixes.isFrameworkClass("io.github.jdubois.bootui.webfluxsample.notes.NoteRepository"))
                 .isFalse();
+    }
+
+    @Test
+    void treatsApplicationsInAFrameworksNamespaceAsApplicationCode() {
+        assertThat(StackFramePrefixes.isFrameworkClass("org.springframework.samples.petclinic.owner.PetTypeFormatter"))
+                .isFalse();
+        assertThat(StackFramePrefixes.isFrameworkClass("io.quarkus.sample.superheroes.villain.service.VillainService"))
+                .isFalse();
+        assertThat(StackFramePrefixes.isFrameworkClass("org.apache.jsp.WEB_002dINF.jsp.owners_jsp"))
+                .isFalse();
+        assertThat(StackFramePrefixes.isFrameworkClass(
+                        "org.springframework.format.support.FormattingConversionService"))
+                .isTrue();
+        assertThat(StackFramePrefixes.isFrameworkClass("io.quarkus.arc.impl.ArcContainerImpl"))
+                .isTrue();
+        assertThat(StackFramePrefixes.isFrameworkClass("org.apache.jasper.runtime.HttpJspBase"))
+                .isTrue();
     }
 
     @Test

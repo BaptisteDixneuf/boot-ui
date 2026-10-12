@@ -1,0 +1,971 @@
+package io.github.jdubois.bootui.autoconfigure.activity;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.exceptions.ExceptionsController;
+import io.github.jdubois.bootui.autoconfigure.mail.EmailController;
+import io.github.jdubois.bootui.autoconfigure.restclienttrace.RestClientTraceController;
+import io.github.jdubois.bootui.autoconfigure.sqltrace.SqlTraceController;
+import io.github.jdubois.bootui.autoconfigure.web.HealthController;
+import io.github.jdubois.bootui.autoconfigure.web.HttpExchangesController;
+import io.github.jdubois.bootui.autoconfigure.web.SecurityLogsController;
+import io.github.jdubois.bootui.autoconfigure.web.TracesController;
+import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
+import io.github.jdubois.bootui.core.dto.ActivityPageInfo;
+import io.github.jdubois.bootui.core.dto.ActivityPersistenceOptionDto;
+import io.github.jdubois.bootui.core.dto.ActivitySwitchRequest;
+import io.github.jdubois.bootui.core.dto.ActivitySwitchResult;
+import io.github.jdubois.bootui.core.dto.HttpExchangeDto;
+import io.github.jdubois.bootui.core.dto.HttpExchangesReport;
+import io.github.jdubois.bootui.core.dto.LiveActivityReport;
+import io.github.jdubois.bootui.core.dto.PageMetadata;
+import io.github.jdubois.bootui.engine.activity.ActivityPage;
+import io.github.jdubois.bootui.engine.activity.ActivityPersistenceSettings;
+import io.github.jdubois.bootui.engine.activity.ActivityQuery;
+import io.github.jdubois.bootui.engine.activity.ActivityStore;
+import io.github.jdubois.bootui.engine.activity.InMemoryActivityStore;
+import io.github.jdubois.bootui.engine.activity.StoredActivityEntry;
+import io.github.jdubois.bootui.engine.activity.SwitchableActivityStore;
+import io.github.jdubois.bootui.engine.cache.CacheActivityRecorder;
+import io.github.jdubois.bootui.engine.correlation.RunIdentity;
+import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
+import io.github.jdubois.bootui.engine.journal.HttpPayload;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournal;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournalSettings;
+import io.github.jdubois.bootui.engine.journal.SqlPayload;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
+import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
+import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
+import org.h2.jdbcx.JdbcDataSource;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.http.ResponseEntity;
+
+class LiveActivityControllerTests {
+
+    private static final AtomicInteger DB_COUNTER = new AtomicInteger();
+
+    @Test
+    void streamOpensAnSseEmitter() {
+        assertThat(controller(new BootUiProperties()).stream()).isNotNull();
+    }
+
+    @Test
+    void shutdownClosesChangeStreamAndTerminatesSchedulerThread() throws Exception {
+        SqlTraceRecorder recorder = new SqlTraceRecorder(true, true, true, false, 100, 100, 2000, 200, 5);
+        LiveActivityController controller = controllerWith(provider(recorder), empty(ExceptionStore.class));
+
+        controller.stream(); // open an SSE emitter so a signal schedules a flush
+        java.util.Set<Thread> before = streamThreads();
+        recorder.clear(); // notifies the subscribed change stream → schedules a flush → starts its thread
+
+        Thread scheduler = awaitNewStreamThread(before);
+        assertThat(scheduler).as("scheduler thread should have started").isNotNull();
+
+        controller.shutdown();
+
+        // close() shuts the scheduler down so a DevTools restart does not leak one daemon thread
+        // (and, through it, the discarded context's class loader) per live reload.
+        assertThat(awaitNotAlive(scheduler)).isTrue();
+    }
+
+    @Test
+    void shutdownClosesChangeStreamAndTerminatesSchedulerThreadForRestClientTraceRecorderToo() throws Exception {
+        RestClientTraceRecorder recorder = new RestClientTraceRecorder(true, true, true, false, 100, 100, 2000, 200, 5);
+        LiveActivityController controller = controllerWithRestClientTraceRecorder(provider(recorder));
+
+        controller.stream(); // open an SSE emitter so a signal schedules a flush
+        java.util.Set<Thread> before = streamThreads();
+        recorder.clear(); // notifies the subscribed change stream → schedules a flush → starts its thread
+
+        Thread scheduler = awaitNewStreamThread(before);
+        assertThat(scheduler).as("scheduler thread should have started").isNotNull();
+
+        controller.shutdown();
+
+        // close() shuts the scheduler down so a DevTools restart does not leak one daemon thread
+        // (and, through it, the discarded context's class loader) per live reload.
+        assertThat(awaitNotAlive(scheduler)).isTrue();
+    }
+
+    @Test
+    void shutdownClosesChangeStreamAndTerminatesSchedulerThreadForCacheActivityRecorderToo() throws Exception {
+        // Preserves/verifies that cache accesses feed the exact same SSE tick the Feed and the Live Flow
+        // map both refresh from - Live Flow's service map has no stream of its own, it rides this one.
+        CacheActivityRecorder recorder = new CacheActivityRecorder(true, 100);
+        LiveActivityController controller = controllerWithCacheActivityRecorder(provider(recorder));
+
+        controller.stream(); // open an SSE emitter so a signal schedules a flush
+        java.util.Set<Thread> before = streamThreads();
+        recorder.recordHit("cacheManager", "products", "product-1"); // notifies the subscribed change stream
+
+        Thread scheduler = awaitNewStreamThread(before);
+        assertThat(scheduler).as("scheduler thread should have started").isNotNull();
+
+        controller.shutdown();
+
+        // close() shuts the scheduler down so a DevTools restart does not leak one daemon thread
+        // (and, through it, the discarded context's class loader) per live reload.
+        assertThat(awaitNotAlive(scheduler)).isTrue();
+    }
+
+    @Test
+    void activityCarriesNoPageInfoAndAnInactivePersistenceOptionWhenNotPersistent() {
+        // The store bean always exists (even with persistence disabled, as a bare in-memory store), so
+        // the response must carry no page info at all - byte-identical to today's behavior - while still
+        // always reporting a persistenceOption so the panel can render its "Use a database" affordance.
+        LiveActivityReport result = controller(new BootUiProperties()).activity(null, null, 0, 0, null, null, null, 0);
+
+        assertThat(result.pageInfo()).isNull();
+        assertThat(result.persistenceOption())
+                .isEqualTo(new ActivityPersistenceOptionDto(false, false, "bootui_activity"));
+    }
+
+    @Test
+    void activityReportsADataSourceAsAvailableWhenOneIsPresentEvenWithPersistenceOff() {
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                provider(mock(DataSource.class)),
+                new BootUiProperties());
+
+        LiveActivityReport result = controller.activity(null, null, 0, 0, null, null, null, 0);
+
+        assertThat(result.persistenceOption())
+                .isEqualTo(new ActivityPersistenceOptionDto(false, true, "bootui_activity"));
+    }
+
+    @Test
+    void aPersistedRowIsHiddenOnceItsPanelIsDisabled() throws Exception {
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        ActivityEntryDto sql = storedRow("sql-1", "SQL", "select * from audit");
+        ActivityEntryDto request = storedRow("req-1", "REQUEST", "GET /orders → 200");
+        ActivityEntryDto marker = storedRow("marker-1", "MARKER", "Application started");
+        when(store.query(any()))
+                .thenReturn(new ActivityPage(
+                        List.of(
+                                new StoredActivityEntry("instance-a", 3L, sql),
+                                new StoredActivityEntry("instance-a", 2L, request),
+                                new StoredActivityEntry("instance-a", 1L, marker)),
+                        null,
+                        false));
+        BootUiProperties properties = new BootUiProperties();
+        BootUiProperties.Panel disabled = new BootUiProperties.Panel();
+        disabled.setEnabled(false);
+        properties.getPanels().put(BootUiPanels.SQL_TRACE, disabled);
+
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                enabledSettings("instance-a", Duration.ofSeconds(2)),
+                empty(DataSource.class),
+                properties);
+        try {
+            // Rows written while SQL Trace was enabled stay in bootui_activity, but are not read once it is off.
+            assertThat(controller
+                            .activity(null, null, 0, 0, null, null, null, 50)
+                            .entries())
+                    .extracting(ActivityEntryDto::id)
+                    .containsExactly("req-1", "marker-1");
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    @Test
+    void persistedPagesSkipDisabledPanelRowsWithoutSkippingOlderVisibleRows() throws Exception {
+        InMemoryActivityStore history = new InMemoryActivityStore(20);
+        history.appendBatch(List.of(
+                new StoredActivityEntry("instance-a", 1, storedRow("marker", "MARKER", "started")),
+                new StoredActivityEntry("instance-a", 2, storedRow("request", "REQUEST", "GET /orders")),
+                new StoredActivityEntry("instance-a", 3, storedRow("sql", "SQL", "select 1"))));
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        when(store.query(any())).thenAnswer(invocation -> history.query(invocation.getArgument(0)));
+        BootUiProperties properties = new BootUiProperties();
+        BootUiProperties.Panel disabled = new BootUiProperties.Panel();
+        disabled.setEnabled(false);
+        properties.getPanels().put(BootUiPanels.SQL_TRACE, disabled);
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                enabledSettings("instance-a", Duration.ofSeconds(2)),
+                empty(DataSource.class),
+                properties);
+        try {
+            LiveActivityReport first = controller.activity(null, null, 0, 0, null, null, null, 1);
+            assertThat(first.entries()).extracting(ActivityEntryDto::id).containsExactly("request");
+            assertThat(first.pageInfo().hasMore()).isTrue();
+            assertThat(first.pageInfo().nextCursor()).isNotNull();
+            LiveActivityReport second = controller.activity(
+                    null, null, 0, 0, null, null, first.pageInfo().nextCursor(), 1);
+            assertThat(second.entries()).extracting(ActivityEntryDto::id).containsExactly("marker");
+            assertThat(second.pageInfo().hasMore()).isFalse();
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    private static ActivityEntryDto storedRow(String id, String type, String summary) {
+        return new ActivityEntryDto(
+                id, type, 1_000L, "OK", summary, null, null, null, null, null, null, null, false, null, null, false);
+    }
+
+    @Test
+    void activityDelegatesEntriesAndPageInfoToStoreWhenPersistenceEnabled() throws Exception {
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        ActivityEntryDto storedEntry = new ActivityEntryDto(
+                "sql-1",
+                "SQL",
+                1_000L,
+                "OK",
+                "select * from audit where owner = 'alice'",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                false,
+                null,
+                null,
+                false);
+        ActivityPage page =
+                new ActivityPage(List.of(new StoredActivityEntry("instance-a", 1L, storedEntry)), null, false);
+        when(store.query(any())).thenReturn(page);
+        ActivityPersistenceSettings settings = enabledSettings("instance-a", Duration.ofSeconds(2));
+
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                settings,
+                empty(DataSource.class),
+                new BootUiProperties());
+        try {
+            LiveActivityReport expectedLive = referenceLiveReport("SQL", "OK", 0, 0, new BootUiProperties());
+
+            LiveActivityReport result = controller.activity("SQL", "OK", 0, 0, "select", 999L, "cursor-1", 50);
+
+            // A stored row is masked again under the live policy (MASKED by default) when it is read (§8).
+            assertThat(result.entries())
+                    .containsExactly(new ActivityEntryDto(
+                            storedEntry.id(),
+                            storedEntry.type(),
+                            storedEntry.timestamp(),
+                            storedEntry.severity(),
+                            "select * from audit where owner = ?",
+                            storedEntry.detail(),
+                            storedEntry.durationMs(),
+                            storedEntry.correlationId(),
+                            storedEntry.method(),
+                            storedEntry.path(),
+                            storedEntry.status(),
+                            storedEntry.thread(),
+                            storedEntry.profileable(),
+                            storedEntry.parentId(),
+                            storedEntry.securedPrincipal(),
+                            storedEntry.sqlNPlusOneSuspected(),
+                            storedEntry.badges()));
+            assertThat(result.pageInfo()).isEqualTo(new ActivityPageInfo(true, null, false));
+            assertThat(result.persistenceOption())
+                    .isEqualTo(new ActivityPersistenceOptionDto(true, false, "bootui_activity"));
+            // The KPI strip stays a "right now" summary from the live re-merge, not scoped to whichever
+            // historical page is being browsed.
+            assertThat(result.available()).isEqualTo(expectedLive.available());
+            assertThat(result.typeCounts()).isEqualTo(expectedLive.typeCounts());
+            // heapUsedBytes is sampled live at call time via ManagementFactory, so it can drift by a few
+            // bytes between the two independent report() invocations (this one and referenceLiveReport's)
+            // even a few instructions apart - compare everything else exactly and only sanity-check heap.
+            assertThat(result.kpis())
+                    .usingRecursiveComparison()
+                    .ignoringFields("heapUsedBytes", "heapMaxBytes")
+                    .isEqualTo(expectedLive.kpis());
+            assertThat(result.kpis().heapUsedBytes()).isNotNull().isPositive();
+            assertThat(result.kpis().heapMaxBytes()).isNotNull().isPositive();
+            assertThat(result.sources()).isEqualTo(expectedLive.sources());
+            assertThat(result.warnings()).isEqualTo(expectedLive.warnings());
+
+            ArgumentCaptor<ActivityQuery> captor = ArgumentCaptor.forClass(ActivityQuery.class);
+            verify(store).query(captor.capture());
+            ActivityQuery query = captor.getValue();
+            assertThat(query.instanceId()).isEqualTo("instance-a");
+            assertThat(query.type()).isEqualTo("SQL");
+            assertThat(query.severity()).isEqualTo("OK");
+            assertThat(query.text()).isEqualTo("select");
+            // since=0 is the existing "no lower bound" convention; the query must translate that to
+            // ActivityQuery's own null-means-unbounded convention rather than filtering on since<=0.
+            assertThat(query.since()).isNull();
+            assertThat(query.until()).isEqualTo(999L);
+            assertThat(query.cursor()).isEqualTo("cursor-1");
+            assertThat(query.pageSize()).isEqualTo(50);
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    @Test
+    void useExistingDatasourceReturns404WhenNoDataSourceIsAvailable() {
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                empty(DataSource.class),
+                new BootUiProperties());
+
+        ResponseEntity<ActivitySwitchResult> response =
+                controller.useExistingDatasource(new ActivitySwitchRequest(true));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(404);
+        assertThat(response.getBody().status()).isEqualTo("unavailable");
+    }
+
+    @Test
+    void useExistingDatasourceReturns400WhenNotConfirmed() {
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                provider(mock(DataSource.class)),
+                new BootUiProperties());
+
+        ResponseEntity<ActivitySwitchResult> response = controller.useExistingDatasource(null);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(400);
+        assertThat(response.getBody().status()).isEqualTo("blocked");
+    }
+
+    @Test
+    void useExistingDatasourceReturns200AndIsANoOpWhenAlreadyPersistent() {
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                enabledSettings("instance-c", Duration.ofSeconds(5)),
+                provider(mock(DataSource.class)),
+                new BootUiProperties());
+        try {
+            ResponseEntity<ActivitySwitchResult> response =
+                    controller.useExistingDatasource(new ActivitySwitchRequest(true));
+
+            assertThat(response.getStatusCode().value()).isEqualTo(200);
+            assertThat(response.getBody().status()).isEqualTo("already-active");
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsDisabledJournalBeforeCreatingTheTable() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        BootUiProperties properties = new BootUiProperties();
+        properties.getRuntimeJournal().setEnabled(false);
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                properties);
+        RuntimeJournal journal =
+                new RuntimeJournal(properties.getRuntimeJournal().toSettings(), RunIdentity.start());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            assertUnavailableSwitch(controller, store, dataSource);
+        } finally {
+            controller.shutdown();
+            journal.close();
+            store.close();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsAClosedJournalBeforeCreatingTheTable() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                new BootUiProperties());
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            journal.close();
+            assertThat(journal.settings().enabled()).isTrue();
+            assertUnavailableSwitch(controller, store, dataSource);
+        } finally {
+            controller.shutdown();
+            journal.close();
+            store.close();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsMissingJournalBeforeCreatingTheTableAndDoesNotDefer() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                new BootUiProperties());
+        try (RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start())) {
+            assertUnavailableSwitch(controller, store, dataSource);
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            assertThat(org.springframework.test.util.ReflectionTestUtils.getField(controller, "deferredCapture"))
+                    .isNull();
+        } finally {
+            controller.shutdown();
+            store.close();
+        }
+    }
+
+    private static void assertUnavailableSwitch(
+            LiveActivityController controller, SwitchableActivityStore store, DataSource dataSource) throws Exception {
+        ResponseEntity<ActivitySwitchResult> response =
+                controller.useExistingDatasource(new ActivitySwitchRequest(true));
+        try (var connection = dataSource.getConnection();
+                var tables = connection.getMetaData().getTables(null, null, "BOOTUI_ACTIVITY", null)) {
+            assertThat(tables.next())
+                    .as(
+                            "journal unavailable: response %s must not create an application database table",
+                            response.getStatusCode().value())
+                    .isFalse();
+        }
+        assertThat(response.getStatusCode().value()).isEqualTo(409);
+        assertThat(response.getBody().status()).isEqualTo("unavailable");
+        assertThat(response.getBody().message()).contains("runtime journal");
+        assertThat(store.persistent()).isFalse();
+    }
+
+    @Test
+    void runtimeSwitchReportsCaptureRegistrationFailureWithoutPublishingTheDurableStore() {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                new BootUiProperties());
+        RuntimeJournal journal = mock(RuntimeJournal.class);
+        when(journal.settings()).thenReturn(RuntimeJournalSettings.defaults());
+        when(journal.isOpen()).thenReturn(true);
+        when(journal.subscribe(any())).thenReturn(() -> {});
+        doThrow(new IllegalStateException("capture registration failed"))
+                .when(journal)
+                .addListener(any());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            ResponseEntity<ActivitySwitchResult> response =
+                    controller.useExistingDatasource(new ActivitySwitchRequest(true));
+            assertThat(response.getStatusCode().value()).isEqualTo(500);
+            assertThat(response.getBody().status()).isEqualTo("failed");
+            assertThat(response.getBody().message()).contains("capture", "table");
+            assertThat(store.persistent()).isFalse();
+        } finally {
+            controller.shutdown();
+            store.close();
+        }
+    }
+
+    @Test
+    void useExistingDatasourceSwitchesTheStoreAndStartsCapturingOnSuccess() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        LiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                buffersFeed());
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            ResponseEntity<ActivitySwitchResult> response =
+                    controller.useExistingDatasource(new ActivitySwitchRequest(true));
+
+            assertThat(response.getStatusCode().value()).isEqualTo(200);
+            assertThat(response.getBody().status()).isEqualTo("success");
+            assertThat(response.getBody().tableName()).isEqualTo("bootui_activity");
+
+            // The switch takes effect immediately: a subsequent GET must now report persistence active
+            // and start serving pagination from the (now durable) store, with no restart required.
+            LiveActivityReport afterSwitch = controller.activity(null, null, 0, 0, null, null, null, 0);
+            assertThat(afterSwitch.persistenceOption())
+                    .isEqualTo(new ActivityPersistenceOptionDto(true, true, "bootui_activity"));
+            assertThat(afterSwitch.pageInfo()).isNotNull();
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.HTTP,
+                    1_000,
+                    2_000_000,
+                    CorrelationContext.forRequest("persisted-request"),
+                    "t",
+                    null,
+                    false,
+                    new HttpPayload("GET", "/persisted", "/persisted", null, 200)));
+            assertThat(journal.awaitDrained(Duration.ofSeconds(5))).isTrue();
+            assertThat(store.query(ActivityQuery.firstPage("instance-x")).entryDtos())
+                    .extracting(ActivityEntryDto::type)
+                    .contains("REQUEST");
+        } finally {
+            controller.shutdown();
+            journal.close();
+            store.close();
+        }
+        try (var connection = dataSource.getConnection();
+                var statement = connection.createStatement();
+                var rows = statement.executeQuery("SELECT COUNT(*) FROM bootui_activity")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getInt(1)).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void withTheJournalAsFeedSourcePersistenceIsWrittenByAJournalSubscriberOnceTheJournalIsInstalled()
+            throws Exception {
+        List<StoredActivityEntry> captured = new CopyOnWriteArrayList<>();
+        SwitchableActivityStore store = new SwitchableActivityStore(new ActivityStore() {
+            @Override
+            public void appendBatch(List<StoredActivityEntry> entries) {
+                captured.addAll(entries);
+            }
+
+            @Override
+            public ActivityPage query(ActivityQuery query) {
+                return ActivityPage.EMPTY;
+            }
+        });
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setFeedSource("journal");
+        LiveActivityController controller =
+                controllerWithExchanges(empty(HttpExchangesController.class), store, properties);
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            assertThat(controller.startPersistence(persistenceSettings(true, "instance-j", Duration.ofHours(1), 16)))
+                    .as("waits for the journal")
+                    .isNull();
+
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.SQL,
+                    1_000,
+                    1_000_000,
+                    CorrelationContext.forRequest("r1"),
+                    "t",
+                    null,
+                    false,
+                    new SqlPayload("select 1", null, "db", false)));
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.HTTP,
+                    1_000,
+                    2_000_000,
+                    CorrelationContext.forRequest("r1"),
+                    "t",
+                    null,
+                    false,
+                    new HttpPayload("GET", "/a", "/a", null, 200)));
+            assertThat(journal.awaitDrained(Duration.ofSeconds(5))).isTrue();
+
+            assertThat(captured)
+                    .extracting(
+                            stored -> stored.entry().type(),
+                            stored -> stored.entry().parentId())
+                    .containsExactlyInAnyOrder(tuple("SQL", "r1"), tuple("REQUEST", null));
+            assertThat(captured)
+                    .allSatisfy(stored -> assertThat(stored.instanceId()).isEqualTo("instance-j"));
+        } finally {
+            controller.shutdown();
+            journal.close();
+        }
+    }
+
+    @Test
+    void aCaptureTheJournalNeverArrivedForWritesNothingSince2_0RemovedThePoller() {
+        List<StoredActivityEntry> captured = new CopyOnWriteArrayList<>();
+        SwitchableActivityStore store = new SwitchableActivityStore(new ActivityStore() {
+            @Override
+            public void appendBatch(List<StoredActivityEntry> entries) {
+                captured.addAll(entries);
+            }
+
+            @Override
+            public ActivityPage query(ActivityQuery query) {
+                return ActivityPage.EMPTY;
+            }
+        });
+        HttpExchangesController exchanges = mock(HttpExchangesController.class);
+        when(exchanges.exchanges(null, null, null, null, null))
+                .thenReturn(exchangesReport(List.of(exchange("ok-1", 1_000L, 200, 5L))));
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setFeedSource("journal");
+        LiveActivityController controller = controllerWithExchanges(provider(exchanges), store, properties);
+
+        assertThat(controller.startPersistence(persistenceSettings(true, "instance-k", Duration.ofHours(1), 16)))
+                .isNull();
+        controller.afterPropertiesSet();
+        controller.shutdown();
+
+        assertThat(captured)
+                .as("the journal is the only source of durable history, so nothing polls the panel buffers")
+                .isEmpty();
+    }
+
+    private static HttpExchangeDto exchange(String id, long timestamp, int status, long durationMs) {
+        return new HttpExchangeDto(
+                id,
+                Instant.ofEpochMilli(timestamp),
+                "GET",
+                "/api/orders",
+                null,
+                "/api/orders",
+                status,
+                status / 100 + "xx",
+                durationMs,
+                null,
+                "127.0.0.1",
+                null,
+                null,
+                null,
+                List.of(),
+                List.of());
+    }
+
+    private static HttpExchangesReport exchangesReport(List<HttpExchangeDto> exchanges) {
+        return new HttpExchangesReport(
+                exchanges.size(),
+                exchanges.size(),
+                0,
+                exchanges,
+                new PageMetadata(exchanges.size(), exchanges.size(), 0, exchanges.size(), exchanges.size(), false),
+                null);
+    }
+
+    private static DataSource newDataSource() {
+        JdbcDataSource dataSource = new JdbcDataSource();
+        dataSource.setURL(
+                "jdbc:h2:mem:live-activity-controller-" + DB_COUNTER.incrementAndGet() + ";DB_CLOSE_DELAY=-1");
+        dataSource.setUser("sa");
+        dataSource.setPassword("");
+        return dataSource;
+    }
+
+    private static SwitchableActivityStore defaultActivityStore() {
+        return new SwitchableActivityStore(new InMemoryActivityStore(200));
+    }
+
+    private static ActivityPersistenceSettings disabledSettings() {
+        return persistenceSettings(false, "instance-x", Duration.ofSeconds(5));
+    }
+
+    private static ActivityPersistenceSettings enabledSettings(String instanceId, Duration captureInterval) {
+        return persistenceSettings(true, instanceId, captureInterval);
+    }
+
+    private static ActivityPersistenceSettings persistenceSettings(
+            boolean enabled, String instanceId, Duration captureInterval) {
+        return persistenceSettings(enabled, instanceId, captureInterval, 500);
+    }
+
+    private static ActivityPersistenceSettings persistenceSettings(
+            boolean enabled, String instanceId, Duration captureInterval, int bufferMaxEntries) {
+        return new ActivityPersistenceSettings(
+                enabled,
+                ActivityPersistenceSettings.DataSourceMode.SHARED,
+                null,
+                null,
+                null,
+                null,
+                "bootui_activity",
+                Duration.ofSeconds(5),
+                bufferMaxEntries,
+                Duration.ofDays(7),
+                instanceId);
+    }
+
+    private static LiveActivityReport referenceLiveReport(
+            String type, String severity, long since, int limit, BootUiProperties properties) {
+        LiveActivityService service = new LiveActivityService(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceController.class),
+                empty(RestClientTraceController.class),
+                empty(ExceptionsController.class),
+                empty(SecurityLogsController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(RequestCorrelationRegistry.class),
+                empty(SecurityEventCorrelationRegistry.class),
+                empty(io.github.jdubois.bootui.engine.cache.CacheActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.class),
+                empty(io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.jms.JmsActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder.class),
+                properties);
+        return service.report(type, severity, since, limit);
+    }
+
+    private static java.util.Set<Thread> streamThreads() {
+        java.util.Set<Thread> threads = new java.util.HashSet<>();
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if ("bootui-activity-stream".equals(thread.getName())) {
+                threads.add(thread);
+            }
+        }
+        return threads;
+    }
+
+    private static Thread awaitNewStreamThread(java.util.Set<Thread> before) throws InterruptedException {
+        for (int i = 0; i < 100; i++) {
+            java.util.Set<Thread> now = streamThreads();
+            now.removeAll(before);
+            if (!now.isEmpty()) {
+                return now.iterator().next();
+            }
+            Thread.sleep(10);
+        }
+        return null;
+    }
+
+    private static Thread awaitThreadNamed(String name) throws InterruptedException {
+        for (int i = 0; i < 100; i++) {
+            for (Thread thread : Thread.getAllStackTraces().keySet()) {
+                if (name.equals(thread.getName())) {
+                    return thread;
+                }
+            }
+            Thread.sleep(10);
+        }
+        return null;
+    }
+
+    private static boolean awaitNotAlive(Thread thread) throws InterruptedException {
+        for (int i = 0; i < 100 && thread.isAlive(); i++) {
+            Thread.sleep(10);
+        }
+        return !thread.isAlive();
+    }
+
+    @Test
+    void hostRequestExcludesBootUiOwnTrafficToAvoidRefreshLoop() {
+        // BootUI's own re-fetches and SSE connection must not re-trigger the feed.
+        assertThat(LiveActivityController.isHostRequest("/bootui/api/activity", "/bootui"))
+                .isFalse();
+        assertThat(LiveActivityController.isHostRequest("/bootui/api/activity/stream", "/bootui"))
+                .isFalse();
+        // Honors a custom base path.
+        assertThat(LiveActivityController.isHostRequest("/app/console/api/activity", "/app/console"))
+                .isFalse();
+    }
+
+    @Test
+    void hostRequestSignalsForApplicationTrafficAndNullUrls() {
+        assertThat(LiveActivityController.isHostRequest("/api/sample/products", "/bootui"))
+                .isTrue();
+        assertThat(LiveActivityController.isHostRequest(null, "/bootui")).isTrue();
+    }
+
+    private static LiveActivityController controller(BootUiProperties properties) {
+        return controllerWith(empty(SqlTraceRecorder.class), empty(ExceptionStore.class), properties);
+    }
+
+    private static LiveActivityController controllerWith(
+            ObjectProvider<SqlTraceRecorder> recorder, ObjectProvider<ExceptionStore> exceptionStore) {
+        return controllerWith(recorder, exceptionStore, new BootUiProperties());
+    }
+
+    private static LiveActivityController controllerWith(
+            ObjectProvider<SqlTraceRecorder> recorder,
+            ObjectProvider<ExceptionStore> exceptionStore,
+            BootUiProperties properties) {
+        return controllerWith(
+                recorder,
+                exceptionStore,
+                defaultActivityStore(),
+                disabledSettings(),
+                empty(DataSource.class),
+                properties);
+    }
+
+    private static LiveActivityController controllerWith(
+            ObjectProvider<SqlTraceRecorder> recorder,
+            ObjectProvider<ExceptionStore> exceptionStore,
+            SwitchableActivityStore activityStore,
+            ActivityPersistenceSettings persistenceSettings,
+            ObjectProvider<DataSource> dataSourceProvider,
+            BootUiProperties properties) {
+        return new LiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceController.class),
+                empty(RestClientTraceController.class),
+                empty(ExceptionsController.class),
+                empty(SecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                recorder,
+                empty(RestClientTraceRecorder.class),
+                exceptionStore,
+                empty(RequestCorrelationRegistry.class),
+                empty(SecurityEventCorrelationRegistry.class),
+                empty(io.github.jdubois.bootui.engine.cache.CacheActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.class),
+                empty(io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.jms.JmsActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder.class),
+                empty(io.github.jdubois.bootui.engine.email.EmailCaptureService.class),
+                activityStore,
+                persistenceSettings,
+                dataSourceProvider,
+                properties);
+    }
+
+    private static LiveActivityController controllerWithExchanges(
+            ObjectProvider<HttpExchangesController> exchanges,
+            SwitchableActivityStore activityStore,
+            BootUiProperties properties) {
+        return new LiveActivityController(
+                exchanges,
+                empty(SqlTraceController.class),
+                empty(RestClientTraceController.class),
+                empty(ExceptionsController.class),
+                empty(SecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                empty(RequestCorrelationRegistry.class),
+                empty(SecurityEventCorrelationRegistry.class),
+                empty(io.github.jdubois.bootui.engine.cache.CacheActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.class),
+                empty(io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.jms.JmsActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder.class),
+                empty(io.github.jdubois.bootui.engine.email.EmailCaptureService.class),
+                activityStore,
+                disabledSettings(),
+                empty(DataSource.class),
+                properties);
+    }
+
+    private static LiveActivityController controllerWithRestClientTraceRecorder(
+            ObjectProvider<RestClientTraceRecorder> restClientTraceRecorder) {
+        return new LiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceController.class),
+                empty(RestClientTraceController.class),
+                empty(ExceptionsController.class),
+                empty(SecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(SqlTraceRecorder.class),
+                restClientTraceRecorder,
+                empty(ExceptionStore.class),
+                empty(RequestCorrelationRegistry.class),
+                empty(SecurityEventCorrelationRegistry.class),
+                empty(io.github.jdubois.bootui.engine.cache.CacheActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.class),
+                empty(io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.jms.JmsActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder.class),
+                empty(io.github.jdubois.bootui.engine.email.EmailCaptureService.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                empty(DataSource.class),
+                new BootUiProperties());
+    }
+
+    private static LiveActivityController controllerWithCacheActivityRecorder(
+            ObjectProvider<CacheActivityRecorder> cacheActivityRecorder) {
+        return new LiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceController.class),
+                empty(RestClientTraceController.class),
+                empty(ExceptionsController.class),
+                empty(SecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                empty(RequestCorrelationRegistry.class),
+                empty(SecurityEventCorrelationRegistry.class),
+                cacheActivityRecorder,
+                empty(io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore.class),
+                empty(io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.jms.JmsActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder.class),
+                empty(io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder.class),
+                empty(io.github.jdubois.bootui.engine.email.EmailCaptureService.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                empty(DataSource.class),
+                new BootUiProperties());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> empty(Class<T> type) {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(null);
+        return provider;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> provider(T value) {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(value);
+        return provider;
+    }
+
+    /**
+     * Properties whose Live Activity feed comes from the panel buffers, which these tests drive: the default journal
+     * source, whose journal does not record here, so the buffers serve the feed.
+     */
+    private static BootUiProperties buffersFeed() {
+        return new BootUiProperties();
+    }
+}

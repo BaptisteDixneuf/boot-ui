@@ -1,0 +1,204 @@
+package io.github.jdubois.bootui.autoconfigure.kafka;
+
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.correlation.RequestIds;
+import io.github.jdubois.bootui.engine.correlation.TraceParents;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
+import io.github.jdubois.bootui.engine.support.BootUiThreadLocal;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.DirectFieldAccessor;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.kafka.config.AbstractKafkaListenerContainerFactory;
+import org.springframework.kafka.listener.RecordInterceptor;
+
+/**
+ * Wraps every {@link AbstractKafkaListenerContainerFactory} bean's {@link RecordInterceptor} after
+ * initialization so every {@code @KafkaListener} delivery is recorded into {@link
+ * KafkaActivityRecorder} before delegating to whatever interceptor (or none) the application already
+ * had configured — the consume-side twin of {@link KafkaProducerCaptureBeanPostProcessor}.
+ *
+ * <p>The factory has no public getter for its current {@code recordInterceptor} (only {@code
+ * setRecordInterceptor}), so it is read via {@link DirectFieldAccessor} and composed rather than
+ * replaced, exactly like the producer-side post-processor. Reading that private field is best-effort:
+ * if reflection fails for one factory, BootUI leaves <em>that factory</em> unwrapped (so its deliveries
+ * are not captured) but still lets the application start and all other factories be processed
+ * normally.</p>
+ *
+ * <p>Recording is fail-open: any failure while reading the record/consumer or while recording the
+ * outcome is caught and logged at warn, and the composed delegate is still invoked afterward —
+ * mirroring {@code QuarkusKafkaConsumerCapture}'s equivalent guarantee.</p>
+ */
+public final class KafkaConsumerCaptureBeanPostProcessor implements BeanPostProcessor {
+
+    private static final Logger log = LoggerFactory.getLogger(KafkaConsumerCaptureBeanPostProcessor.class);
+
+    private final ObjectProvider<KafkaActivityRecorder> recorderProvider;
+
+    public KafkaConsumerCaptureBeanPostProcessor(ObjectProvider<KafkaActivityRecorder> recorderProvider) {
+        this.recorderProvider = recorderProvider;
+    }
+
+    @Override
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
+        if (!(bean instanceof AbstractKafkaListenerContainerFactory<?, ?, ?> factory)) {
+            return bean;
+        }
+        KafkaActivityRecorder recorder = recorderProvider.getIfAvailable();
+        if (recorder == null || !recorder.isEnabled()) {
+            return bean;
+        }
+        try {
+            RecordInterceptor<Object, Object> existing = (RecordInterceptor<Object, Object>)
+                    new DirectFieldAccessor(factory).getPropertyValue("recordInterceptor");
+            AbstractKafkaListenerContainerFactory untyped = (AbstractKafkaListenerContainerFactory) factory;
+            untyped.setRecordInterceptor(new CapturingRecordInterceptor(existing, recorder, beanName));
+        } catch (RuntimeException ex) {
+            log.warn(
+                    "BootUI could not enable Kafka consumer capture for listener container factory bean "
+                            + "'{}'; leaving it unwrapped",
+                    beanName,
+                    ex);
+        }
+        return bean;
+    }
+
+    /**
+     * Times each delivery from {@link #intercept} to its terminal {@link #success}/{@link #failure}
+     * callback (both are always invoked on the same thread, synchronously, by the listener container),
+     * records the outcome, then delegates to the composed interceptor.
+     */
+    private static final class CapturingRecordInterceptor implements RecordInterceptor<Object, Object> {
+
+        private final RecordInterceptor<Object, Object> delegate;
+        private final KafkaActivityRecorder recorder;
+        private final String listenerId;
+        private final ThreadLocal<Long> startNanos = new BootUiThreadLocal<>();
+        private final ThreadLocal<BootUiCorrelation.Scope> executionScope = new BootUiThreadLocal<>();
+
+        private CapturingRecordInterceptor(
+                RecordInterceptor<Object, Object> delegate, KafkaActivityRecorder recorder, String listenerId) {
+            this.delegate = delegate;
+            this.recorder = recorder;
+            // At this factory-wide interception point Spring Kafka does not expose the resolved per-listener
+            // @KafkaListener id, so the best available stable identifier is the listener container factory
+            // bean name that installed this interceptor.
+            this.listenerId = listenerId;
+        }
+
+        @Override
+        public ConsumerRecord<Object, Object> intercept(
+                ConsumerRecord<Object, Object> record, Consumer<Object, Object> consumer) {
+            startNanos.set(System.nanoTime());
+            openExecution(record);
+            ConsumerRecord<Object, Object> intercepted =
+                    delegate == null ? record : delegate.intercept(record, consumer);
+            if (intercepted == null) {
+                // The application's interceptor filtered the record out, so no listener runs for it.
+                closeExecution();
+            }
+            return intercepted;
+        }
+
+        @Override
+        public void success(ConsumerRecord<Object, Object> record, Consumer<Object, Object> consumer) {
+            recordOutcome(record, consumer, true, null);
+            if (delegate != null) {
+                delegate.success(record, consumer);
+            }
+        }
+
+        @Override
+        public void failure(
+                ConsumerRecord<Object, Object> record, Exception exception, Consumer<Object, Object> consumer) {
+            recordOutcome(record, consumer, false, exception == null ? null : exception.getMessage());
+            if (delegate != null) {
+                delegate.failure(record, exception, consumer);
+            }
+        }
+
+        @Override
+        public void afterRecord(ConsumerRecord<Object, Object> record, Consumer<Object, Object> consumer) {
+            startNanos.remove();
+            closeExecution();
+            if (delegate != null) {
+                delegate.afterRecord(record, consumer);
+            }
+        }
+
+        private void recordOutcome(
+                ConsumerRecord<Object, Object> record,
+                Consumer<Object, Object> consumer,
+                boolean success,
+                String errorMessage) {
+            try {
+                Long start = startNanos.get();
+                // start is only null if success()/failure() fires without a matching intercept() call, which
+                // spring-kafka never does in practice (both are always invoked on the same thread for the
+                // same record); 0 is used rather than null in that defensive case since it is not a real,
+                // reachable "unknown duration" state worth modelling explicitly.
+                Long durationNanos = start == null ? 0L : Math.max(0L, System.nanoTime() - start);
+                Object key = record.key();
+                String groupId = groupIdOf(consumer);
+                recorder.recordConsumeNanos(
+                        record.topic(),
+                        record.partition(),
+                        record.offset(),
+                        key == null ? null : String.valueOf(key),
+                        durationNanos,
+                        success,
+                        errorMessage,
+                        groupId,
+                        listenerId,
+                        null);
+            } catch (RuntimeException ex) {
+                log.warn("BootUI could not capture an incoming Kafka message; leaving it untouched", ex);
+            }
+        }
+
+        /**
+         * Makes this delivery an execution of its own ({@code docs/PLAN-v2.md} §5.1) on the consumer thread, from
+         * {@code intercept} to {@code afterRecord}, which Spring Kafka calls around the listener on that thread, so
+         * the SQL, exceptions, REST client calls, and messages the listener produces nest under it. A scope left open
+         * by a delivery whose {@code afterRecord} never came is closed first.
+         */
+        private void openExecution(ConsumerRecord<Object, Object> record) {
+            closeExecution();
+            executionScope.set(BootUiCorrelation.open(
+                    CorrelationContext.forExecution(RequestIds.next()).withLinkedTraceId(linkedTraceId(record))));
+        }
+
+        /** The trace the record's {@code traceparent} header names, linking this delivery to its sender. */
+        private static String linkedTraceId(ConsumerRecord<Object, Object> record) {
+            try {
+                Header header = record == null ? null : record.headers().lastHeader(TraceParents.HEADER);
+                return header == null ? null : TraceParents.traceIdOf(header.value());
+            } catch (RuntimeException ex) {
+                return null;
+            }
+        }
+
+        private void closeExecution() {
+            BootUiCorrelation.Scope scope = executionScope.get();
+            executionScope.remove();
+            if (scope != null) {
+                scope.close();
+            }
+        }
+
+        private static String groupIdOf(Consumer<Object, Object> consumer) {
+            try {
+                return consumer.groupMetadata().groupId();
+            } catch (RuntimeException ex) {
+                return null;
+            }
+        }
+    }
+}

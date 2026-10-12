@@ -4,8 +4,15 @@ import io.github.jdubois.bootui.core.SecretMasker;
 import io.github.jdubois.bootui.core.ValueExposure;
 import io.github.jdubois.bootui.core.dto.EmailMessageDto;
 import io.github.jdubois.bootui.core.dto.EmailsReport;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.MailPayload;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
 import io.github.jdubois.bootui.spi.ExposurePolicy;
-import io.github.jdubois.bootui.spi.TraceIdProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.util.List;
 
 /**
@@ -27,7 +34,9 @@ import java.util.List;
  * enabled) is applied at <em>read</em> time (not at capture time), so a live change takes effect on the
  * next request without needing to re-capture anything.</p>
  */
-public final class EmailCaptureService {
+public final class EmailCaptureService implements RuntimeEventPublisher, MemoryOffloadable {
+
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
 
     private final EmailStore store;
     private final ExposurePolicy exposurePolicy;
@@ -55,9 +64,9 @@ public final class EmailCaptureService {
         return maskContent;
     }
 
-    /** Installs the trace-id provider used when stamping captured messages. */
-    public void setTraceIdProvider(TraceIdProvider traceIdProvider) {
-        this.store.setTraceIdProvider(traceIdProvider);
+    /** Replaces the source of the request id stamped on each captured email; see {@link EmailStore}. */
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        this.store.setCorrelationContextProvider(correlationProvider);
     }
 
     /** Registers a listener notified whenever the captured-message store changes. */
@@ -74,8 +83,39 @@ public final class EmailCaptureService {
      */
     public boolean capture(CapturedEmail email) {
         boolean sent = !devTrapEnabled;
-        store.capture(email, sent);
+        CorrelationContext context = store.currentCorrelation();
+        EmailStore.Entry entry = store.capture(email, sent);
+        publish(email, entry, context);
         return sent;
+    }
+
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each captured email's metadata:
+     * never its sender, recipients, subject, or body.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
+    private void publish(CapturedEmail email, EmailStore.Entry entry, CorrelationContext context) {
+        try {
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.MAIL,
+                    entry.timestamp(),
+                    -1,
+                    context,
+                    entry.traceId(),
+                    entry.thread(),
+                    null,
+                    !entry.sent(),
+                    new MailPayload(
+                            email.to().size() + email.cc().size() + email.bcc().size(),
+                            email.attachments().size(),
+                            entry.sent())));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the application's mail.
+        }
     }
 
     /** Lists all captured messages, newest-first, revealed or masked per {@link #isMaskContentEnabled()}. */
@@ -93,6 +133,24 @@ public final class EmailCaptureService {
     /** Returns one captured message by id, revealed or masked per {@link #isMaskContentEnabled()}. */
     public EmailMessageDto get(String id) {
         return store.get(id).map(this::toDto).orElse(null);
+    }
+
+    @Override
+    public String offloadId() {
+        return "email";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "Captured emails";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = store.size();
+        clear();
+        return retained;
     }
 
     /** Discards all captured messages. */
@@ -117,7 +175,8 @@ public final class EmailCaptureService {
                 email.attachments().stream().map(CapturedAttachment::toDto).toList(),
                 entry.sent(),
                 entry.traceId(),
-                entry.thread());
+                entry.thread(),
+                entry.requestId());
     }
 
     private static List<String> maskEach(List<String> addresses) {

@@ -2,11 +2,49 @@ package io.github.jdubois.bootui.engine.exceptions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.spi.CorrelationContext;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class ExceptionStoreTests {
+
+    @Test
+    void theCrossRunSignatureIgnoresLineNumbersButNotMethods() {
+        List<ExceptionStore.Frame> before = List.of(
+                new ExceptionStore.Frame("com.example.OrderService", "place", "OrderService.java", 40, true),
+                new ExceptionStore.Frame("com.example.OrderController", "post", "OrderController.java", 12, true));
+        List<ExceptionStore.Frame> shifted = List.of(
+                new ExceptionStore.Frame("com.example.OrderService", "place", "OrderService.java", 47, true),
+                new ExceptionStore.Frame("com.example.OrderController", "post", "OrderController.java", 15, true));
+        List<ExceptionStore.Frame> otherMethod = List.of(
+                new ExceptionStore.Frame("com.example.OrderService", "cancel", "OrderService.java", 40, true),
+                new ExceptionStore.Frame("com.example.OrderController", "post", "OrderController.java", 12, true));
+
+        String signature = ExceptionStore.signature("java.lang.IllegalStateException", before);
+
+        assertThat(ExceptionStore.signature("java.lang.IllegalStateException", shifted))
+                .isEqualTo(signature);
+        assertThat(ExceptionStore.signature("java.lang.IllegalStateException", otherMethod))
+                .isNotEqualTo(signature);
+        assertThat(ExceptionStore.signature("java.lang.IllegalArgumentException", before))
+                .isNotEqualTo(signature);
+    }
+
+    @Test
+    void theAgentBridgesFramesNeverChangeAFailuresGroup() {
+        ExceptionStore.Frame job = new ExceptionStore.Frame("com.example.Job", "run", "Job.java", 10, true);
+        ExceptionStore.Frame worker = new ExceptionStore.Frame(
+                "java.util.concurrent.ThreadPoolExecutor", "runWorker", "ThreadPoolExecutor.java", 1144, false);
+        ExceptionStore.Frame bridge = new ExceptionStore.Frame(
+                "io.github.jdubois.bootui.agent.bridge.TaskPropagation", "runTask", "TaskPropagation.java", 230, false);
+
+        assertThat(ExceptionStore.fingerprintFrames(List.of(job, bridge, worker)))
+                .containsExactly(job, worker);
+        assertThat(ExceptionStore.signature("java.lang.IllegalStateException", List.of(job, bridge, worker)))
+                .isEqualTo(ExceptionStore.signature("java.lang.IllegalStateException", List.of(job, worker)));
+    }
 
     @Test
     void groupsRepeatedFailuresWithIdenticalStacks() {
@@ -22,6 +60,29 @@ class ExceptionStoreTests {
     }
 
     @Test
+    void stampsEachOccurrenceWithTheRequestIdCurrentWhenItWasRecorded() {
+        ExceptionStore store = new ExceptionStore(100, 25, 50);
+        List<Throwable> failures = sameOrigin(3);
+
+        try (BootUiCorrelation.Scope ignored =
+                BootUiCorrelation.open(CorrelationContext.forRequest("0123456789abcdef"))) {
+            store.record(failures.get(0), "worker-1", "GET", "/orders", "Handler#x", "web");
+        }
+        store.setCorrelationContextProvider(() -> CorrelationContext.forRequest("fedcba9876543210"));
+        store.record(failures.get(1), "log-thread", null, null, null, "log");
+        store.setCorrelationContextProvider(() -> {
+            throw new IllegalStateException("no request context");
+        });
+        store.record(failures.get(2), "main", null, null, null, "log");
+
+        ExceptionStore.GroupDetail detail = store.find(store.groups().get(0).fingerprint());
+        assertThat(detail.occurrences())
+                .extracting(ExceptionStore.Occurrence::requestId)
+                .containsExactlyInAnyOrder("0123456789abcdef", "fedcba9876543210", null);
+        assertThat(store.groups().get(0).last().requestId()).isNull();
+    }
+
+    @Test
     void deduplicatesTheSameThrowableInstance() {
         ExceptionStore store = new ExceptionStore(100, 25, 50);
         IllegalStateException ex = new IllegalStateException("boom");
@@ -32,6 +93,46 @@ class ExceptionStoreTests {
         assertThat(store.totalExceptions()).isEqualTo(1);
         assertThat(store.groups()).hasSize(1);
         assertThat(store.groups().get(0).count()).isEqualTo(1);
+    }
+
+    @Test
+    void distinctValueEqualThrowablesAreSeparateOccurrences() {
+        ExceptionStore store = new ExceptionStore(100, 25, 50);
+        List<io.github.jdubois.bootui.engine.journal.RuntimeEvent> events = new ArrayList<>();
+        store.setRuntimeEventSink(event -> {
+            events.add(event);
+            return true;
+        });
+        List<ValueEqualFailure> failures = new ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            failures.add(new ValueEqualFailure());
+        }
+        for (ValueEqualFailure failure : failures) {
+            store.record(failure, "main", null, null, null, "log");
+            store.record(new RuntimeException("wrapper", failure), "main", null, null, null, "web");
+        }
+
+        assertThat(store.totalExceptions()).isEqualTo(2);
+        assertThat(store.groups())
+                .singleElement()
+                .satisfies(group -> assertThat(group.count()).isEqualTo(2));
+        assertThat(events).hasSize(2);
+    }
+
+    private static final class ValueEqualFailure extends RuntimeException {
+        ValueEqualFailure() {
+            super("equal failure");
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof ValueEqualFailure;
+        }
+
+        @Override
+        public int hashCode() {
+            return 1;
+        }
     }
 
     @Test

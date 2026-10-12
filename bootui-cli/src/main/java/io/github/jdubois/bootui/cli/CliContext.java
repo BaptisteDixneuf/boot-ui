@@ -4,6 +4,7 @@ import io.github.jdubois.bootui.client.BootUiCatalog;
 import io.github.jdubois.bootui.client.BootUiClient;
 import io.github.jdubois.bootui.client.BootUiClientException;
 import io.github.jdubois.bootui.client.BootUiClientOptions;
+import io.github.jdubois.bootui.client.JsonParseException;
 import io.github.jdubois.bootui.client.JsonValue;
 import io.github.jdubois.bootui.client.JsonWriter;
 import io.github.jdubois.bootui.client.ToolOutcome;
@@ -24,6 +25,9 @@ import java.util.function.Function;
  * once parsing has finished — {@code bootui beans --url …} sets them after the command has been selected.
  */
 final class CliContext {
+
+    private static final String UNKNOWN_MCP_OUTCOME =
+            "The MCP action outcome is unknown: no valid BootUI MCP server status acknowledgement was received. The action was not retried.";
 
     private final GlobalOptions options = new GlobalOptions();
     private final ToolManifest manifest;
@@ -100,10 +104,10 @@ final class CliContext {
                 emit(result.payload(), result.rawBody());
                 return ExitCodes.SUCCESS;
             }
-            confirmBootUiAnswered(client, result.outcome());
-            err.println(describe(client, tool, result.outcome(), result.errorMessage()));
+            ToolOutcome outcome = confirmBootUiAnswered(client, result);
+            err.println(describe(client, tool, outcome, result.errorMessage()));
             err.flush();
-            return exitCodeFor(result.outcome());
+            return exitCodeFor(outcome);
         });
     }
 
@@ -117,18 +121,23 @@ final class CliContext {
      * declining by policy, and exit {@code 2}. A CI gate reads that as "skip", so a misconfigured target
      * would quietly pass instead of failing.
      *
-     * <p>Asking for the catalog settles it: if there is no command-line endpoint there, that throws, and
-     * its message already names the likely causes. This costs a request only on a path that has failed.
+     * <p>HTTP 503 also needs the catalog: only a disabled endpoint is a policy refusal, while an outage
+     * remains a failed request even when the target is BootUI. The catalog is validated before its enabled
+     * state is trusted. This costs a request only on a path that has failed.
      */
-    private void confirmBootUiAnswered(BootUiClient client, ToolOutcome outcome) {
-        if (outcome != ToolOutcome.REFUSED_BY_POLICY && outcome != ToolOutcome.UNKNOWN_TOOL) {
-            return;
+    private ToolOutcome confirmBootUiAnswered(BootUiClient client, ToolResult result) {
+        ToolOutcome outcome = result.outcome();
+        if (outcome != ToolOutcome.REFUSED_BY_POLICY && outcome != ToolOutcome.UNKNOWN_TOOL && result.status() != 503) {
+            return outcome;
         }
         try {
-            client.catalog();
+            BootUiCatalog catalog = client.catalog();
+            return result.status() == 503 && !catalog.enabled() ? ToolOutcome.ENDPOINT_DISABLED : outcome;
         } catch (BootUiClientException noEndpoint) {
-            throw new BootUiClientException(
-                    "This is not a BootUI policy refusal. " + noEndpoint.getMessage(), noEndpoint);
+            String context = result.status() == 503
+                    ? "Cannot confirm BootUI command-line endpoint state after HTTP 503. "
+                    : "This is not a BootUI policy refusal. ";
+            throw new BootUiClientException(context + noEndpoint.getMessage(), noEndpoint);
         }
     }
 
@@ -136,12 +145,12 @@ final class CliContext {
     int listTools() {
         return withClient(client -> {
             JsonValue document = client.get(CliPaths.CLI);
+            BootUiCatalog catalog = BootUiCatalog.from(document);
             if (options.json(terminal)) {
                 out.println(document.toJson());
                 out.flush();
                 return ExitCodes.SUCCESS;
             }
-            BootUiCatalog catalog = BootUiCatalog.from(document);
             List<JsonValue> rows = new ArrayList<>();
             for (BootUiCatalog.CatalogTool tool : catalog.tools()) {
                 ToolManifest.Tool known = manifest.byName(tool.name());
@@ -168,11 +177,7 @@ final class CliContext {
 
     /** Reads the MCP Server panel. */
     int mcpStatus() {
-        return withClient(client -> {
-            JsonValue status = client.get(CliPaths.MCP_SERVER);
-            emit(status, status.toJson());
-            return ExitCodes.SUCCESS;
-        });
+        return withClient(client -> emitMcpStatus(client.get(CliPaths.MCP_SERVER), false));
     }
 
     /**
@@ -183,10 +188,39 @@ final class CliContext {
      */
     int mcpToggle(boolean enabled) {
         return withClient(client -> {
-            JsonValue status = client.post(CliPaths.MCP_TOGGLE, "{\"enabled\":" + enabled + "}");
-            emit(status, status.toJson());
-            return ExitCodes.SUCCESS;
+            JsonValue status;
+            try {
+                status = client.post(CliPaths.MCP_TOGGLE, "{\"enabled\":" + enabled + "}");
+            } catch (BootUiClientException failure) {
+                if (failure.getCause() instanceof JsonParseException) {
+                    throw new BootUiClientException(UNKNOWN_MCP_OUTCOME, failure);
+                }
+                throw failure;
+            }
+            return emitMcpStatus(status, true);
         });
+    }
+
+    private int emitMcpStatus(JsonValue status, boolean action) {
+        // Recognize the stable report envelope, not a particular state or the counters newer servers add.
+        JsonValue tools = status.get("tools");
+        boolean valid = status.isObject()
+                && "bootui".equals(status.get("serverName").asString(null))
+                && "http".equals(status.get("transport").asString(null))
+                && status.get("enabled").isBoolean()
+                && tools.isArray()
+                && tools.values().stream()
+                        .allMatch(tool -> tool.isObject()
+                                && !tool.get("name").asString("").isBlank()
+                                && tool.get("action").isBoolean());
+        if (!valid) {
+            throw new BootUiClientException(
+                    action
+                            ? UNKNOWN_MCP_OUTCOME
+                            : "The target did not return a valid BootUI MCP server status report.");
+        }
+        emit(status, status.toJson());
+        return ExitCodes.SUCCESS;
     }
 
     private static String status(BootUiCatalog.CatalogTool tool) {

@@ -3,15 +3,21 @@ package io.github.jdubois.bootui.quarkus;
 import io.github.jdubois.bootui.core.dto.PanelDto;
 import io.github.jdubois.bootui.core.dto.PanelsReport;
 import io.github.jdubois.bootui.engine.agent.AgentSessionStore;
+import io.github.jdubois.bootui.engine.codepaths.CodePathsService;
 import io.github.jdubois.bootui.engine.github.GitHubRepositoryDetector;
+import io.github.jdubois.bootui.engine.insights.RuntimeInsightsService;
+import io.github.jdubois.bootui.engine.inventory.CodeInventoryService;
+import io.github.jdubois.bootui.engine.javaagent.JavaAgentService;
 import io.github.jdubois.bootui.engine.mysql.MySqlDataSourceDetection;
 import io.github.jdubois.bootui.engine.panel.BootUiPanels;
 import io.github.jdubois.bootui.engine.postgres.PostgresDataSourceDetection;
+import io.github.jdubois.bootui.engine.sideeffects.SideEffectsService;
 import io.github.jdubois.bootui.quarkus.agent.QuarkusClaudeCodeProperties;
 import io.github.jdubois.bootui.quarkus.agent.QuarkusCopilotProperties;
 import io.github.jdubois.bootui.quarkus.devservices.CapturedDevServices;
 import io.smallrye.config.SmallRyeConfig;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -139,8 +145,8 @@ import org.eclipse.microprofile.config.Config;
  * therefore report an honest, panel-specific reason so
  * the shared Vue unavailable-alert never implies a port is forthcoming. <strong>HTTP Sessions</strong>,
  * <strong>Spring Data</strong> and <strong>Spring Security</strong> are likewise permanent exceptions: HTTP
- * Sessions inventories servlet sessions via Spring Session's enumerable registry (Quarkus is reactive/stateless
- * and has no equivalent registry, even when servlet sessions are added via quarkus-undertow); Spring Data
+ * Sessions inventories servlet sessions through embedded Tomcat's session managers in Spring MVC applications
+ * (Quarkus is reactive/stateless and has no equivalent registry, even when servlet sessions are added via quarkus-undertow); Spring Data
  * enumerates Spring Data repository beans (Quarkus uses Panache/Hibernate instead — the Hibernate advisor covers
  * mapping insight); and Spring Security reads Spring Security's filter chain and user store (Quarkus security is
  * covered by the Quarkus-native Security advisor). The <strong>Security</strong> advisor,
@@ -391,8 +397,9 @@ public class QuarkusPanelAvailability {
                     + " runtime per-step buffer (Spring's BufferingApplicationStartup) to record a timeline; only"
                     + " coarse boot totals exist, so this fine-grained step timeline is not used here.",
             BootUiPanels.HTTP_SESSIONS,
-            "Not applicable on Quarkus: this panel inventories servlet HTTP sessions via Spring Session's"
-                    + " enumerable registry, but Quarkus is reactive/stateless by default and exposes no equivalent"
+            "Not applicable on Quarkus: this panel inventories servlet HTTP sessions through embedded Tomcat's"
+                    + " session managers in Spring MVC applications, but Quarkus is reactive/stateless by default and"
+                    + " exposes no equivalent"
                     + " active-session registry to list (servlet sessions added via quarkus-undertow are not"
                     + " tracked), so it is not used here.",
             BootUiPanels.DATA,
@@ -441,6 +448,7 @@ public class QuarkusPanelAvailability {
             Map.entry(BootUiPanels.KAFKA, KAFKA_ABSENT),
             Map.entry(BootUiPanels.RABBITMQ, RABBIT_ABSENT),
             Map.entry(BootUiPanels.WEBSOCKETS, WEBSOCKETS_ABSENT),
+            Map.entry(BootUiPanels.RUNTIME_INSIGHTS, RuntimeInsightsService.DISABLED),
             Map.entry(BootUiPanels.REST_CLIENT_TRACE, REST_CLIENT_TRACE_ABSENT),
             Map.entry(BootUiPanels.SQL_TRACE, SQL_TRACE_ABSENT),
             Map.entry(BootUiPanels.POSTGRESQL, POSTGRESQL_ABSENT),
@@ -477,6 +485,7 @@ public class QuarkusPanelAvailability {
             BootUiPanels.EXCEPTIONS,
             BootUiPanels.MCP_SERVER,
             BootUiPanels.CLI,
+            BootUiPanels.JAVA_AGENT,
             BootUiPanels.VULNERABILITIES,
             BootUiPanels.DATABASE_ADVISOR);
 
@@ -526,6 +535,21 @@ public class QuarkusPanelAvailability {
      * lookup instead of a 14-way OR-chain.
      */
     private final Map<String, Boolean> dynamicAvailability;
+
+    /**
+     * Code Inventory, whose availability is the BootUI agent's: computed fresh per call, like GitHub's. Absent when this
+     * class is built outside the container, as in tests, where the panel is then unavailable with the agent's reason.
+     */
+    @Inject
+    Instance<CodeInventoryService> codeInventory;
+
+    /** Code Paths, whose availability is the BootUI agent's code-paths sensor's, computed fresh per call. */
+    @Inject
+    Instance<CodePathsService> codePaths;
+
+    /** Side Effects, whose availability is the BootUI agent's, computed fresh per call. */
+    @Inject
+    Instance<SideEffectsService> sideEffects;
 
     @Inject
     public QuarkusPanelAvailability(Config config) {
@@ -589,6 +613,10 @@ public class QuarkusPanelAvailability {
                 Map.entry(BootUiPanels.KAFKA, kafkaPresent),
                 Map.entry(BootUiPanels.RABBITMQ, rabbitPresent),
                 Map.entry(BootUiPanels.WEBSOCKETS, webSocketsPresent),
+                Map.entry(
+                        BootUiPanels.RUNTIME_INSIGHTS,
+                        config.getOptionalValue("bootui.runtime-journal.enabled", Boolean.class)
+                                .orElse(true)),
                 Map.entry(BootUiPanels.REST_CLIENT_TRACE, restClientTracePresent),
                 Map.entry(BootUiPanels.SECURITY_LOGS, securityLogsAvailable),
                 Map.entry(BootUiPanels.SQL_TRACE, connectionPoolsPresent),
@@ -740,7 +768,49 @@ public class QuarkusPanelAvailability {
     public boolean isPanelAvailable(String panelId) {
         return AVAILABLE_PANELS.contains(panelId)
                 || dynamicAvailability.getOrDefault(panelId, Boolean.FALSE)
-                || (BootUiPanels.GITHUB.equals(panelId) && githubAvailable());
+                || (BootUiPanels.GITHUB.equals(panelId) && githubAvailable())
+                || (BootUiPanels.CODE_INVENTORY.equals(panelId) && codeInventoryUnavailableReason() == null)
+                || (BootUiPanels.CODE_PATHS.equals(panelId) && codePathsUnavailableReason() == null)
+                || (BootUiPanels.SIDE_EFFECTS.equals(panelId) && sideEffectsUnavailableReason() == null);
+    }
+
+    /** Why Code Inventory is unavailable: the BootUI agent's inventory sensor does not record this run. */
+    private String codeInventoryUnavailableReason() {
+        try {
+            Instance<CodeInventoryService> services = codeInventory;
+            if (services == null || !services.isResolvable()) {
+                return JavaAgentService.INVENTORY_REQUIREMENT + ".";
+            }
+            return services.get().unavailableReason();
+        } catch (RuntimeException ex) {
+            return JavaAgentService.INVENTORY_REQUIREMENT + ".";
+        }
+    }
+
+    /** Why Code Paths is unavailable: the BootUI agent's code-paths sensor does not record this run. */
+    private String codePathsUnavailableReason() {
+        try {
+            Instance<CodePathsService> services = codePaths;
+            if (services == null || !services.isResolvable()) {
+                return JavaAgentService.CODE_PATHS_REQUIREMENT + ".";
+            }
+            return services.get().unavailableReason();
+        } catch (RuntimeException ex) {
+            return JavaAgentService.CODE_PATHS_REQUIREMENT + ".";
+        }
+    }
+
+    /** Why Side Effects is unavailable: the BootUI agent is not armed for this run with Side Effects support. */
+    private String sideEffectsUnavailableReason() {
+        try {
+            Instance<SideEffectsService> services = sideEffects;
+            if (services == null || !services.isResolvable()) {
+                return JavaAgentService.SIDE_EFFECTS_REQUIREMENT + ".";
+            }
+            return services.get().unavailableReason();
+        } catch (RuntimeException ex) {
+            return JavaAgentService.SIDE_EFFECTS_REQUIREMENT + ".";
+        }
     }
 
     /** Whether the panel is enabled by the live per-panel access policy. */
@@ -763,6 +833,18 @@ public class QuarkusPanelAvailability {
     private String unavailableReason(String panelId) {
         if (BootUiPanels.GITHUB.equals(panelId)) {
             return githubUnavailableReason();
+        }
+        if (BootUiPanels.CODE_INVENTORY.equals(panelId)) {
+            String reason = codeInventoryUnavailableReason();
+            return reason == null ? JavaAgentService.INVENTORY_REQUIREMENT + "." : reason;
+        }
+        if (BootUiPanels.CODE_PATHS.equals(panelId)) {
+            String reason = codePathsUnavailableReason();
+            return reason == null ? JavaAgentService.CODE_PATHS_REQUIREMENT + "." : reason;
+        }
+        if (BootUiPanels.SIDE_EFFECTS.equals(panelId)) {
+            String reason = sideEffectsUnavailableReason();
+            return reason == null ? JavaAgentService.SIDE_EFFECTS_REQUIREMENT + "." : reason;
         }
         return CAPABILITY_ABSENT.getOrDefault(
                 panelId,

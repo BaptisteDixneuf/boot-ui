@@ -21,8 +21,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -158,6 +161,14 @@ public abstract class AbstractBootUiApiConformanceTest {
      */
     protected String routeProbePath() {
         return applicationPath() + "/conformance-route-probe/4711";
+    }
+
+    /**
+     * An application request that fails with an exception BootUI captures into an exception group, or {@code null} when
+     * the host application has none; the Live Activity exception-link contract is skipped then.
+     */
+    protected String exceptionProbePath() {
+        return null;
     }
 
     /** Browser-visible UI mount, including any host application root path. */
@@ -873,6 +884,7 @@ public abstract class AbstractBootUiApiConformanceTest {
             Response scanned = probe.request("POST", api("/" + panel + "/scan"), stateChangingHeaders(probe), "");
             assertThat(scanned.status()).as(panel + " scan").isEqualTo(200);
             JsonNode report = scanned.json();
+            assertOneOutcomePerRule(panel, report);
             JsonNode metadata = report.path("violationDetails");
             String scanId = metadata.path("scanId").asText();
             assertThat(scanId).as(panel + " snapshot identifier").isNotBlank();
@@ -924,6 +936,24 @@ public abstract class AbstractBootUiApiConformanceTest {
             assertThat(probe.get(api("/" + panel)).json().path("violationDetails"))
                     .isEqualTo(metadata);
         }
+    }
+
+    /**
+     * A rule has exactly one outcome per scan: an id listed in {@code results} is never also listed in
+     * {@code analysisErrors}, whichever advisor and stack produced the report. Incomplete coverage of a rule that did
+     * find something belongs in the finding and the evidence limitations, not in a second, contradictory entry.
+     */
+    private static void assertOneOutcomePerRule(String panel, JsonNode report) {
+        Set<String> findings = new HashSet<>();
+        report.path("results").forEach(result -> findings.add(result.path("id").asText()));
+        List<String> errors = new ArrayList<>();
+        report.path("analysisErrors")
+                .forEach(error -> errors.add(error.path("id").asText()));
+        assertThat(errors)
+                .as(panel + " analysisErrors must not repeat a rule listed in results")
+                .allSatisfy(id -> assertThat(findings)
+                        .as(panel + " rule " + id + " is both a result and an analysis error")
+                        .doesNotContain(id));
     }
 
     /**
@@ -1271,6 +1301,29 @@ public abstract class AbstractBootUiApiConformanceTest {
                         + coverage.path("archivesFirstParty").asInt())
                 .as("$.coverage archive counts must add up to archivesFound")
                 .isEqualTo(coverage.path("archivesFound").asInt());
+        // Runtime reach (PLAN-v2 §5.15): every adapter says whether rows carry it and, without it, why; a row never
+        // reads NOT_LOADED without the agent's evidence.
+        JsonNode reach = report.path("runtimeReach");
+        assertThat(reach.isObject()).as("$.runtimeReach must be an object").isTrue();
+        assertThat(reach.path("available").isBoolean())
+                .as("$.runtimeReach.available must be a boolean")
+                .isTrue();
+        for (JsonNode dependency : report.path("dependencies")) {
+            if (reach.path("available").asBoolean()) {
+                assertThat(dependency.path("runtimeReach").path("status").asText())
+                        .as("$.dependencies[].runtimeReach.status")
+                        .isIn("NOT_LOADED", "LOADED", "AFFECTED_CLASS_LOADED", "UNKNOWN");
+            } else {
+                assertThat(dependency.path("runtimeReach").isNull())
+                        .as("$.dependencies[].runtimeReach without reach")
+                        .isTrue();
+            }
+        }
+        if (!reach.path("available").asBoolean()) {
+            assertThat(reach.path("unavailableReason").asText())
+                    .as("$.runtimeReach.unavailableReason")
+                    .isNotBlank();
+        }
     }
 
     @Test
@@ -1501,6 +1554,751 @@ public abstract class AbstractBootUiApiConformanceTest {
         assertThat(detailResponse.status())
                 .as("GET /bootui/api/traces/{unknown} must return 404 for an unrecognised trace id")
                 .isEqualTo(404);
+    }
+
+    @Test
+    void runtimeJournalReportsOneShapeAndClearingItNeedsConfirmation() {
+        assumeTrue(isPanelUsableInLiveManifest("activity"), "activity panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.runtimeJournal();
+        BootUiHttpProbe probe = probe();
+
+        Response status = probe.get(api(contract.relativePath()));
+
+        assertThat(status.status()).as("GET %s status", contract.relativePath()).isEqualTo(200);
+        List<String> failures = new ArrayList<>();
+        assertJsonContract("runtime journal status", contract, status.json(), failures);
+        assertThat(failures).as("runtime journal contract").isEmpty();
+        assertThat(status.json().path("enabled").asBoolean(false)).isTrue();
+        assertThat(status.json().path("runId").asText()).matches("[0-9a-f]{8}");
+
+        Response unconfirmed = probe.request("POST", api("/activity/journal/clear"), stateChangingHeaders(probe), "{}");
+        assertThat(unconfirmed.status())
+                .as("Clear recording without confirm=true")
+                .isEqualTo(400);
+        assertThat(unconfirmed.json().path("status").asText()).isEqualTo("blocked");
+    }
+
+    @Test
+    void liveActivityServesTheFeedRenderedFromTheJournalOnRequest() {
+        assumeTrue(isPanelUsableInLiveManifest("activity"), "activity panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.reads().stream()
+                .filter(read -> read.relativePath().equals("/activity"))
+                .findFirst()
+                .orElseThrow();
+        BootUiHttpProbe probe = probe();
+
+        Response journal = probe.get(api("/activity?source=journal"));
+
+        assertThat(journal.status()).as("GET /activity?source=journal status").isEqualTo(200);
+        List<String> failures = new ArrayList<>();
+        assertJsonContract("live activity from the journal", contract, journal.json(), failures);
+        assertThat(failures).as("live activity contract, from the journal").isEmpty();
+        assertThat(journal.json().path("available").asBoolean(false)).isTrue();
+        assertThat(journal.json().path("sources").toString()).contains("Runtime journal");
+
+        Response unknown = probe.get(api("/activity?source=elsewhere"));
+        assertThat(unknown.status()).as("an unknown feed source is rejected").isEqualTo(400);
+
+        Response buffers = probe.get(api("/activity?source=buffers&noRequest=true"));
+        assertThat(buffers.status()).isEqualTo(200);
+        assertThat(buffers.json().path("warnings").toString())
+                .as("a journal-only filter on the buffers' feed is reported, never silently dropped")
+                .contains("source=journal");
+    }
+
+    @Test
+    void liveActivityExceptionEntriesNameTheirExceptionGroup() throws InterruptedException {
+        assumeTrue(isPanelUsableInLiveManifest("activity"), "activity panel is not available in this environment");
+        assumeTrue(isPanelUsableInLiveManifest("exceptions"), "exceptions panel is not available in this environment");
+        String failing = exceptionProbePath();
+        assumeTrue(failing != null, "this host application has no failing request to send");
+        BootUiHttpProbe probe = probe();
+        probe.get(failing);
+        // The entry's path omits the application's root path; another failing request's entry never counts.
+        String failingPath = failing.substring(applicationPath().length());
+        for (String feed : List.of("/activity?source=journal&type=EXCEPTION&limit=50", "/activity?source=buffers")) {
+            String groupId = null;
+            for (int attempt = 0; attempt < 30 && groupId == null; attempt++) {
+                for (JsonNode entry : probe.get(api(feed)).json().path("entries")) {
+                    if ("EXCEPTION".equals(entry.path("type").asText())) {
+                        assertThat(entry.has("exceptionGroupId"))
+                                .as("%s: an EXCEPTION entry carries exceptionGroupId", feed)
+                                .isTrue();
+                        if (entry.path("path").asText("").endsWith(failingPath)
+                                && !entry.path("exceptionGroupId").asText("").isBlank()) {
+                            groupId = entry.path("exceptionGroupId").asText();
+                            break;
+                        }
+                    }
+                }
+                if (groupId == null) {
+                    Thread.sleep(100);
+                }
+            }
+            assertThat(groupId)
+                    .as("%s lists the exception of %s with its group id", feed, failingPath)
+                    .isNotNull();
+            Response detail = probe.get(api("/exceptions/" + groupId));
+            assertThat(detail.status())
+                    .as("%s: GET /exceptions/{exceptionGroupId} resolves the entry's group", feed)
+                    .isEqualTo(200);
+        }
+    }
+
+    @Test
+    void requestJournalProfileKeepsOneShapeForAnUnknownAndARecordedRequest() throws InterruptedException {
+        assumeTrue(isPanelUsableInLiveManifest("activity"), "activity panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.requestJournalProfile();
+        BootUiHttpProbe probe = probe();
+
+        Response unknown = probe.get(api(contract.relativePath()));
+        assertThat(unknown.status())
+                .as("GET %s status", contract.relativePath())
+                .isEqualTo(200);
+        List<String> failures = new ArrayList<>();
+        assertJsonContract("request journal profile, unknown", contract, unknown.json(), failures);
+        assertThat(unknown.json().path("available").asBoolean(true)).isFalse();
+
+        probe.get(routeProbePath());
+        String requestId = null;
+        for (int attempt = 0; attempt < 20 && requestId == null; attempt++) {
+            for (JsonNode entry : probe.get(api("/activity?source=journal&type=REQUEST&limit=50"))
+                    .json()
+                    .path("entries")) {
+                if (entry.path("path").asText("").contains("conformance-route-probe")) {
+                    requestId = entry.path("id").asText();
+                    break;
+                }
+            }
+            if (requestId == null) {
+                Thread.sleep(100);
+            }
+        }
+        assertThat(requestId)
+                .as("the journal's feed lists the route probe request")
+                .isNotNull();
+        Response recorded = probe.get(api("/activity/request/" + requestId + "/journal"));
+        assertThat(recorded.status()).isEqualTo(200);
+        assertJsonContract("request journal profile, recorded", contract, recorded.json(), failures);
+        assertThat(failures).as("request journal profile contract").isEmpty();
+        assertThat(recorded.json().path("available").asBoolean(false)).isTrue();
+        assertThat(recorded.json().path("requestId").asText()).isEqualTo(requestId);
+        assertThat(recorded.json().path("route").asText()).isNotBlank();
+    }
+
+    @Test
+    void changeImpactNeverGuessesAnUnknownSymbol() {
+        assumeTrue(
+                isPanelUsableInLiveManifest("runtime-insights"),
+                "runtime-insights panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.changeImpact();
+        List<String> failures = new ArrayList<>();
+
+        Response unknown = probe().get(api(contract.relativePath()));
+
+        assertThat(unknown.status())
+                .as("GET %s status", contract.relativePath())
+                .isEqualTo(200);
+        assertJsonContract("change impact, unknown symbol", contract, unknown.json(), failures);
+        assertThat(failures).as("change impact contract").isEmpty();
+        assertThat(unknown.json().path("status").asText()).isIn("NOT_FOUND", "UNAVAILABLE");
+        assertThat(unknown.json().path("reason").asText()).isNotBlank();
+        assertThat(unknown.json().path("observed").size()).isZero();
+
+        // A method is a symbol too (M5-7a): an unknown one answers the same shape on every stack, never guessed.
+        Response method = probe().get(api("/runtime-insights/impact?symbol="
+                + URLEncoder.encode("ConformanceUnknown#method(String)", StandardCharsets.UTF_8)));
+        assertThat(method.status()).isEqualTo(200);
+        assertJsonContract("change impact, unknown method", contract, method.json(), failures);
+        assertThat(failures).as("change impact contract, method").isEmpty();
+        assertThat(method.json().path("status").asText()).isIn("NOT_FOUND", "UNAVAILABLE");
+        assertThat(method.json().path("reason").asText()).isNotBlank();
+        assertThat(method.json().path("notObserved").size()).isZero();
+    }
+
+    @Test
+    void changeImpactSymbolsSuggestNothingForAnUnknownQuery() {
+        assumeTrue(
+                isPanelUsableInLiveManifest("runtime-insights"),
+                "runtime-insights panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.changeImpactSymbols();
+        List<String> failures = new ArrayList<>();
+
+        Response unknown = probe().get(api(contract.relativePath()));
+
+        assertThat(unknown.status())
+                .as("GET %s status", contract.relativePath())
+                .isEqualTo(200);
+        assertJsonContract("change impact symbols, unknown query", contract, unknown.json(), failures);
+        assertThat(failures).as("change impact symbols contract").isEmpty();
+        assertThat(unknown.json().path("query").asText()).isEqualTo("conformanceUnknownSymbol");
+        assertThat(unknown.json().path("symbols").size()).isZero();
+        assertThat(unknown.json().path("total").asInt(-1)).isZero();
+    }
+
+    @Test
+    void readingTheResourceProfileStartsNoSession() {
+        assumeTrue(
+                isPanelUsableInLiveManifest("runtime-insights"),
+                "runtime-insights panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.resourceProfile();
+        BootUiHttpProbe probe = probe();
+        List<String> failures = new ArrayList<>();
+
+        Response first = probe.get(api(contract.relativePath()));
+        Response second = probe.get(api(contract.relativePath()));
+
+        assertThat(first.status()).as("GET %s status", contract.relativePath()).isEqualTo(200);
+        assertJsonContract("resource profile", contract, first.json(), failures);
+        assertThat(failures).as("resource profile contract").isEmpty();
+        assertThat(first.json().path("state").asText()).isIn("IDLE", "COMPLETED", "FAILED", "UNAVAILABLE");
+        assertThat(second.json().path("state").asText())
+                .as("a read never starts a JFR session")
+                .isEqualTo(first.json().path("state").asText());
+        assertThat(first.json().path("maxDurationSeconds").asLong()).isPositive();
+        if ("UNAVAILABLE".equals(first.json().path("state").asText())) {
+            assertThat(first.json().path("reason").asText()).isNotBlank();
+        }
+    }
+
+    @Test
+    void theRunComparisonComparesTheCurrentRunWithAKeptOneOrSaysWhyNot() {
+        assumeTrue(
+                isPanelUsableInLiveManifest("runtime-insights"),
+                "runtime-insights panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.runComparison();
+        BootUiHttpProbe probe = probe();
+        List<String> failures = new ArrayList<>();
+
+        Response newest = probe.get(api(contract.relativePath()));
+        assertThat(newest.status()).as("GET %s status", contract.relativePath()).isEqualTo(200);
+        assertJsonContract("run comparison, newest", contract, newest.json(), failures);
+        JsonNode json = newest.json();
+        assertThat(json.path("status").asText())
+                .isIn("COMPARED", "PARTIAL", "INSUFFICIENT", "NOT_COMPARABLE", "NO_PREVIOUS_RUN");
+        assertThat(json.path("current").path("source").asText()).isEqualTo("CURRENT");
+        if (json.path("previous").isNull()) {
+            assertThat(json.path("status").asText()).isEqualTo("NO_PREVIOUS_RUN");
+            assertThat(json.path("reason").asText()).isNotBlank();
+        }
+        assertThat(json.path("restartCost").path("status").asText()).isIn("COMPARED", "UNAVAILABLE");
+        // Code changes lead the comparison with the BootUI agent (M5-7a): null without it, the same shape on every
+        // stack with it, unavailable with its reason when it cannot list them.
+        JsonNode codeChanges = json.path("codeChanges");
+        if (!codeChanges.isNull()) {
+            assertThat(codeChanges.path("available").isBoolean())
+                    .as(codeChanges.toString())
+                    .isTrue();
+            assertThat(codeChanges.path("methods").isArray())
+                    .as(codeChanges.toString())
+                    .isTrue();
+            if (!codeChanges.path("available").asBoolean()) {
+                assertThat(codeChanges.path("unavailableReason").asText()).isNotBlank();
+            }
+        }
+        // Side effects follow with the BootUI agent (M5-7b): null without it; with it, the same shape on every stack,
+        // each of the four compared sensors with a status, or unavailable with its reason.
+        JsonNode sideEffects = json.path("sideEffects");
+        if (!sideEffects.isNull()) {
+            assertThat(sideEffects.path("available").isBoolean())
+                    .as(sideEffects.toString())
+                    .isTrue();
+            assertThat(sideEffects.path("changes").isArray())
+                    .as(sideEffects.toString())
+                    .isTrue();
+            if (sideEffects.path("available").asBoolean()) {
+                List<String> sensors = new ArrayList<>();
+                sideEffects.path("sensors").forEach(sensor -> {
+                    sensors.add(sensor.path("sensor").asText());
+                    assertThat(sensor.path("status").asText()).isIn("COMPARED", "PARTIAL", "NOT_COMPARED");
+                });
+                assertThat(sensors).containsExactly("network", "files", "processes", "environment");
+            } else {
+                assertThat(sideEffects.path("unavailableReason").asText()).isNotBlank();
+            }
+        }
+
+        Response unknown = probe.get(api(contract.relativePath() + "?run=conformance-unknown-run"));
+        assertThat(unknown.status()).isEqualTo(200);
+        assertJsonContract("run comparison, unknown run", contract, unknown.json(), failures);
+        assertThat(failures).as("run comparison contract").isEmpty();
+        assertThat(unknown.json().path("status").asText()).isEqualTo("NO_PREVIOUS_RUN");
+        assertThat(unknown.json().path("reason").asText()).contains("conformance-unknown-run");
+    }
+
+    @Test
+    void runtimeInsightsProjectTheJournalIntoObservationsWithStableIdsAndEvidence() throws InterruptedException {
+        assumeTrue(
+                isPanelUsableInLiveManifest("runtime-insights"),
+                "runtime-insights panel is not available in this environment");
+        ReadContract detailContract = BootUiApiContractCatalog.runtimeInsight();
+        BootUiHttpProbe probe = probe();
+        List<String> failures = new ArrayList<>();
+
+        Response unknown = probe.get(api(detailContract.relativePath()));
+        assertThat(unknown.status())
+                .as("GET %s status", detailContract.relativePath())
+                .isEqualTo(200);
+        assertJsonContract("runtime insight, unknown", detailContract, unknown.json(), failures);
+        assertThat(unknown.json().path("available").asBoolean(true)).isFalse();
+
+        for (int i = 0; i < 7; i++) {
+            probe.get(routeProbePath());
+        }
+        JsonNode breakdown = null;
+        for (int attempt = 0; attempt < 30 && breakdown == null; attempt++) {
+            JsonNode report = probe.get(api("/runtime-insights")).json();
+            for (JsonNode observation : report.path("observations")) {
+                // The probe's route is labelled by its template where a stack resolves one, so any breakdown over
+                // five warm requests will do: the probe guarantees at least one route has them. Its time is split
+                // into phases, or, when its requests reached no handler BootUI marks (an unmapped path on Quarkus)
+                // or made no recorded call on a stack that marks no phases (WebFlux), it says so as insufficient.
+                if ("route-time-breakdown".equals(observation.path("kind").asText())
+                        && observation.path("eligible").asLong() >= 5
+                        && ("OBSERVED".equals(observation.path("status").asText())
+                                || explainsUnsplitTime(observation))) {
+                    breakdown = observation;
+                }
+            }
+            if (breakdown == null) {
+                Thread.sleep(100);
+            }
+        }
+        assertThat(breakdown)
+                .as("a route with five warm requests shows where its time went, or why it cannot")
+                .isNotNull();
+        String id = breakdown.path("id").asText();
+        assertThat(id).matches("route-time-breakdown:[0-9a-f]{10}");
+        assertThat(breakdown.path("minimumTier").asText()).isEqualTo("REQUEST_ID");
+        assertThat(breakdown.path("sentence").asText()).contains("warm median");
+
+        Response detail = probe.get(api("/runtime-insights/insights/" + id));
+        assertThat(detail.status()).isEqualTo(200);
+        assertJsonContract("runtime insight, observed", detailContract, detail.json(), failures);
+        assertThat(failures).as("runtime insight contract").isEmpty();
+        assertThat(detail.json().path("available").asBoolean(false)).isTrue();
+        assertThat(detail.json().path("observation").path("id").asText()).isEqualTo(id);
+        assertThat(detail.json().path("columns").size()).isPositive();
+        assertThat(detail.json().path("rows").size()).isPositive();
+
+        JsonNode report = probe.get(api("/runtime-insights")).json();
+        assertThat(report.path("checks").size())
+                .as("every observation reports whether it ran")
+                .isEqualTo(23);
+        // Each kind's external validation (docs/PLAN-v2.md M4-20) decides its default listing on every stack, but
+        // stays internal: no check carries it, and no row's reason mentions it.
+        for (JsonNode check : report.path("checks")) {
+            assertThat(check.has("validation") || check.has("validationReason"))
+                    .as("check %s does not expose its external validation", check.path("kind"))
+                    .isFalse();
+        }
+        Set<String> notListedByDefault = Set.of(
+                "route-time-breakdown",
+                "exception-hotspots",
+                "connections-per-request",
+                "ai-usage-by-route",
+                "repeated-selects",
+                "lazy-sql-after-handler",
+                "split-transaction-writes",
+                "framework-warnings-by-route",
+                "anonymous-data-reach",
+                "gc-inflated-latency",
+                "heap-growth-after-gc");
+        for (JsonNode observation : report.path("observations")) {
+            // The default list (docs/PLAN-v2.md M4-19): every row says whether it is listed, and why when it is not.
+            assertThat(observation.path("listed").isBoolean())
+                    .as("observation %s says whether it is listed by default", observation.path("id"))
+                    .isTrue();
+            assertThat(observation.path("unlistedReason").isTextual())
+                    .as("observation %s says why it is left out exactly when it is", observation.path("id"))
+                    .isEqualTo(!observation.path("listed").asBoolean());
+            if (notListedByDefault.contains(observation.path("kind").asText())) {
+                assertThat(observation.path("listed").asBoolean())
+                        .as("observation %s of a kind that is not listed by default (M4-20)", observation.path("id"))
+                        .isFalse();
+            }
+            assertThat(observation.path("unlistedReason").asText().toLowerCase(Locale.ROOT))
+                    .as("observation %s never tells users about the external validation", observation.path("id"))
+                    .doesNotContain("validat");
+        }
+        boolean httpCovered = false;
+        for (JsonNode coverage : report.path("coverage")) {
+            httpCovered |= "http".equals(coverage.path("source").asText())
+                    && coverage.path("byRequestId").asLong() > 0;
+        }
+        assertThat(httpCovered).as("HTTP events are linked by request id").isTrue();
+        for (JsonNode route : report.path("notExercised")) {
+            assertThat(route.asText())
+                    .as("a route not exercised is a METHOD route label, never a BootUI or framework endpoint")
+                    .matches("[A-Z]+ /.*")
+                    .doesNotContain("/bootui")
+                    .doesNotContain("*");
+        }
+    }
+
+    /** Whether an insufficient breakdown says why its route's time is not split into phases. */
+    private static boolean explainsUnsplitTime(JsonNode observation) {
+        String sentence = observation.path("sentence").asText();
+        return "INSUFFICIENT".equals(observation.path("status").asText())
+                && (sentence.contains("not split into phases") || sentence.contains("marks no phases"));
+    }
+
+    private static boolean bootstrapAgentBridgeAbsent() {
+        return JavaAgentPresence.detached();
+    }
+
+    @Test
+    void theJavaAgentPanelReportsNotAttachedWithSetupSnippetsWhenTheJvmRunsWithoutTheAgent() {
+        assumeTrue(isPanelUsableInLiveManifest("java-agent"), "java-agent panel is not available in this environment");
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        Response response = probe().get(api("/java-agent"));
+
+        assertThat(response.status()).isEqualTo(200);
+        JsonNode report = response.json();
+        assertThat(report.path("state").asText())
+                .as("the sample applications run without the BootUI agent")
+                .isEqualTo("NOT_ATTACHED");
+        assertThat(report.path("reason").asText()).isNotBlank();
+        assertThat(report.path("expectedProtocol").asInt()).isEqualTo(1);
+        assertThat(report.path("protocol").isNull()).isTrue();
+        assertThat(report.path("claim").isNull()).isTrue();
+        assertThat(report.path("sensors").size()).isZero();
+        JsonNode snippets = report.path("setup").path("snippets");
+        assertThat(snippets.size()).isPositive();
+        for (JsonNode snippet : snippets) {
+            assertThat(snippet.path("id").asText()).isNotBlank();
+            assertThat(snippet.path("label").asText()).isNotBlank();
+            assertThat(snippet.path("language").asText()).isNotBlank();
+            assertThat(snippet.path("text").asText()).contains("bootui-agent");
+        }
+        assertThat(report.path("setup").path("jarPath").asText()).contains("bootui-agent");
+    }
+
+    /**
+     * The runtime switch of an agent sensor ({@code docs/PLAN-v2.md} M5-14) without the BootUI agent: the report offers
+     * no switch, a switchable sensor such as {@code environment} answers 409 with the reason, and a sensor installed with
+     * the claim only, such as {@code executors}, or a body without
+     * {@code enabled} answers 400, each with the canonical {@code error} body; a read-only panel refuses it first with 403.
+     */
+    @Test
+    void aSwitchableSensorCannotBeSwitchedWithoutTheAgentAndOtherSensorsNever() {
+        assumeTrue(isPanelUsableInLiveManifest("java-agent"), "java-agent panel is not available in this environment");
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        assertThat(probe().get(api("/java-agent")).json().path("toggles").size())
+                .isZero();
+        JsonNode panel = livePanelsById().get("java-agent");
+
+        BootUiHttpProbe probe = probe();
+        Response refused = probe.request(
+                "POST", api("/java-agent/sensors/environment"), stateChangingHeaders(probe), "{\"enabled\":true}");
+        if (panel.path("readOnly").asBoolean(false)) {
+            assertThat(refused.status())
+                    .as("a read-only java-agent panel refuses the switch")
+                    .isEqualTo(403);
+            return;
+        }
+        assertThat(refused.status())
+                .as("POST java-agent/sensors/environment without the agent")
+                .isEqualTo(409);
+        assertThat(refused.isJson()).isTrue();
+        assertThat(refused.json().path("error").asText()).contains("not armed");
+
+        BootUiHttpProbe other = probe();
+        Response unknown = other.request(
+                "POST", api("/java-agent/sensors/executors"), stateChangingHeaders(other), "{\"enabled\":true}");
+        assertThat(unknown.status()).as("POST java-agent/sensors/executors").isEqualTo(400);
+        assertThat(unknown.json().path("error").asText()).contains("threads, files, environment");
+
+        BootUiHttpProbe empty = probe();
+        Response missing =
+                empty.request("POST", api("/java-agent/sensors/environment"), stateChangingHeaders(empty), "{}");
+        assertThat(missing.status())
+                .as("POST java-agent/sensors/environment without enabled")
+                .isEqualTo(400);
+        assertThat(missing.json().path("error").asText()).contains("enabled");
+    }
+
+    /**
+     * Code Inventory without the BootUI agent ({@code docs/PLAN-v2.md} §5.15): the panel is unavailable with the Java
+     * Agent panel's reason, and every read still answers its shape, {@code available: false} with that reason. The
+     * available shape is asserted with the agent attached, by the Spring sample's agent scenario.
+     */
+    @Test
+    void codeInventoryIsUnavailableWithTheJavaAgentReasonWithoutTheAgent() {
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        JsonNode panel = panelFromLiveManifest("code-inventory");
+        assertThat(panel).as("the code-inventory panel is in the manifest").isNotNull();
+        assumeTrue(panel.path("enabled").asBoolean(true), "the code-inventory panel is disabled here");
+        assertThat(panel.path("available").asBoolean())
+                .as("Code Inventory needs the agent")
+                .isFalse();
+        assertThat(panel.path("unavailableReason").asText()).startsWith("Requires the BootUI agent's inventory sensor");
+
+        List<String> failures = new ArrayList<>();
+        List<ReadContract> contracts = new ArrayList<>();
+        contracts.add(BootUiApiContractCatalog.reads().stream()
+                .filter(contract -> contract.relativePath().equals("/code-inventory"))
+                .findFirst()
+                .orElseThrow());
+        contracts.addAll(BootUiApiContractCatalog.codeInventoryLists());
+        for (ReadContract contract : contracts) {
+            Response response = probe().get(api(contract.relativePath()));
+            assertThat(response.status())
+                    .as("GET %s status", contract.relativePath())
+                    .isEqualTo(200);
+            JsonNode body = response.json();
+            assertJsonContract(contract.relativePath(), contract, body, failures);
+            assertThat(body.path("available").asBoolean())
+                    .as("GET %s available", contract.relativePath())
+                    .isFalse();
+            assertThat(body.path("unavailableReason").asText())
+                    .as("GET %s unavailableReason", contract.relativePath())
+                    .startsWith("Requires the BootUI agent's inventory sensor");
+        }
+        assertThat(failures).as("code inventory contracts").isEmpty();
+    }
+
+    /**
+     * Code Paths without the BootUI agent ({@code docs/PLAN-v2.md} §5.14): the panel is unavailable with the Java Agent
+     * panel's reason, and every read still answers its shape, {@code available: false} with that reason. The available
+     * shape is asserted with the agent attached, by the Spring sample's agent scenario.
+     */
+    @Test
+    void codePathsIsUnavailableWithTheJavaAgentReasonWithoutTheAgent() {
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        JsonNode panel = panelFromLiveManifest("code-paths");
+        assertThat(panel).as("the code-paths panel is in the manifest").isNotNull();
+        assumeTrue(panel.path("enabled").asBoolean(true), "the code-paths panel is disabled here");
+        assertThat(panel.path("available").asBoolean())
+                .as("Code Paths needs the agent")
+                .isFalse();
+        assertThat(panel.path("unavailableReason").asText())
+                .startsWith("Requires the BootUI agent's code-paths sensor");
+
+        List<String> failures = new ArrayList<>();
+        List<ReadContract> contracts = new ArrayList<>();
+        contracts.add(BootUiApiContractCatalog.reads().stream()
+                .filter(contract -> contract.relativePath().equals("/code-paths"))
+                .findFirst()
+                .orElseThrow());
+        contracts.addAll(BootUiApiContractCatalog.codePathsTrees());
+        for (ReadContract contract : contracts) {
+            Response response = probe().get(api(contract.relativePath()));
+            assertThat(response.status())
+                    .as("GET %s status", contract.relativePath())
+                    .isEqualTo(200);
+            JsonNode body = response.json();
+            assertJsonContract(contract.relativePath(), contract, body, failures);
+            assertThat(body.path("available").asBoolean())
+                    .as("GET %s available", contract.relativePath())
+                    .isFalse();
+            assertThat(body.path("unavailableReason").asText())
+                    .as("GET %s unavailableReason", contract.relativePath())
+                    .startsWith("Requires the BootUI agent's code-paths sensor");
+        }
+        assertThat(failures).as("code paths contracts").isEmpty();
+    }
+
+    /**
+     * Side Effects without the BootUI agent ({@code docs/PLAN-v2.md} §5.16): the panel is unavailable with the Java Agent
+     * panel's reason, and its reads still answer their shape, {@code available: false} with that reason, every sensor
+     * listed; an unknown sensor is a {@code 400}. The available shape is asserted with the agent attached, by the Spring
+     * sample's agent scenario.
+     */
+    /**
+     * Without the agent's caught-exceptions sensor, the Exceptions panel's report carries no caught-in-code summary
+     * and its section answers its contract, unavailable with why ({@code docs/PLAN-v2.md} M5-6), on every stack.
+     */
+    @Test
+    void caughtInApplicationCodeIsUnavailableWithoutTheAgent() {
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        JsonNode panel = panelFromLiveManifest("exceptions");
+        assumeTrue(panel != null && panel.path("enabled").asBoolean(true), "the exceptions panel is disabled here");
+
+        JsonNode report = probe().get(api("/exceptions")).json();
+        assertThat(report.has("caughtInCode"))
+                .as("the summary field is present")
+                .isTrue();
+        assertThat(report.path("caughtInCode").isNull())
+                .as("no summary without the sensor")
+                .isTrue();
+
+        ReadContract contract = BootUiApiContractCatalog.caughtExceptions();
+        Response response = probe().get(api(contract.relativePath()));
+        assertThat(response.status())
+                .as("GET %s status", contract.relativePath())
+                .isEqualTo(200);
+        List<String> failures = new ArrayList<>();
+        JsonNode body = response.json();
+        assertJsonContract(contract.relativePath(), contract, body, failures);
+        assertThat(failures).isEmpty();
+        assertThat(body.path("available").asBoolean()).isFalse();
+        assertThat(body.path("unavailableReason").asText()).contains("caught-exceptions sensor");
+        assertThat(body.path("rows")).isEmpty();
+    }
+
+    @Test
+    void sideEffectsIsUnavailableWithTheJavaAgentReasonWithoutTheAgent() {
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        JsonNode panel = panelFromLiveManifest("side-effects");
+        assertThat(panel).as("the side-effects panel is in the manifest").isNotNull();
+        assumeTrue(panel.path("enabled").asBoolean(true), "the side-effects panel is disabled here");
+        assertThat(panel.path("available").asBoolean())
+                .as("Side Effects needs the agent")
+                .isFalse();
+        assertThat(panel.path("unavailableReason").asText()).startsWith("Requires the BootUI agent");
+
+        List<String> failures = new ArrayList<>();
+        List<ReadContract> contracts = new ArrayList<>();
+        contracts.add(BootUiApiContractCatalog.reads().stream()
+                .filter(contract -> contract.relativePath().equals("/side-effects"))
+                .findFirst()
+                .orElseThrow());
+        contracts.add(BootUiApiContractCatalog.sideEffectsSensor());
+        for (ReadContract contract : contracts) {
+            Response response = probe().get(api(contract.relativePath()));
+            assertThat(response.status())
+                    .as("GET %s status", contract.relativePath())
+                    .isEqualTo(200);
+            JsonNode body = response.json();
+            assertJsonContract(contract.relativePath(), contract, body, failures);
+            assertThat(body.path("available").asBoolean())
+                    .as("GET %s available", contract.relativePath())
+                    .isFalse();
+            assertThat(body.path("unavailableReason").asText())
+                    .as("GET %s unavailableReason", contract.relativePath())
+                    .startsWith("Requires the BootUI agent");
+        }
+        JsonNode report = probe().get(api("/side-effects")).json();
+        List<String> sensors = new ArrayList<>();
+        report.path("sensors").forEach(sensor -> sensors.add(sensor.path("id").asText()));
+        assertThat(sensors)
+                .containsExactly(
+                        "network",
+                        "files",
+                        "processes",
+                        "environment",
+                        "thread-activity",
+                        "thread-locals",
+                        "resources",
+                        "blocking",
+                        "security-sinks");
+        report.path("sensors").forEach(sensor -> {
+            if (java.util.Set.of(
+                            "processes",
+                            "network",
+                            "files",
+                            "environment",
+                            "blocking",
+                            "thread-activity",
+                            "thread-locals",
+                            "resources",
+                            "security-sinks")
+                    .contains(sensor.path("id").asText())) {
+                // Shipped sensors (M5-5a to M5-5g, M5-6b): unavailable with the Java Agent panel's reason without the
+                // agent.
+                assertThat(sensor.path("state").asText()).isEqualTo("unavailable");
+                assertThat(sensor.path("reason").asText()).startsWith("Requires the BootUI agent");
+            } else {
+                assertThat(sensor.path("state").asText()).isEqualTo("not-available");
+                assertThat(sensor.path("reason").asText()).isEqualTo("Not available in this version.");
+            }
+        });
+        assertThat(failures).as("side effects contracts").isEmpty();
+
+        Response unknown = probe().get(api("/side-effects/sensor?sensor=not-a-sensor"));
+        assertThat(unknown.status()).as("an unknown sensor").isEqualTo(400);
+        assertThat(unknown.json().path("error").asText()).contains("not-a-sensor");
+    }
+
+    /**
+     * The Runtime Insights surfaces that read the BootUI agent's evidence, without the agent ({@code docs/PLAN-v2.md}
+     * M5-10's acceptance pass): each agent-gated check is {@code NOT_APPLICABLE} naming the agent, never evaluated
+     * with zero findings; the run comparison carries no code changes or side effects section, rather than an empty
+     * one that would read as "nothing changed"; and the journal's agent evidence retains nothing.
+     */
+    @Test
+    void agentGatedRuntimeInsightsSayTheyNeedTheAgentWithoutIt() {
+        assumeTrue(bootstrapAgentBridgeAbsent(), "this JVM runs with the BootUI agent attached");
+        assumeTrue(
+                isPanelUsableInLiveManifest("runtime-insights"),
+                "runtime-insights panel is not available in this environment");
+
+        JsonNode report = probe().get(api("/runtime-insights")).json();
+        assumeTrue(report.path("available").asBoolean(false), "the runtime journal does not record here");
+        Map<String, JsonNode> checks = new HashMap<>();
+        report.path("checks").forEach(check -> checks.put(check.path("kind").asText(), check));
+        for (String kind : JavaAgentPresence.AGENT_CHECKS) {
+            JsonNode check = checks.get(kind);
+            assertThat(check).as("the %s check is listed", kind).isNotNull();
+            assertThat(check.path("status").asText()).as("%s status", kind).isEqualTo("NOT_APPLICABLE");
+            assertThat(check.path("findings").asInt()).as("%s findings", kind).isZero();
+            assertThat(check.path("reason").asText())
+                    .as("%s reason", kind)
+                    .startsWith("This observation requires the BootUI agent's");
+        }
+        report.path("observations")
+                .forEach(observation -> assertThat(observation.path("kind").asText())
+                        .as("no agent-gated observation without the agent")
+                        .isNotIn(JavaAgentPresence.AGENT_CHECKS));
+
+        Response comparison = probe().get(api("/runtime-insights/comparison"));
+        assertThat(comparison.status()).isEqualTo(200);
+        for (String section : List.of("codeChanges", "sideEffects")) {
+            JsonNode value = comparison.json().path(section);
+            assertThat(value.isNull() || value.isMissingNode())
+                    .as("the comparison has no %s section without the agent: %s", section, value)
+                    .isTrue();
+        }
+
+        if (isPanelUsableInLiveManifest("activity")) {
+            JsonNode evidence = probe().get(
+                            api(BootUiApiContractCatalog.runtimeJournal().relativePath()))
+                    .json()
+                    .path("agentEvidence");
+            if (!evidence.isNull() && !evidence.isMissingNode()) {
+                assertThat(evidence.path("retainedBytes").asLong())
+                        .as("no agent evidence is retained")
+                        .isZero();
+                assertThat(evidence.path("stores"))
+                        .as("no agent evidence store reports")
+                        .isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void runtimeResourcesReportOneShapeWithABalancedLedger() {
+        assumeTrue(isPanelUsableInLiveManifest("activity"), "activity panel is not available in this environment");
+        ReadContract contract = BootUiApiContractCatalog.runtimeResources();
+
+        Response response = probe().get(api(contract.relativePath()));
+
+        assertThat(response.status())
+                .as("GET %s status", contract.relativePath())
+                .isEqualTo(200);
+        List<String> failures = new ArrayList<>();
+        assertJsonContract("runtime resources", contract, response.json(), failures);
+        assertThat(failures).as("runtime resources contract").isEmpty();
+        JsonNode resources = response.json();
+        assertThat(resources.path("available").asBoolean(false))
+                .as("the resources source is on by default: %s", resources.path("unavailableReason"))
+                .isTrue();
+        int families = resources.path("families").size();
+        for (JsonNode point : resources.path("points")) {
+            assertThat(point.path("familyCpuNanos").size()).isLessThanOrEqualTo(families);
+            long process = point.path("processCpuNanos").asLong();
+            if (process >= 0) {
+                long parts = point.path("requestCpuNanos").asLong()
+                        + point.path("internalCpuNanos").asLong();
+                for (JsonNode family : point.path("familyCpuNanos")) {
+                    parts += family.asLong();
+                }
+                assertThat(parts)
+                        .as("a point's CPU parts sum to the process's CPU")
+                        .isEqualTo(process);
+            }
+        }
     }
 
     @Test
@@ -2315,8 +3113,12 @@ public abstract class AbstractBootUiApiConformanceTest {
         probe().get(routeProbePath());
 
         // Spring WebFlux records an exchange once the response has completed, so it can land a moment after
-        // the client has read the response; poll briefly rather than race the recorder.
+        // the client has read the response, and the route template can be attached a moment after that: until
+        // then the exchange shows its masked path while the rankings already group it under the template. Poll
+        // both reads together until they agree, rather than race the recorder.
         JsonNode exchange = MissingNode.getInstance();
+        String routeId = null;
+        JsonNode row = null;
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (true) {
             Response list = probe().get(api("/http-exchanges?q=" + marker));
@@ -2325,7 +3127,22 @@ public abstract class AbstractBootUiApiConformanceTest {
                     isNull(list.json().path("unavailableReason")),
                     "HTTP exchanges are not recorded in this environment");
             exchange = list.json().path("exchanges").path(0);
-            if (exchange.isObject() || System.nanoTime() > deadline) {
+            if (exchange.isObject()) {
+                routeId = exchange.path("method").asText() + " "
+                        + exchange.path("route").asText("");
+                Response rankings = probe().get(api(
+                        "/http-exchanges/routes?limit=1&route=" + URLEncoder.encode(routeId, StandardCharsets.UTF_8)));
+                assertThat(rankings.status())
+                        .as("GET /http-exchanges/routes?route= status")
+                        .isEqualTo(200);
+                row = null;
+                for (JsonNode candidate : rankings.json().path("routes")) {
+                    if (routeId.equals(candidate.path("id").asText())) {
+                        row = candidate;
+                    }
+                }
+            }
+            if (row != null || System.nanoTime() > deadline) {
                 break;
             }
             try {
@@ -2343,19 +3160,7 @@ public abstract class AbstractBootUiApiConformanceTest {
                 .doesNotContain("4711")
                 .doesNotContain("?");
         assertThat(exchange.path("routeSource").asText()).isIn("FRAMEWORK_TEMPLATE", "DECLARED_MAPPING", "MASKED_PATH");
-        String routeId = exchange.path("method").asText() + " " + route;
         String encodedRouteId = URLEncoder.encode(routeId, StandardCharsets.UTF_8);
-
-        Response rankings = probe().get(api("/http-exchanges/routes?limit=1&route=" + encodedRouteId));
-        assertThat(rankings.status())
-                .as("GET /http-exchanges/routes?route= status")
-                .isEqualTo(200);
-        JsonNode row = null;
-        for (JsonNode candidate : rankings.json().path("routes")) {
-            if (routeId.equals(candidate.path("id").asText())) {
-                row = candidate;
-            }
-        }
         assertThat(row).as("the pinned row for %s", routeId).isNotNull();
         assertThat(row.path("requests").asLong()).isPositive();
 
@@ -2468,7 +3273,12 @@ public abstract class AbstractBootUiApiConformanceTest {
         }
     }
 
-    private void assertJsonContract(String panelId, ReadContract contract, JsonNode root, List<String> failures) {
+    /**
+     * Adds to {@code failures} every way {@code root} breaks {@code contract}: its root type, each required field's type,
+     * the availability pair, and a non-negative total. Public, so an agent scenario outside this suite, such as the
+     * Spring sample's, asserts the available shapes it alone can reach against the same catalog.
+     */
+    public static void assertJsonContract(String panelId, ReadContract contract, JsonNode root, List<String> failures) {
         if (!matchesType(root, contract.rootType())) {
             failures.add(panelId + " -> root expected " + contract.rootType() + " but was " + root.getNodeType());
             return;
@@ -2515,6 +3325,8 @@ public abstract class AbstractBootUiApiConformanceTest {
             case OBJECT -> node.isObject();
             case NULLABLE_STRING -> isNull(node) || node.isTextual();
             case NULLABLE_OBJECT -> isNull(node) || node.isObject();
+            case NULLABLE_INTEGER -> isNull(node) || node.isIntegralNumber();
+            case NULLABLE_NUMBER -> isNull(node) || node.isNumber();
         };
     }
 

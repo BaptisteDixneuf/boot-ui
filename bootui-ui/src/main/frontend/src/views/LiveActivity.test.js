@@ -1,8 +1,10 @@
 import {flushPromises, mount} from '@vue/test-utils'
 import {afterEach, describe, expect, it, vi} from 'vitest'
+import {ref} from 'vue'
 
 import {safeLocalStorage} from '../utils/safeStorage.js'
 import LiveActivity from './LiveActivity.vue'
+import PanelHeader from './components/PanelHeader.vue'
 
 vi.mock('../utils/useConfirm.js', () => ({
   useConfirm: () => ({confirm: () => Promise.resolve(true)})
@@ -103,8 +105,12 @@ function requestProfile(overrides = {}) {
   }
 }
 
-function stubFetch(activity, profile) {
+function stubFetch(activity, profile, journalProfile = {available: false, unavailableReason: 'Not retained.'}) {
   return vi.fn((url) => {
+    if (url === 'api/activity/journal') return Promise.resolve(jsonResponse({enabled: true}))
+    if (typeof url === 'string' && url.startsWith('api/activity/request/') && url.endsWith('/journal')) {
+      return Promise.resolve(jsonResponse(journalProfile))
+    }
     if (typeof url === 'string' && url.startsWith('api/activity/request/')) {
       return Promise.resolve(jsonResponse(profile))
     }
@@ -126,10 +132,35 @@ function mountLiveActivity(options = {}) {
 describe('LiveActivity', () => {
   let wrapper
 
+  it('does not present unavailable SQL execution timing as measured zero', async () => {
+    vi.stubGlobal(
+      'fetch',
+      stubFetch(
+        activityReport(),
+        requestProfile({
+          sqlGroups: [],
+          timing: {sqlCount: 0, sqlMs: 0, sqlPercent: 0, restCallCount: 1, restCallMs: 12},
+          sections: [{type: 'SQL', available: false, unavailableReason: 'Only SQL preparation was observed.'}]
+        })
+      )
+    )
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    await wrapper.get('tr.activity-row-clickable').trigger('click')
+    await flushPromises()
+    const drawer = wrapper.get('.activity-drawer')
+    expect(drawer.text()).toContain('SQL execution timing unavailable')
+    expect(drawer.text()).toContain('1 REST client call(s), 12 ms outbound')
+    expect(drawer.text()).not.toContain('0 SQL statement(s)')
+    expect(drawer.text()).not.toContain('0% of request')
+  })
+
   afterEach(() => {
     wrapper?.unmount()
     wrapper = null
     safeLocalStorage.removeItem('bootui.activity.flowCollapsed')
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    vi.useRealTimers()
     vi.unstubAllGlobals()
   })
 
@@ -154,6 +185,593 @@ describe('LiveActivity', () => {
 
     expect(wrapper.text()).toContain('Cache hit ratio')
     expect(wrapper.text()).toContain('—')
+  })
+
+  it('opens the runtime journal status only on demand', async () => {
+    const fetchMock = stubFetch(activityReport(), requestProfile())
+    vi.stubGlobal('fetch', fetchMock)
+
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/journal')).toBe(false)
+    const toggle = wrapper.findAll('button').find((button) => button.text().includes('Recording'))
+    expect(toggle.attributes('aria-expanded')).toBe('false')
+    expect(toggle.attributes('aria-controls')).toBe('activity-runtime-journal')
+
+    await toggle.trigger('click')
+    await flushPromises()
+
+    expect(toggle.attributes('aria-expanded')).toBe('true')
+    expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/journal')).toBe(true)
+    expect(wrapper.find('#activity-runtime-journal').exists()).toBe(true)
+  })
+
+  it('asks for the runtime journal feed with its route, request, and no-request filters only when chosen', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+    try {
+      safeLocalStorage.removeItem('bootui.activity.filters')
+      const fetchMock = stubFetch(activityReport(), requestProfile())
+      vi.stubGlobal('fetch', fetchMock)
+      const feedUrls = () =>
+        fetchMock.mock.calls
+          .map(([url]) => url)
+          .filter((url) => url === 'api/activity' || url.startsWith('api/activity?'))
+
+      wrapper = mountLiveActivity()
+      await flushPromises()
+
+      expect(feedUrls().every((url) => !url.includes('source='))).toBe(true)
+      expect(wrapper.find('#activity-route-filter').exists()).toBe(false)
+
+      await wrapper.get('#activity-feed-source').setValue('journal')
+      await wrapper.get('#activity-route-filter').setValue('GET /api/orders/{id}')
+      await wrapper.get('#activity-no-request').setValue(true)
+      vi.advanceTimersByTime(400)
+      await flushPromises()
+
+      const last = new URLSearchParams(feedUrls().at(-1).split('?')[1])
+      expect(last.get('source')).toBe('journal')
+      expect(last.get('route')).toBe('GET /api/orders/{id}')
+      expect(last.get('noRequest')).toBe('true')
+      expect(last.has('requestId')).toBe(false)
+
+      await wrapper
+        .findAll('button')
+        .find((button) => button.text() === 'Clear')
+        .trigger('click')
+      vi.advanceTimersByTime(400)
+      await flushPromises()
+      const cleared = new URLSearchParams(feedUrls().at(-1).split('?')[1])
+      expect(cleared.get('source')).toBe('journal')
+      expect(cleared.has('route')).toBe(false)
+      expect(cleared.has('noRequest')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+      safeLocalStorage.removeItem('bootui.activity.filters')
+    }
+  })
+
+  it('loads the runtime journal record of an opened request by its request id', async () => {
+    const profile = requestProfile({request: {...requestProfile().request, requestId: '0a1b2c3d4e5f6a7b'}})
+    const fetchMock = stubFetch(activityReport(), profile, {
+      available: true,
+      route: 'GET /api/todos',
+      durationMicros: 120000,
+      timeline: [],
+      gcPauses: [],
+      touched: {tables: ['todos']},
+      notes: []
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    routeState.query = {request: 'exchange-7'}
+    try {
+      wrapper = mountLiveActivity()
+      await flushPromises()
+
+      expect(fetchMock).toHaveBeenCalledWith('api/activity/request/exchange-7', expect.anything())
+      expect(fetchMock).toHaveBeenCalledWith('api/activity/request/0a1b2c3d4e5f6a7b/journal', expect.anything())
+      expect(wrapper.text()).toContain('Recorded by the runtime journal')
+      expect(wrapper.text()).toContain('todos')
+    } finally {
+      routeState.query = {}
+    }
+  })
+
+  it('offers the journal filters when the default feed comes from the runtime journal', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    vi.stubGlobal('fetch', stubFetch(activityReport({sources: ['Runtime journal']}), requestProfile()))
+
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    expect(wrapper.find('#activity-route-filter').exists()).toBe(true)
+    expect(
+      wrapper
+        .get('#activity-feed-source')
+        .findAll('option')
+        .map((option) => option.text())
+    ).toEqual(['Default', 'Runtime journal', 'Panel buffers'])
+  })
+
+  it('shows a retained journal profile when its HTTP-exchange details have been evicted', async () => {
+    const fetchMock = stubFetch(
+      activityReport({sources: ['Runtime journal']}),
+      requestProfile({available: false, unavailableReason: 'Request req-1 is no longer in the buffer.', request: null}),
+      {
+        available: true,
+        route: 'GET /api/todos',
+        durationMicros: 120000,
+        status: 200,
+        timeline: [{source: 'sql', label: 'select from todo', offsetMillis: 2, durationMicros: 1000}],
+        gcPauses: [],
+        touched: {tables: ['todo']},
+        notes: []
+      }
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    await wrapper.find('.activity-table tbody tr .bootui-keyboard-target').trigger('click')
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledWith('api/activity/request/req-1/journal', expect.anything())
+    expect(wrapper.find('.request-journal').exists()).toBe(true)
+    expect(wrapper.text()).toContain('Recorded by the runtime journal')
+    expect(wrapper.text()).toContain('HTTP-exchange details unavailable')
+    expect(wrapper.text()).toContain('select from todo')
+  })
+
+  it('opens scheduled executions directly from the journal without an HTTP-exchange lookup', async () => {
+    const fetchMock = stubFetch(
+      activityReport({
+        sources: ['Runtime journal'],
+        entries: [requestEntry({id: 'scheduled-1', type: 'SCHEDULED', summary: 'Cleanup', profileable: true})]
+      }),
+      requestProfile({available: false, unavailableReason: 'not an HTTP request'}),
+      {
+        available: true,
+        route: 'Scheduled: Cleanup',
+        durationMicros: 25000,
+        status: null,
+        timeline: [],
+        gcPauses: [],
+        touched: {tables: []},
+        notes: []
+      }
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    await wrapper.find('.activity-table tbody tr .bootui-keyboard-target').trigger('click')
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledWith('api/activity/request/scheduled-1/journal', expect.anything())
+    expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/request/scheduled-1')).toBe(false)
+    expect(wrapper.text()).toContain('Scheduled: Cleanup')
+    expect(wrapper.text()).not.toContain('HTTP-exchange details unavailable')
+  })
+
+  it("never shows an earlier row's profile when a second row is opened while the first loads", async () => {
+    const first = requestProfile({request: {...requestProfile().request, path: '/api/first'}})
+    const second = requestProfile({request: {...requestProfile().request, path: '/api/second'}})
+    let releaseFirst
+    const firstGate = new Promise((resolve) => {
+      releaseFirst = resolve
+    })
+    const fetchMock = vi.fn((url) => {
+      if (url.endsWith('/journal')) return Promise.resolve(jsonResponse({available: false, unavailableReason: 'none'}))
+      if (url === 'api/activity/request/req-1') return firstGate.then(() => jsonResponse(first))
+      if (url === 'api/activity/request/req-2') return Promise.resolve(jsonResponse(second))
+      return Promise.resolve(
+        jsonResponse(activityReport({entries: [requestEntry(), requestEntry({id: 'req-2', path: '/api/second'})]}))
+      )
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    const rows = wrapper.findAll('.activity-table tbody tr .bootui-keyboard-target')
+    await rows[0].trigger('click')
+    await rows[1].trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('/api/second')
+
+    releaseFirst()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('/api/second')
+    expect(wrapper.text()).not.toContain('/api/first')
+    expect(wrapper.text()).not.toContain('Loading…')
+  })
+
+  it('withholds the journal-only filters while persisted history serves the feed', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    const persisted = activityReport({
+      sources: ['Runtime journal'],
+      pageInfo: {persistent: true, hasMore: false, nextCursor: null}
+    })
+    vi.stubGlobal('fetch', stubFetch(persisted, requestProfile()))
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    expect(wrapper.find('#activity-run-filter').exists()).toBe(false)
+    expect(wrapper.find('#activity-route-filter').exists()).toBe(false)
+    expect(wrapper.find('#activity-feed-source').exists()).toBe(false)
+    expect(wrapper.text()).toContain('keeps no run or request grouping')
+  })
+
+  it('does not send a feed source while persisted history serves the feed', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    const persisted = activityReport({
+      sources: ['Runtime journal'],
+      pageInfo: {persistent: true, hasMore: false, nextCursor: null}
+    })
+    const fetchMock = stubFetch(persisted, requestProfile())
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    const urls = fetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.startsWith('api/activity'))
+    expect(urls.length).toBeGreaterThan(0)
+    expect(urls.every((url) => !url.includes('source='))).toBe(true)
+  })
+
+  it('does not blame hidden journal filters for an empty persisted page', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    let persistedNow = false
+    const base = {entries: [], typeCounts: {}, sources: ['Runtime journal']}
+    const memory = activityReport({...base, pageInfo: {persistent: false, hasMore: false, nextCursor: null}})
+    const persisted = activityReport({...base, pageInfo: {persistent: true, hasMore: false, nextCursor: null}})
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url) => Promise.resolve(jsonResponse(persistedNow ? persisted : memory)))
+    )
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    await wrapper.get('#activity-route-filter').setValue('GET /x')
+    persistedNow = true
+    await wrapper.get('#activity-errors-only').setValue(true)
+    await wrapper.get('#activity-errors-only').setValue(false)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    await flushPromises()
+
+    expect(wrapper.find('#activity-route-filter').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('No activity matches the current filters')
+    expect(wrapper.text()).toContain('No visible rows on this page')
+  })
+
+  it('does not claim nothing was recorded when persisted rows are all hidden', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    const persisted = activityReport({
+      entries: [],
+      typeCounts: {},
+      sources: ['Runtime journal'],
+      pageInfo: {persistent: true, hasMore: false, nextCursor: null}
+    })
+    vi.stubGlobal('fetch', stubFetch(persisted, requestProfile()))
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('No visible rows on this page')
+    expect(wrapper.text()).not.toContain('No activity recorded yet')
+    expect(wrapper.text()).not.toContain('older history is available')
+  })
+
+  it('explains an empty persisted page that still has older history', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    const persisted = activityReport({
+      entries: [],
+      typeCounts: {},
+      sources: ['Runtime journal'],
+      pageInfo: {persistent: true, hasMore: true, nextCursor: 'abc'}
+    })
+    vi.stubGlobal('fetch', stubFetch(persisted, requestProfile()))
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('No visible rows on this page')
+    expect(wrapper.text()).not.toContain('No activity recorded yet')
+    expect(wrapper.text()).toContain('Load older activity')
+  })
+
+  it('asks for one run only when a run id is entered', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+    try {
+      safeLocalStorage.removeItem('bootui.activity.filters')
+      const fetchMock = stubFetch(activityReport({sources: ['Runtime journal']}), requestProfile())
+      vi.stubGlobal('fetch', fetchMock)
+      wrapper = mountLiveActivity()
+      await flushPromises()
+      await wrapper.get('#activity-run-filter').setValue('run-3')
+      vi.advanceTimersByTime(400)
+      await flushPromises()
+      const feedUrls = fetchMock.mock.calls.map(([url]) => url).filter((url) => url.startsWith('api/activity?'))
+      expect(new URLSearchParams(feedUrls.at(-1).split('?')[1]).get('run')).toBe('run-3')
+    } finally {
+      vi.useRealTimers()
+      safeLocalStorage.removeItem('bootui.activity.filters')
+    }
+  })
+
+  it.each(['resolve', 'reject'])(
+    'ignores an old-filter cursor page that %ss without changing the new page or its busy state',
+    async (settlement) => {
+      vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+      safeLocalStorage.removeItem('bootui.activity.filters')
+      let finishOld
+      let failOld
+      const oldPage = new Promise((resolve, reject) => {
+        finishOld = resolve
+        failOld = reject
+      })
+      let finishNew
+      const newPage = new Promise((resolve) => {
+        finishNew = resolve
+      })
+      const head = (cursor, entries) =>
+        activityReport({
+          entries,
+          pageInfo: {persistent: true, hasMore: true, nextCursor: cursor}
+        })
+      const fetchMock = vi.fn((url) => {
+        const query = new URLSearchParams(String(url).split('?')[1])
+        if (query.get('cursor') === 'old-cursor') return oldPage
+        if (query.get('cursor') === 'new-cursor') return newPage
+        return Promise.resolve(
+          jsonResponse(
+            head(query.has('severity') ? 'new-cursor' : 'old-cursor', [
+              requestEntry({severity: 'ERROR', summary: 'Current head'})
+            ])
+          )
+        )
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      wrapper = mountLiveActivity()
+      await flushPromises()
+      const olderButton = () =>
+        wrapper.findAll('button').find((button) => ['Load older activity', 'Loading…'].includes(button.text()))
+      await olderButton().trigger('click')
+      await wrapper.get('#activity-severity-filter').setValue('ERROR')
+      await vi.advanceTimersByTimeAsync(301)
+      await flushPromises()
+      expect(olderButton().attributes('disabled')).toBeUndefined()
+      await olderButton().trigger('click')
+      expect(olderButton().attributes('disabled')).toBeDefined()
+
+      if (settlement === 'resolve') {
+        finishOld(
+          jsonResponse(
+            head('wrong-cursor', [
+              requestEntry({
+                id: 'old-query',
+                severity: 'ERROR',
+                summary: 'Obsolete page'
+              })
+            ])
+          )
+        )
+      } else failOld(new Error('Obsolete page failed'))
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('Obsolete page')
+      expect(olderButton().attributes('disabled')).toBeDefined()
+
+      finishNew(
+        jsonResponse(
+          head('next-new-cursor', [
+            requestEntry({
+              id: 'new-query',
+              severity: 'ERROR',
+              summary: 'Current older page'
+            })
+          ])
+        )
+      )
+      await flushPromises()
+      expect(wrapper.text()).toContain('Current older page')
+      expect(olderButton().attributes('disabled')).toBeUndefined()
+      await olderButton().trigger('click')
+      await flushPromises()
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('cursor=next-new-cursor'))).toBe(true)
+      vi.useRealTimers()
+    }
+  )
+
+  it('invalidates older pages when the backing feed becomes in-memory or its source changes', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    let finishOld
+    const oldPage = new Promise((resolve) => {
+      finishOld = resolve
+    })
+    let memory = false
+    const persisted = activityReport({
+      pageInfo: {persistent: true, hasMore: true, nextCursor: 'old-cursor'}
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url) =>
+        String(url).includes('cursor=') ? oldPage : Promise.resolve(jsonResponse(memory ? activityReport() : persisted))
+      )
+    )
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Load older activity')
+      .trigger('click')
+    memory = true
+    wrapper.findComponent(PanelHeader).vm.$emit('refresh')
+    await flushPromises()
+    await wrapper.get('#activity-feed-source').setValue('buffers')
+    finishOld(
+      jsonResponse(
+        activityReport({
+          entries: [requestEntry({id: 'obsolete', summary: 'Obsolete persisted row'})],
+          pageInfo: {persistent: true, hasMore: true, nextCursor: 'obsolete-cursor'}
+        })
+      )
+    )
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('Obsolete persisted row')
+    expect(wrapper.text()).not.toContain('Load older activity')
+    expect(wrapper.text()).not.toContain('Loading…')
+  })
+
+  it('keeps ordinary pagination merged with the current live head and follows the older cursor', async () => {
+    const head = (entries, cursor) =>
+      activityReport({
+        entries,
+        pageInfo: {persistent: true, hasMore: cursor !== null, nextCursor: cursor}
+      })
+    let finishOlder
+    const pending = new Promise((resolve) => {
+      finishOlder = resolve
+    })
+    let refreshed = false
+    const fetchMock = vi.fn((url) => {
+      const cursor = new URLSearchParams(String(url).split('?')[1]).get('cursor')
+      if (cursor === 'first-page') return pending
+      if (cursor === 'second-page')
+        return Promise.resolve(jsonResponse(head([requestEntry({id: 'oldest', summary: 'Oldest page'})], null)))
+      return Promise.resolve(
+        jsonResponse(head([requestEntry({summary: refreshed ? 'Updated current head' : 'Initial head'})], 'first-page'))
+      )
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    const olderButton = () => wrapper.findAll('button').find((button) => button.text() === 'Load older activity')
+    await olderButton().trigger('click')
+    refreshed = true
+    wrapper.findComponent(PanelHeader).vm.$emit('refresh')
+    await flushPromises()
+    finishOlder(
+      jsonResponse(
+        head(
+          [requestEntry({summary: 'Duplicate old head'}), requestEntry({id: 'older', summary: 'Older page'})],
+          'second-page'
+        )
+      )
+    )
+    await flushPromises()
+    expect(wrapper.text()).toContain('Updated current head')
+    expect(wrapper.text()).not.toContain('Duplicate old head')
+    expect(wrapper.text()).toContain('Older page')
+    await olderButton().trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('Oldest page')
+    expect(olderButton()).toBeUndefined()
+  })
+
+  it('ignores a superseded filter head while the new query waits for the outstanding read', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+    const head = (summary, cursor) =>
+      activityReport({
+        entries: [requestEntry({severity: 'ERROR', summary})],
+        pageInfo: {persistent: true, hasMore: true, nextCursor: cursor}
+      })
+    let finishOld
+    const pending = new Promise((resolve) => {
+      finishOld = resolve
+    })
+    let finishCurrent
+    const current = new Promise((resolve) => {
+      finishCurrent = resolve
+    })
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(head('Initial head', 'initial')))
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    fetchMock.mockImplementation((url) => (String(url).includes('severity=ERROR') ? current : pending))
+    wrapper.findComponent(PanelHeader).vm.$emit('refresh')
+    await flushPromises()
+    await wrapper.get('#activity-severity-filter').setValue('ERROR')
+    await vi.advanceTimersByTimeAsync(301)
+    finishOld(jsonResponse(head('Obsolete query head', 'obsolete')))
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('Obsolete query head')
+    expect(wrapper.findAll('button').find((button) => button.text() === 'Load older activity')).toBeUndefined()
+    finishCurrent(jsonResponse(head('Current query head', 'current')))
+    await flushPromises()
+    expect(wrapper.text()).toContain('Current query head')
+    expect(wrapper.findAll('button').find((button) => button.text() === 'Load older activity')).toBeTruthy()
+  })
+
+  it('says no activity is recorded yet when the feed is empty and nothing narrows it', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    vi.stubGlobal('fetch', stubFetch(activityReport({entries: [], typeCounts: {}}), requestProfile()))
+
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    const text = wrapper.get('table tbody').text()
+    expect(text).toContain('No activity recorded yet. Send a request to the application')
+    expect(text).not.toContain('No activity matches the current filters.')
+  })
+
+  it('says no activity matches the filters only while a filter, search, or toggle narrows the feed', async () => {
+    safeLocalStorage.removeItem('bootui.activity.filters')
+    vi.stubGlobal('fetch', stubFetch(activityReport({sources: ['Runtime journal']}), requestProfile()))
+
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    const emptyText = () => wrapper.get('table tbody').text()
+
+    await wrapper.get('#activity-severity-filter').setValue('ERROR')
+    expect(emptyText()).toContain('No activity matches the current filters.')
+    expect(emptyText()).not.toContain('No activity recorded yet.')
+
+    await wrapper.get('#activity-severity-filter').setValue('')
+    await wrapper.get('#activity-text-filter').setValue('no-such-path')
+    expect(emptyText()).toContain('No activity matches the current filters.')
+
+    await wrapper.get('#activity-text-filter').setValue('')
+    await wrapper.get('#activity-errors-only').setValue(true)
+    expect(emptyText()).toContain('No activity matches the current filters.')
+
+    await wrapper.get('#activity-errors-only').setValue(false)
+    expect(wrapper.text()).toContain('GET /api/todos → 200')
+  })
+
+  it('says no activity matches the filters when a journal filter narrows an empty feed', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+    try {
+      safeLocalStorage.removeItem('bootui.activity.filters')
+      vi.stubGlobal(
+        'fetch',
+        stubFetch(activityReport({entries: [], typeCounts: {}, sources: ['Runtime journal']}), requestProfile())
+      )
+
+      wrapper = mountLiveActivity()
+      await flushPromises()
+      expect(wrapper.get('table tbody').text()).toContain('No activity recorded yet.')
+
+      await wrapper.get('#activity-no-request').setValue(true)
+      expect(wrapper.get('table tbody').text()).toContain('No activity matches the current filters.')
+      expect(wrapper.get('table tbody').text()).not.toContain('No activity recorded yet.')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('opens the resource track only on demand', async () => {
+    const fetchMock = stubFetch(activityReport(), requestProfile())
+    vi.stubGlobal('fetch', fetchMock)
+
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/resources')).toBe(false)
+    const toggle = wrapper.findAll('button').find((button) => button.text() === 'Resources')
+    expect(toggle.attributes('aria-controls')).toBe('activity-runtime-resources')
+    await toggle.trigger('click')
+    await flushPromises()
+
+    expect(toggle.attributes('aria-expanded')).toBe('true')
+    expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/resources')).toBe(true)
+    expect(wrapper.find('#activity-runtime-resources').exists()).toBe(true)
   })
 
   it('keeps filters usable when browser storage reads and writes are denied', async () => {
@@ -203,6 +821,29 @@ describe('LiveActivity', () => {
     expect(row.text()).not.toContain('N+1')
   })
 
+  it('nests a propagated task under its request with its after-response and running badges', async () => {
+    const handoff = requestEntry({
+      id: 'running:async-1',
+      parentId: 'req-1',
+      profileable: false,
+      type: 'ASYNC',
+      severity: 'WARN',
+      summary: 'Async task FutureTask',
+      detail: 'still running · ThreadPoolExecutor.runWorker',
+      badges: ['RUNNING', 'AFTER_RESPONSE']
+    })
+    vi.stubGlobal('fetch', stubFetch(activityReport({entries: [requestEntry(), handoff]}), requestProfile()))
+
+    wrapper = mountLiveActivity()
+    await flushPromises()
+
+    const child = wrapper.get('tr.activity-child-row')
+    expect(child.text()).toContain('ASYNC')
+    expect(child.text()).toContain('Async task FutureTask')
+    expect(child.findAll('.activity-entry-badge').map((badge) => badge.text())).toEqual(['running', 'after response'])
+    expect(child.get('.activity-entry-badge').attributes('title')).toBe('Still running now')
+  })
+
   it('keeps row pointer activation and nested keyboard actions independent', async () => {
     const child = requestEntry({
       id: 'sql-1',
@@ -231,7 +872,10 @@ describe('LiveActivity', () => {
 
     await row.get('button.btn-outline-primary').trigger('click')
     await flushPromises()
-    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('api/activity/request/'))).toHaveLength(2)
+    const profileCalls = fetchMock.mock.calls.filter(
+      ([url]) => String(url).startsWith('api/activity/request/') && !String(url).endsWith('/journal')
+    )
+    expect(profileCalls).toHaveLength(2)
   })
 
   it('renders a scheduled-task-run entry with its own icon and links the KPI card to the Scheduled Tasks panel', async () => {
@@ -345,6 +989,52 @@ describe('LiveActivity', () => {
     const drawer = wrapper.get('.activity-drawer')
     expect(drawer.text()).toContain('N+1 · 6 identical')
     expect(drawer.text()).toContain('at com.example.TodoRepository.findById(TodoRepository.java:42)')
+  })
+
+  it('shows the performance deep dives in the request profile drawer', async () => {
+    const journalProfile = {
+      available: true,
+      requestId: 'req-1',
+      route: 'GET /api/todos',
+      status: 200,
+      durationMicros: 120_000
+    }
+    const codePath = {
+      available: true,
+      found: true,
+      route: 'GET /api/todos',
+      assemblyOnly: false,
+      topMethods: [],
+      limitations: []
+    }
+    const fetchMock = vi.fn((url) => {
+      if (String(url).endsWith('/journal')) return Promise.resolve(jsonResponse(journalProfile))
+      if (String(url).startsWith('api/activity/request/')) return Promise.resolve(jsonResponse(requestProfile()))
+      if (String(url).startsWith('api/code-paths/requests/')) return Promise.resolve(jsonResponse(codePath))
+      return Promise.resolve(jsonResponse(activityReport()))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    wrapper = mountLiveActivity({
+      global: {
+        provide: {
+          panels: ref({
+            panels: [
+              {id: 'runtime-insights', enabled: true, available: true},
+              {id: 'code-paths', enabled: true, available: true}
+            ]
+          })
+        }
+      }
+    })
+    await flushPromises()
+    await wrapper.get('tr.activity-row-clickable').trigger('click')
+    await flushPromises()
+
+    const section = wrapper.get('.activity-drawer .request-code-path')
+    expect(section.text()).toContain('Performance deep dives')
+    expect(section.text()).toContain('Open the JFR profile in Runtime Insights')
+    expect(section.text()).toContain('Open GET /api/todos in Code Paths')
   })
 
   it('restores focus to the drawer opener after close button, Escape, and backdrop closes', async () => {
@@ -800,64 +1490,104 @@ describe('LiveActivity', () => {
     wrapper = mountLiveActivity()
     await flushPromises()
 
-    await wrapper
-      .findAll('button')
-      .find((b) => b.text().includes('Use a database'))
-      .trigger('click')
+    const disclosure = wrapper.findAll('button').find((b) => b.text().includes('Use a database'))
+    expect(disclosure.find('i').attributes('aria-hidden')).toBe('true')
+    await disclosure.trigger('click')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('reuse the existing one right now')
+    expect(wrapper.text()).toContain('reuse the existing one while the runtime journal is recording')
     expect(wrapper.findAll('button').find((b) => b.text().includes('Use the existing datasource'))).toBeTruthy()
   })
 
-  it('switches to the database when the existing-datasource action is confirmed', async () => {
-    let persistedNow = false
-    const notPersisted = activityReport({
-      persistenceOption: {active: false, dataSourceAvailable: true, tableName: 'bootui_activity'}
-    })
-    const persisted = activityReport({
-      pageInfo: {persistent: true, nextCursor: null, hasMore: false},
-      persistenceOption: {active: true, dataSourceAvailable: true, tableName: 'bootui_activity'}
-    })
-    const fetchMock = vi.fn((url) => {
-      if (url === 'api/activity/use-existing-datasource') {
-        persistedNow = true
-        return Promise.resolve(
-          jsonResponse({
-            status: 'success',
-            message: 'Live Activity is now saving to the "bootui_activity" table.',
-            tableName: 'bootui_activity'
-          })
-        )
-      }
-      if (typeof url === 'string' && url.startsWith('api/activity/request/')) {
-        return Promise.resolve(jsonResponse(requestProfile()))
-      }
-      return Promise.resolve(jsonResponse(persistedNow ? persisted : notPersisted))
-    })
-    vi.stubGlobal('fetch', fetchMock)
+  it.each([
+    ['disabled', {enabled: false}, 'runtime journal is disabled'],
+    ['malformed', {}, 'runtime journal status'],
+    ['unavailable', null, 'runtime journal status']
+  ])(
+    'qualifies the configured datasource when the journal is %s without changing datasource presence',
+    async (kind, journal, reason) => {
+      const activity = activityReport({
+        persistenceOption: {active: false, dataSourceAvailable: true, tableName: 'bootui_activity'}
+      })
+      const fetchMock = vi.fn((url) => {
+        if (url === 'api/activity/journal') {
+          return journal === null
+            ? Promise.reject(new Error('journal unavailable'))
+            : Promise.resolve(jsonResponse(journal))
+        }
+        return Promise.resolve(jsonResponse(activity))
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      wrapper = mountLiveActivity()
+      await flushPromises()
+      expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/journal')).toBe(false)
+      await wrapper
+        .findAll('button')
+        .find((button) => button.text().includes('Use a database'))
+        .trigger('click')
+      await flushPromises()
+      const action = wrapper.findAll('button').find((button) => button.text().includes('Use the existing datasource'))
+      expect(action.attributes('disabled')).toBeDefined()
+      expect(wrapper.text()).toContain('already configured')
+      expect(wrapper.text()).toContain(reason)
+      expect(fetchMock.mock.calls.some(([url]) => url === 'api/activity/use-existing-datasource')).toBe(false)
+      expect(wrapper.text()).toContain('GET /api/todos')
+    }
+  )
 
-    wrapper = mountLiveActivity()
-    await flushPromises()
+  it.each(['success', 'already-active'])(
+    'switches to the database with a %s acknowledgement and a custom table',
+    async (status) => {
+      let persistedNow = false
+      const notPersisted = activityReport({
+        persistenceOption: {active: false, dataSourceAvailable: true, tableName: 'bootui_activity'}
+      })
+      const persisted = activityReport({
+        pageInfo: {persistent: true, nextCursor: null, hasMore: false},
+        persistenceOption: {active: true, dataSourceAvailable: true, tableName: 'bootui_activity'}
+      })
+      const fetchMock = vi.fn((url) => {
+        if (url === 'api/activity/journal') return Promise.resolve(jsonResponse({enabled: true}))
+        if (url === 'api/activity/use-existing-datasource') {
+          persistedNow = true
+          return Promise.resolve(
+            jsonResponse({
+              status,
+              message: 'Live Activity is now saving to the "custom_activity" table.',
+              tableName: 'custom_activity',
+              futureField: true
+            })
+          )
+        }
+        if (typeof url === 'string' && url.startsWith('api/activity/request/')) {
+          return Promise.resolve(jsonResponse(requestProfile()))
+        }
+        return Promise.resolve(jsonResponse(persistedNow ? persisted : notPersisted))
+      })
+      vi.stubGlobal('fetch', fetchMock)
 
-    await wrapper
-      .findAll('button')
-      .find((b) => b.text().includes('Use a database'))
-      .trigger('click')
-    await flushPromises()
-    await wrapper
-      .findAll('button')
-      .find((b) => b.text().includes('Use the existing datasource'))
-      .trigger('click')
-    await flushPromises()
+      wrapper = mountLiveActivity()
+      await flushPromises()
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      'api/activity/use-existing-datasource',
-      expect.objectContaining({method: 'POST', body: JSON.stringify({confirm: true})})
-    )
-    expect(wrapper.text()).toContain('Live Activity is now saving to the "bootui_activity" table.')
-    expect(wrapper.findAll('button').find((b) => b.text().includes('Use a database'))).toBeFalsy()
-  })
+      await wrapper
+        .findAll('button')
+        .find((b) => b.text().includes('Use a database'))
+        .trigger('click')
+      await flushPromises()
+      await wrapper
+        .findAll('button')
+        .find((b) => b.text().includes('Use the existing datasource'))
+        .trigger('click')
+      await flushPromises()
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'api/activity/use-existing-datasource',
+        expect.objectContaining({method: 'POST', body: JSON.stringify({confirm: true})})
+      )
+      expect(wrapper.text()).toContain('Live Activity is now saving to the "custom_activity" table.')
+      expect(wrapper.findAll('button').find((b) => b.text().includes('Use a database'))).toBeFalsy()
+    }
+  )
 
   it('disables the existing-datasource switch action when the panel is read-only', async () => {
     vi.stubGlobal(
@@ -881,6 +1611,81 @@ describe('LiveActivity', () => {
 
     const switchButton = wrapper.findAll('button').find((b) => b.text().includes('Use the existing datasource'))
     expect(switchButton.attributes('disabled')).toBeDefined()
+  })
+
+  it.each(['', '{', 'null', '{}', '{"status":"unexpected","message":"Saved","tableName":"custom_activity"}'])(
+    'does not acknowledge an invalid 2xx datasource response %j and re-reads without retrying the POST',
+    async (body) => {
+      safeLocalStorage.removeItem('bootui.activity.filters')
+      let reads = 0
+      const before = activityReport({
+        persistenceOption: {active: false, dataSourceAvailable: true, tableName: 'custom_activity'}
+      })
+      const fetchMock = vi.fn((url) => {
+        if (url === 'api/activity/journal') return Promise.resolve(jsonResponse({enabled: true}))
+        if (url === 'api/activity/use-existing-datasource') {
+          return Promise.resolve(new Response(body, {status: 200}))
+        }
+        if (url === 'api/activity') {
+          reads++
+          if (reads > 1) return Promise.reject(new Error('Feed read unavailable'))
+        }
+        return Promise.resolve(jsonResponse(before))
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      wrapper = mountLiveActivity()
+      await flushPromises()
+      await wrapper
+        .findAll('button')
+        .find((button) => button.text().includes('Use a database'))
+        .trigger('click')
+      await flushPromises()
+      await wrapper
+        .findAll('button')
+        .find((button) => button.text().includes('Use the existing datasource'))
+        .trigger('click')
+      await flushPromises()
+
+      expect(wrapper.text()).toContain('outcome is unknown')
+      expect(wrapper.text()).not.toContain('Live Activity is now saving to a database.')
+      expect(wrapper.find('.alert-success').exists()).toBe(false)
+      expect(reads).toBe(2)
+      expect(fetchMock.mock.calls.filter(([url]) => url === 'api/activity/use-existing-datasource')).toHaveLength(1)
+      expect(wrapper.text()).toContain('GET /api/todos')
+    }
+  )
+
+  it.each([
+    [403, '', 'HTTP 403'],
+    [503, '<html>Unavailable</html>', 'HTTP 503'],
+    [409, '{"reason":"Datasource changed"}', 'Datasource changed']
+  ])('preserves HTTP %s datasource errors without inventing a success', async (code, body, message) => {
+    const before = activityReport({
+      persistenceOption: {active: false, dataSourceAvailable: true, tableName: 'custom_activity'}
+    })
+    const fetchMock = vi.fn((url) =>
+      url === 'api/activity/journal'
+        ? Promise.resolve(jsonResponse({enabled: true}))
+        : url === 'api/activity/use-existing-datasource'
+          ? Promise.resolve(new Response(body, {status: code, headers: {'content-type': 'application/json'}}))
+          : Promise.resolve(jsonResponse(before))
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    wrapper = mountLiveActivity()
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text().includes('Use a database'))
+      .trigger('click')
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text().includes('Use the existing datasource'))
+      .trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain(message)
+    expect(wrapper.find('.alert-success').exists()).toBe(false)
+    expect(fetchMock.mock.calls.filter(([url]) => url === 'api/activity/use-existing-datasource')).toHaveLength(1)
   })
 
   it('shows Live flow between the KPI summary and activity feed controls by default', async () => {
@@ -1047,6 +1852,10 @@ describe('LiveActivity', () => {
         'Open GET /api/orders/{id}, the route of the slowest request (/api/orders/42), in HTTP Exchanges'
       )
       expect(wrapper.get('.activity-kpi-latency-samples').text()).toBe('over 7 retained requests')
+      expect(JSON.parse(wrapper.get('.activity-why-slow a').attributes('data-to'))).toEqual({
+        path: '/runtime-insights',
+        query: {q: 'GET /api/orders/{id}'}
+      })
     })
 
     it('falls back to a path search when an older server sends no route', async () => {
@@ -1070,6 +1879,7 @@ describe('LiveActivity', () => {
         query: {q: '/api/orders/42'}
       })
       expect(wrapper.find('.activity-kpi-latency-samples').exists()).toBe(false)
+      expect(wrapper.find('.activity-why-slow').exists()).toBe(false)
     })
 
     it('opens the request profile an HTTP Exchanges link names', async () => {

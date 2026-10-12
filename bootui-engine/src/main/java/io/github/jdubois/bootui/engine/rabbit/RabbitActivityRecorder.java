@@ -1,5 +1,14 @@
 package io.github.jdubois.bootui.engine.rabbit;
 
+import io.github.jdubois.bootui.engine.correlation.CorrelationSource;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.MessagingPayload;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventPublisher;
+import io.github.jdubois.bootui.engine.journal.RuntimeEventSink;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import io.github.jdubois.bootui.spi.CorrelationContextProvider;
+import io.github.jdubois.bootui.spi.MemoryOffloadable;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -34,7 +43,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Thread-safe, capped at {@code maxEntries}, and evicts the oldest message once full so it
  * never grows unbounded.</p>
  */
-public final class RabbitActivityRecorder {
+public final class RabbitActivityRecorder implements RuntimeEventPublisher, MemoryOffloadable {
 
     private static final int MAX_METADATA_LENGTH = 512;
     private static final String FAILURE_MESSAGE = "Message processing failed";
@@ -56,7 +65,63 @@ public final class RabbitActivityRecorder {
             Long durationMillis,
             boolean success,
             String errorMessage,
-            String correlationId) {}
+            String correlationId,
+            String requestId,
+            String executionId) {
+        /** Without BootUI's execution identity. */
+        public CapturedMessage(
+                long id,
+                long timestamp,
+                Direction direction,
+                String exchange,
+                String routingKey,
+                String queue,
+                Long durationMillis,
+                boolean success,
+                String errorMessage,
+                String correlationId,
+                String requestId) {
+            this(
+                    id,
+                    timestamp,
+                    direction,
+                    exchange,
+                    routingKey,
+                    queue,
+                    durationMillis,
+                    success,
+                    errorMessage,
+                    correlationId,
+                    requestId,
+                    null);
+        }
+
+        /** Without BootUI's execution identity. */
+        public CapturedMessage(
+                long id,
+                long timestamp,
+                Direction direction,
+                String exchange,
+                String routingKey,
+                String queue,
+                Long durationMillis,
+                boolean success,
+                String errorMessage,
+                String correlationId) {
+            this(
+                    id,
+                    timestamp,
+                    direction,
+                    exchange,
+                    routingKey,
+                    queue,
+                    durationMillis,
+                    success,
+                    errorMessage,
+                    correlationId,
+                    null);
+        }
+    }
 
     private final boolean enabled;
     private final boolean captureCorrelationId;
@@ -65,6 +130,8 @@ public final class RabbitActivityRecorder {
 
     private final Deque<CapturedMessage> buffer = new ArrayDeque<>();
     private final Object lock = new Object();
+    private final CorrelationSource correlation = new CorrelationSource();
+    private volatile RuntimeEventSink journal = RuntimeEventSink.NONE;
     private final AtomicLong sequence = new AtomicLong();
     private final AtomicLong totalCaptured = new AtomicLong();
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
@@ -90,6 +157,24 @@ public final class RabbitActivityRecorder {
     }
 
     /**
+     * Replaces the source of the correlation stamped on each message ({@code docs/PLAN-v2.md} §5.1): the sender's
+     * request or execution for an outgoing message, and the listener's own execution for a consumed one. Defaults to
+     * the thread's correlation scope; passing {@code null} restores it.
+     */
+    /**
+     * Installs the runtime journal ({@code docs/PLAN-v2.md} §5.2), which receives each recorded message right after this
+     * recorder retains it. {@code null} restores the default, which publishes nothing.
+     */
+    @Override
+    public void setRuntimeEventSink(RuntimeEventSink journal) {
+        this.journal = journal == null ? RuntimeEventSink.NONE : journal;
+    }
+
+    public void setCorrelationContextProvider(CorrelationContextProvider correlationProvider) {
+        correlation.set(correlationProvider);
+    }
+
+    /**
      * Records a completed (or attempted) publish. {@code durationMillis} is {@code null} when
      * unknown — the Spring AMQP {@code MessagePostProcessor.postProcessMessage} hook runs just
      * before the actual {@code basicPublish} with no post-send callback available (without
@@ -104,7 +189,62 @@ public final class RabbitActivityRecorder {
             boolean success,
             String errorMessage,
             String correlationId) {
-        record(Direction.PUBLISH, exchange, routingKey, null, durationMillis, success, errorMessage, correlationId);
+        record(
+                Direction.PUBLISH,
+                exchange,
+                routingKey,
+                null,
+                RuntimeEvent.millisToNanos(durationMillis),
+                success,
+                errorMessage,
+                correlationId,
+                correlation.current());
+    }
+
+    /** Records a publish with the sender's correlation, captured by the adapter ({@code docs/PLAN-v2.md} §5.1). */
+    public void recordPublish(
+            String exchange,
+            String routingKey,
+            Long durationMillis,
+            boolean success,
+            String errorMessage,
+            String correlationId,
+            CorrelationContext context) {
+        record(
+                Direction.PUBLISH,
+                exchange,
+                routingKey,
+                null,
+                RuntimeEvent.millisToNanos(durationMillis),
+                success,
+                errorMessage,
+                correlationId,
+                context == null ? CorrelationContext.NONE : context);
+    }
+
+    /**
+     * Records a publish timed in nanoseconds from when it entered the channel to its outcome, with the sender's
+     * correlation, captured by the adapter: the panel keeps milliseconds, and the runtime journal the nanoseconds and
+     * the publish's start ({@code docs/PLAN-v2.md} §5.2).
+     */
+    public void recordPublishNanos(
+            String exchange,
+            String routingKey,
+            Long durationNanos,
+            boolean success,
+            String errorMessage,
+            String correlationId,
+            CorrelationContext context) {
+        record(
+                Direction.PUBLISH,
+                exchange,
+                routingKey,
+                null,
+                durationNanos,
+                success,
+                errorMessage,
+                correlationId,
+                context == null ? CorrelationContext.NONE : context);
     }
 
     /** Records a completed (successful or failed) {@code @RabbitListener} message delivery. */
@@ -116,7 +256,64 @@ public final class RabbitActivityRecorder {
             boolean success,
             String errorMessage,
             String correlationId) {
-        record(Direction.CONSUME, exchange, routingKey, queue, durationMillis, success, errorMessage, correlationId);
+        record(
+                Direction.CONSUME,
+                exchange,
+                routingKey,
+                queue,
+                RuntimeEvent.millisToNanos(durationMillis),
+                success,
+                errorMessage,
+                correlationId,
+                correlation.current());
+    }
+
+    /** Records a consumed delivery with the correlation the adapter captured for it ({@code docs/PLAN-v2.md} §5.1). */
+    public void recordConsume(
+            String exchange,
+            String routingKey,
+            String queue,
+            Long durationMillis,
+            boolean success,
+            String errorMessage,
+            String correlationId,
+            CorrelationContext context) {
+        record(
+                Direction.CONSUME,
+                exchange,
+                routingKey,
+                queue,
+                RuntimeEvent.millisToNanos(durationMillis),
+                success,
+                errorMessage,
+                correlationId,
+                context == null ? CorrelationContext.NONE : context);
+    }
+
+    /**
+     * Records a consumed delivery timed in nanoseconds, with the correlation the adapter captured for it, or the
+     * current one when {@code context} is {@code null}: the panel keeps milliseconds, and the runtime journal the
+     * nanoseconds ({@code docs/PLAN-v2.md} §5.2).
+     */
+    public void recordConsumeNanos(
+            String exchange,
+            String routingKey,
+            String queue,
+            Long durationNanos,
+            boolean success,
+            String errorMessage,
+            String correlationId,
+            CorrelationContext context) {
+        record(
+                Direction.CONSUME,
+                exchange,
+                routingKey,
+                queue,
+                durationNanos,
+                success,
+                errorMessage,
+                correlationId,
+                context == null ? correlation.current() : context);
     }
 
     private void record(
@@ -124,13 +321,15 @@ public final class RabbitActivityRecorder {
             String exchange,
             String routingKey,
             String queue,
-            Long durationMillis,
+            Long durationNanos,
             boolean success,
             String errorMessage,
-            String correlationId) {
+            String correlationId,
+            CorrelationContext context) {
         if (!enabled) {
             return;
         }
+        long nanos = durationNanos == null || durationNanos < 0 ? -1 : durationNanos;
         CapturedMessage entry = new CapturedMessage(
                 sequence.incrementAndGet(),
                 System.currentTimeMillis(),
@@ -138,10 +337,12 @@ public final class RabbitActivityRecorder {
                 truncate(exchange),
                 truncate(routingKey),
                 truncate(queue),
-                durationMillis == null ? null : Math.max(0, durationMillis),
+                nanos < 0 ? null : nanos / 1_000_000,
                 success,
                 success ? null : FAILURE_MESSAGE,
-                captureCorrelationId ? hashCorrelationId(correlationId, maxCorrelationIdLength) : null);
+                captureCorrelationId ? hashCorrelationId(correlationId, maxCorrelationIdLength) : null,
+                context.requestId(),
+                context.executionId());
         synchronized (lock) {
             buffer.addLast(entry);
             // At most one entry is ever added per record() call and maxEntries is fixed at construction,
@@ -149,6 +350,25 @@ public final class RabbitActivityRecorder {
             if (buffer.size() > maxEntries) {
                 buffer.removeFirst();
             }
+        }
+        boolean sent = direction == Direction.PUBLISH;
+        try {
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.MESSAGING,
+                    RuntimeEvent.startMillis(entry.timestamp(), nanos),
+                    nanos,
+                    context,
+                    sent ? null : Thread.currentThread().getName(),
+                    null,
+                    !success,
+                    new MessagingPayload(
+                            "rabbitmq",
+                            sent,
+                            sent || entry.queue() == null ? entry.exchange() : entry.queue(),
+                            !success,
+                            sent ? null : context.linkedTraceId())));
+        } catch (RuntimeException ex) {
+            // Publishing never disturbs the message it observes.
         }
         totalCaptured.incrementAndGet();
         notifyListeners();
@@ -165,6 +385,24 @@ public final class RabbitActivityRecorder {
 
     public long totalCaptured() {
         return totalCaptured.get();
+    }
+
+    @Override
+    public String offloadId() {
+        return "rabbitmq";
+    }
+
+    @Override
+    public String offloadLabel() {
+        return "RabbitMQ messages";
+    }
+
+    /** Drops what {@link #clear()} drops, for <b>Free BootUI memory</b>; recording settings are kept. */
+    @Override
+    public long offloadRetainedData() {
+        long retained = recent().size();
+        clear();
+        return retained;
     }
 
     public void clear() {

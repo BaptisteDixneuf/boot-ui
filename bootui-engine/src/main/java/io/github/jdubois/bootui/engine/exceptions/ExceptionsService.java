@@ -121,7 +121,9 @@ public final class ExceptionsService {
                 last == null ? null : last.traceId(),
                 summary.status().name(),
                 summary.regressionCount(),
-                errorContractLink(summary.exceptionClassName(), last == null ? null : last.handler()));
+                errorContractLink(summary.exceptionClassName(), last == null ? null : last.handler()),
+                last == null ? null : last.requestId(),
+                last == null ? null : last.executionId());
     }
 
     /** Resolves the declared-handler cross-link, tolerating a resolver that cannot answer. */
@@ -161,7 +163,9 @@ public final class ExceptionsService {
                 occurrence.requestPath(),
                 occurrence.handler(),
                 occurrence.source(),
-                occurrence.traceId());
+                occurrence.traceId(),
+                occurrence.requestId(),
+                occurrence.executionId());
     }
 
     private String displayMessage(String message) {

@@ -14,7 +14,10 @@ import java.util.stream.Stream;
  *
  * <p>BootUI is matched by its module packages rather than by the whole {@code io.github.jdubois.bootui} namespace,
  * so the sample applications ({@code io.github.jdubois.bootui.sample} and {@code
- * io.github.jdubois.bootui.webfluxsample}) count as application code and show real call sites.</p>
+ * io.github.jdubois.bootui.webfluxsample}) count as application code and show real call sites. For the same reason,
+ * applications living in a framework's namespace, such as Spring PetClinic ({@code org.springframework.samples}) and
+ * Quarkus Super Heroes ({@code io.quarkus.sample}), and pages compiled from JSPs ({@code org.apache.jsp}), count as
+ * application code.</p>
  */
 public final class StackFramePrefixes {
 
@@ -27,7 +30,9 @@ public final class StackFramePrefixes {
             "io.github.jdubois.bootui.quarkus.",
             "io.github.jdubois.bootui.client.",
             "io.github.jdubois.bootui.cli.",
-            "io.github.jdubois.bootui.conformance.");
+            "io.github.jdubois.bootui.conformance.",
+            // The Java agent and its bootstrap bridge (PLAN-v2 §5.13): their frames sit on application stacks.
+            "io.github.jdubois.bootui.agent.");
 
     private static final List<String> THIRD_PARTY_PREFIXES = List.of(
             "java.",
@@ -54,11 +59,28 @@ public final class StackFramePrefixes {
             "net.bytebuddy.",
             "org.jboss.");
 
+    /** Application code inside a framework prefix above. Package-private for tests. */
+    static final List<String> APPLICATION_PREFIXES =
+            List.of("org.springframework.samples.", "io.quarkus.sample.", "org.apache.jsp.");
+
     private static final List<String> FRAMEWORK_PREFIXES = Stream.concat(
                     THIRD_PARTY_PREFIXES.stream(), BOOTUI_MODULE_PREFIXES.stream())
             .toList();
 
     private StackFramePrefixes() {}
+
+    /** Whether {@code className} belongs to one of BootUI's own modules, the agent and its bridge included. */
+    public static boolean isBootUiModule(String className) {
+        if (className == null) {
+            return false;
+        }
+        for (String prefix : BOOTUI_MODULE_PREFIXES) {
+            if (className.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /**
      * Whether {@code className} belongs to a known framework/JDK/BootUI-internal package rather than
@@ -68,6 +90,11 @@ public final class StackFramePrefixes {
     public static boolean isFrameworkClass(String className) {
         if (className == null) {
             return true;
+        }
+        for (String prefix : APPLICATION_PREFIXES) {
+            if (className.startsWith(prefix)) {
+                return false;
+            }
         }
         for (String prefix : FRAMEWORK_PREFIXES) {
             if (className.startsWith(prefix)) {

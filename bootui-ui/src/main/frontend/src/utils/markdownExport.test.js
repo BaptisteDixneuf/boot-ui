@@ -1,6 +1,7 @@
 import {describe, expect, it, vi} from 'vitest'
 import {ApiError} from '../api.js'
 import {
+  insightMarkdown,
   MAX_EXCEPTION_DETAILS,
   MAX_FRAMES,
   MAX_OCCURRENCES,
@@ -193,6 +194,23 @@ describe('Markdown primitives', () => {
 })
 
 describe('profileMarkdown', () => {
+  it('qualifies unavailable SQL execution timing without hiding measured outbound calls', () => {
+    const {markdown} = profileMarkdown(
+      profile({
+        sqlGroups: [],
+        exceptions: [],
+        timing: {sqlCount: 0, sqlMs: 0, sqlPercent: 0, restCallCount: 1, restCallMs: 12},
+        sections: [{type: 'SQL', available: false, unavailableReason: 'SQL preparation is not execution evidence.'}]
+      })
+    )
+    expect(markdown).toContain('- **Timing:** SQL execution timing unavailable; 1 REST client call, 12 ms outbound')
+    expect(markdown).toContain('## SQL (unavailable)')
+    expect(markdown).toContain('SQL preparation is not execution evidence.')
+    expect(markdown).not.toContain('0 SQL statements')
+    expect(markdown).not.toContain('0% of the request')
+    expect(markdown).not.toContain('```sql')
+  })
+
   it('renders the request, normalized SQL with N+1 call sites, exceptions, and notes', () => {
     const {markdown, omissions} = profileMarkdown(profile())
 
@@ -470,5 +488,55 @@ describe('loading an export', () => {
     expect(correlation.correlationUnavailableReason).toBe(
       'Live Activity could not be read: the Live Activity panel is disabled or not permitted.'
     )
+  })
+})
+
+describe('insightMarkdown', () => {
+  const detail = {
+    available: true,
+    observation: {
+      id: 'repeated-selects:abc',
+      kind: 'repeated-selects',
+      subject: 'GET /api/orders',
+      status: 'OBSERVED',
+      sentence: '`GET /api/orders` ran `select * from lines where order_id = ?` 5 or more times in 3 of 9 requests.',
+      eligible: 9,
+      affected: 3,
+      minimumTier: 'REQUEST_ID',
+      whatToCheck: ['Load them with one statement, such as a join.'],
+      exemplarRequestIds: ['r-1'],
+      limitations: ['Counts statements the request ran.']
+    },
+    columns: ['Request', 'Statement'],
+    rows: [{cells: ['r-1', 'select a | b from t']}],
+    truncated: 2
+  }
+
+  it('keeps the engine code marks as code, escapes the rest, and lists what it left out', () => {
+    const {markdown, omissions} = insightMarkdown(detail, {title: 'Repeated SELECTs'})
+    expect(markdown).toContain('# BootUI runtime insight: Repeated SELECTs')
+    expect(markdown).toContain('`GET /api/orders` ran `select * from lines where order_id = ?` 5 or more times')
+    expect(markdown).toContain('- **Counted:** 3 of 9 requests')
+    expect(markdown).toContain('1. Load them with one statement, such as a join.')
+    expect(markdown).toContain('`bootui request-profile r-1`')
+    expect(markdown).toContain('journal profile first')
+    expect(markdown).toContain('Check `source` and `available`')
+    expect(markdown).toContain('| r-1 | select a \\| b from t |')
+    expect(markdown).toContain('not a verdict')
+    expect(omissions).toEqual(['2 evidence rows beyond the first 1.'])
+    expect(markdown).not.toContain('Not listed by default')
+  })
+
+  it('says why a row the default list leaves out is left out, so an AI does not over-weight it', () => {
+    const {markdown} = insightMarkdown({
+      ...detail,
+      observation: {...detail.observation, listed: false, unlistedReason: 'Its warm median is under 20 ms.'}
+    })
+    expect(markdown).toContain('- **Not listed by default:** Its warm median is under 20 ms.')
+  })
+
+  it('says why an observation is unavailable instead of exporting nothing', () => {
+    const {markdown} = insightMarkdown({available: false, unavailableReason: 'No observation x.'})
+    expect(markdown).toContain('No observation x.')
   })
 })

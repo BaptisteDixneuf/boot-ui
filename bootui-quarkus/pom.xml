@@ -14,7 +14,7 @@
     <artifactId>bootui-quarkus</artifactId>
     <name>BootUI :: Quarkus Extension (Runtime)</name>
     <description>Quarkus extension that serves the BootUI developer console — the Quarkus adapter over the
-        framework-neutral bootui-engine, the analogue of bootui-spring-autoconfigure on Spring Boot.</description>
+        framework-neutral bootui-engine, the analogue of bootui-spring-boot-starter on Spring Boot.</description>
 
     <!--
         This is the runtime half of the BootUI Quarkus extension (deployment half:
@@ -23,14 +23,8 @@
     -->
 
     <dependencies>
-        <!-- Framework-neutral DTO/wire contract: the immutable records the engine returns and this adapter
-             serializes (imported directly by the JAX-RS resources), declared explicitly rather than leaned on
-             transitively through bootui-engine. -->
-        <dependency>
-            <groupId>com.julien-dubois.bootui</groupId>
-            <artifactId>bootui-core</artifactId>
-        </dependency>
-        <!-- Framework-neutral engine (logic shared with the Spring adapter) + the shared Vue UI bundle. -->
+        <!-- Framework-neutral engine (the DTO/wire contract and the logic shared with the Spring adapter) + the
+             shared Vue UI bundle. -->
         <dependency>
             <groupId>com.julien-dubois.bootui</groupId>
             <artifactId>bootui-engine</artifactId>
@@ -197,6 +191,17 @@
             <scope>provided</scope>
         </dependency>
 
+        <!-- LangChain4j core, compile-only (provided): needed solely to compile QuarkusAiCallListener, the
+             ChatModelListener that records Quarkus LangChain4j's model calls in the runtime journal (M3-9).
+             provided scope is NOT transitive, and the class-presence-gated build step (registerAiCalls) excludes
+             the listener when an application has no LangChain4j, so its types are never linked (R2). -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-core</artifactId>
+            <version>${langchain4j.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- Quarkus WebSockets Next extension, compile-only (provided): needed solely to compile the optional
              WebSockets panel runtime bindings (QuarkusWebSocketSessionProvider and
              QuarkusWebSocketConnectionCapture), which read io.quarkus.websockets.next OpenConnections /
@@ -322,7 +327,7 @@
           switch against a real, disposable database rather than hand-rolling a java.sql.DataSource/
           Connection fake (SwitchableActivityStore/BufferedActivityStore are final, so they cannot be
           mocked either, and this module has no Mockito). Mirrors the identical bootui-engine
-          (JdbcActivityStoreTests) and bootui-spring-autoconfigure (LiveActivityControllerTests) test
+          (JdbcActivityStoreTests) and bootui-spring-boot-starter (LiveActivityControllerTests) test
           dependency for the same feature. H2's version is managed by the imported quarkus-bom.
         -->
         <dependency>
@@ -334,6 +339,11 @@
 
     <build>
         <plugins>
+            <!-- Published: Maven Central receives a flattened, parentless POM (configured in the root POM). -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+            </plugin>
             <!-- Generates the final META-INF/quarkus-extension.yaml (injecting the runtime `artifact` GAV) and
                  META-INF/quarkus-extension.properties (with the deployment-artifact GAV), linking this runtime jar
                  to bootui-quarkus-deployment. Bound to process-resources — the canonical Quarkus phase, matching
@@ -359,8 +369,10 @@
                         </goals>
                         <configuration>
                             <deployment>${project.groupId}:bootui-quarkus-deployment:${project.version}</deployment>
-                            <!-- The plugin's default is the build platform's own minor, which would make Quarkus refuse the
-                                 extension on the older LTS line it supports (docs/setup/quarkus.md). -->
+                            <!-- The plugin's default is the build platform's own minor, which would make Quarkus
+                                 refuse the extension on the older LTS line it supports. The quarkus-lts job in
+                                 build.yml tests that line; keep this range, that job, and docs/setup/quarkus.md
+                                 in step. -->
                             <requiresQuarkusCore>[3.33,)</requiresQuarkusCore>
                         </configuration>
                     </execution>

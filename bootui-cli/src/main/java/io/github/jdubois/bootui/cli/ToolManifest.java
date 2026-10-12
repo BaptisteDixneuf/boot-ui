@@ -55,7 +55,11 @@ public final class ToolManifest {
                     tool.get("stacks").values().stream()
                             .map(stack -> stack.asString(""))
                             .toList(),
-                    tool.get("summary").asString("")));
+                    tool.get("summary").asString(""),
+                    tool.get("description").asString(""),
+                    tool.get("example").asString(""),
+                    tool.get("idHelp").asString(""),
+                    tool.get("queryHelp").asString("")));
         }
         return new ToolManifest(tools);
     }
@@ -78,12 +82,16 @@ public final class ToolManifest {
      *
      * @param name the MCP tool name it invokes
      * @param command the space-separated command path, e.g. {@code memory heap analyze}
-     * @param schema the argument schema: {@code NONE}, {@code LIMIT}, {@code QUERY_LIMIT}, {@code ID},
+     * @param schema the argument schema: {@code NONE}, {@code LIMIT}, {@code QUERY_LIMIT}, {@code QUERY}, {@code ID},
      *     or {@code RULE_VIOLATIONS}
      * @param panel the panel backing it
      * @param action whether it changes state, and is therefore refused on a read-only panel
      * @param stacks the stacks that advertise it, so help can say when a command is stack-specific
-     * @param summary a one-line description for help output
+     * @param summary a one-line description for the command listing
+     * @param description the whole description for the command's own help, or the summary when the manifest has none
+     * @param example one complete command line, with {@code <placeholders>} for values another command returns
+     * @param idHelp where the {@code <id>} comes from, or empty when the command takes none
+     * @param queryHelp the words {@code --query} understands beyond a plain filter, or empty
      */
     public record Tool(
             String name,
@@ -92,12 +100,69 @@ public final class ToolManifest {
             String panel,
             boolean action,
             List<String> stacks,
-            String summary) {
+            String summary,
+            String description,
+            String example,
+            String idHelp,
+            String queryHelp) {
+
+        /** The tag the help prints before an action's description: it changes state, so ask the user first. */
+        public static final String ACTION_TAG = "[action - needs approval]";
 
         public Tool {
             Objects.requireNonNull(name, "name");
             Objects.requireNonNull(command, "command");
             stacks = stacks == null ? List.of() : List.copyOf(stacks);
+            summary = summary == null ? "" : summary;
+            description = description == null || description.isBlank() ? summary : description;
+            example = example == null || example.isBlank() ? "bootui " + command : example;
+            idHelp = idHelp == null ? "" : idHelp;
+            queryHelp = queryHelp == null ? "" : queryHelp;
+        }
+
+        public Tool(
+                String name,
+                String command,
+                String schema,
+                String panel,
+                boolean action,
+                List<String> stacks,
+                String summary) {
+            this(name, command, schema, panel, action, stacks, summary, null, null, null, null);
+        }
+
+        /** The whole description for a command's own {@code --help}, tagged when the tool is an action. */
+        public String helpDescription() {
+            return tag() + description;
+        }
+
+        /** {@link #ACTION_TAG} and a space for an action, otherwise empty. */
+        public String tag() {
+            return action ? ACTION_TAG + " " : "";
+        }
+
+        /**
+         * The command with its arguments, such as {@code bootui insights show <id>} or
+         * {@code bootui beans [--query <text>] [--limit <count>]}, from the same schema flags the command tree binds.
+         */
+        public String synopsis() {
+            StringBuilder line = new StringBuilder("bootui ").append(command);
+            if (takesId()) {
+                line.append(optionalId() ? " [<id>]" : " <id>");
+            }
+            if (takesScanId()) {
+                line.append(" --scan-id <scanId>");
+            }
+            if (takesQuery()) {
+                line.append(" [--query <text>]");
+            }
+            if (takesOffset()) {
+                line.append(" [--offset <offset>]");
+            }
+            if (takesLimit()) {
+                line.append(" [--limit <count>]");
+            }
+            return line.toString();
         }
 
         /** The command path split into its words. */
@@ -107,7 +172,12 @@ public final class ToolManifest {
 
         /** Whether this tool takes a {@code query} filter. */
         public boolean takesQuery() {
-            return "QUERY_LIMIT".equals(schema);
+            return "QUERY_LIMIT".equals(schema) || "QUERY".equals(schema);
+        }
+
+        /** Whether this tool lists every match, so a {@code --limit} from an older script is accepted and ignored. */
+        public boolean ignoresLimit() {
+            return "QUERY".equals(schema);
         }
 
         /** Whether this tool takes a {@code limit}. */
@@ -117,7 +187,11 @@ public final class ToolManifest {
 
         /** Whether this tool requires an {@code id} positional. */
         public boolean takesId() {
-            return "ID".equals(schema) || takesScanId();
+            return "ID".equals(schema) || optionalId() || takesScanId();
+        }
+
+        public boolean optionalId() {
+            return "OPTIONAL_ID".equals(schema);
         }
 
         /** Whether this tool requires a completed advisor snapshot identifier. */

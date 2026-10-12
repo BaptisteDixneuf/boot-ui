@@ -1,0 +1,1547 @@
+package io.github.jdubois.bootui.autoconfigure.reactive;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.github.jdubois.bootui.autoconfigure.BootUiProperties;
+import io.github.jdubois.bootui.autoconfigure.config.BootUiExposure;
+import io.github.jdubois.bootui.autoconfigure.mail.EmailController;
+import io.github.jdubois.bootui.autoconfigure.web.HealthController;
+import io.github.jdubois.bootui.autoconfigure.web.HttpExchangesController;
+import io.github.jdubois.bootui.autoconfigure.web.TracesController;
+import io.github.jdubois.bootui.core.ValueExposure;
+import io.github.jdubois.bootui.core.dto.ActivityEntryDto;
+import io.github.jdubois.bootui.core.dto.ActivityPersistenceOptionDto;
+import io.github.jdubois.bootui.core.dto.ActivitySwitchRequest;
+import io.github.jdubois.bootui.core.dto.ActivitySwitchResult;
+import io.github.jdubois.bootui.core.dto.EmailMessageDto;
+import io.github.jdubois.bootui.core.dto.EmailsReport;
+import io.github.jdubois.bootui.core.dto.HttpExchangeDto;
+import io.github.jdubois.bootui.core.dto.HttpExchangesReport;
+import io.github.jdubois.bootui.core.dto.LiveActivityReport;
+import io.github.jdubois.bootui.core.dto.PageMetadata;
+import io.github.jdubois.bootui.core.dto.RequestProfileDto;
+import io.github.jdubois.bootui.core.dto.SecurityLogsReport;
+import io.github.jdubois.bootui.core.dto.TraceDetailDto;
+import io.github.jdubois.bootui.engine.activity.ActivityPage;
+import io.github.jdubois.bootui.engine.activity.ActivityPersistenceSettings;
+import io.github.jdubois.bootui.engine.activity.ActivityQuery;
+import io.github.jdubois.bootui.engine.activity.ActivityStore;
+import io.github.jdubois.bootui.engine.activity.InMemoryActivityStore;
+import io.github.jdubois.bootui.engine.activity.StoredActivityEntry;
+import io.github.jdubois.bootui.engine.activity.SwitchableActivityStore;
+import io.github.jdubois.bootui.engine.cache.CacheActivityRecorder;
+import io.github.jdubois.bootui.engine.correlation.BootUiCorrelation;
+import io.github.jdubois.bootui.engine.correlation.RunIdentity;
+import io.github.jdubois.bootui.engine.email.EmailCaptureService;
+import io.github.jdubois.bootui.engine.exceptions.ExceptionStore;
+import io.github.jdubois.bootui.engine.faulttolerance.FaultToleranceEventRecorder;
+import io.github.jdubois.bootui.engine.jms.JmsActivityRecorder;
+import io.github.jdubois.bootui.engine.journal.HttpPayload;
+import io.github.jdubois.bootui.engine.journal.JournalAggregates;
+import io.github.jdubois.bootui.engine.journal.JournalSource;
+import io.github.jdubois.bootui.engine.journal.RuntimeEvent;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournal;
+import io.github.jdubois.bootui.engine.journal.RuntimeJournalSettings;
+import io.github.jdubois.bootui.engine.kafka.KafkaActivityRecorder;
+import io.github.jdubois.bootui.engine.panel.BootUiPanels;
+import io.github.jdubois.bootui.engine.rabbit.RabbitActivityRecorder;
+import io.github.jdubois.bootui.engine.restclienttrace.RestClientTraceRecorder;
+import io.github.jdubois.bootui.engine.scheduled.ScheduledTaskRunStore;
+import io.github.jdubois.bootui.engine.sqltrace.SqlTraceRecorder;
+import io.github.jdubois.bootui.engine.web.ProfileCapabilities;
+import io.github.jdubois.bootui.spi.CorrelationContext;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
+import org.h2.jdbcx.JdbcDataSource;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.http.ResponseEntity;
+import reactor.test.StepVerifier;
+
+/**
+ * Tests for {@link ReactiveLiveActivityController}. The merge/correlation math itself is already
+ * covered by {@code LiveActivityAssemblerTests} and {@code ExecutionProfileAssemblerTests} (shared with
+ * Quarkus); this suite focuses on what is genuinely new here: gathering signals directly from the
+ * reactive/shared controllers with each source's own {@code bootui.panels.*} enablement re-checked
+ * (since bypassing HTTP also bypasses {@code ReactivePanelAccessFilter}), the persistence
+ * switch/pagination contract (ported unchanged from the servlet controller), and the SSE lifecycle.
+ */
+class ReactiveLiveActivityControllerTests {
+
+    private static final AtomicInteger DB_COUNTER = new AtomicInteger();
+
+    @Test
+    void streamOpensAnSseEmitter() {
+        assertThat(controller(new BootUiProperties()).stream()).isNotNull();
+    }
+
+    @Test
+    void signalRequestHandledPushesAnUpdateOnTheOpenStream() {
+        ReactiveLiveActivityController controller = controller(new BootUiProperties());
+
+        StepVerifier.create(controller.stream())
+                .then(controller::signalRequestHandled)
+                .assertNext(sse -> assertThat(sse.event()).isEqualTo("update"))
+                .thenCancel()
+                .verify(Duration.ofSeconds(3));
+    }
+
+    @Test
+    void activityCarriesNoPageInfoAndAnInactivePersistenceOptionWhenNotPersistent() {
+        LiveActivityReport result = controller(new BootUiProperties()).activity(null, null, 0, 0, null, null, null, 0);
+
+        assertThat(result.pageInfo()).isNull();
+        assertThat(result.persistenceOption())
+                .isEqualTo(new ActivityPersistenceOptionDto(false, false, "bootui_activity"));
+    }
+
+    @Test
+    void activityReportsADataSourceAsAvailableWhenOneIsPresentEvenWithPersistenceOff() {
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                provider(mock(DataSource.class)),
+                new BootUiProperties());
+
+        LiveActivityReport result = controller.activity(null, null, 0, 0, null, null, null, 0);
+
+        assertThat(result.persistenceOption())
+                .isEqualTo(new ActivityPersistenceOptionDto(false, true, "bootui_activity"));
+    }
+
+    @Test
+    void activityDelegatesEntriesAndPageInfoToStoreWhenPersistenceEnabled() throws Exception {
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        when(store.query(any())).thenReturn(ActivityPage.EMPTY);
+        ActivityPersistenceSettings settings = enabledSettings("instance-reactive-a", Duration.ofSeconds(2));
+
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                settings,
+                empty(DataSource.class),
+                new BootUiProperties());
+        try {
+            LiveActivityReport result = controller.activity("SQL", "OK", 0, 0, "select", 999L, "cursor-1", 50);
+
+            assertThat(result.pageInfo())
+                    .isEqualTo(new io.github.jdubois.bootui.core.dto.ActivityPageInfo(
+                            true, ActivityPage.EMPTY.nextCursor(), ActivityPage.EMPTY.hasMore()));
+            assertThat(result.persistenceOption())
+                    .isEqualTo(new ActivityPersistenceOptionDto(true, false, "bootui_activity"));
+
+            ArgumentCaptor<ActivityQuery> captor = ArgumentCaptor.forClass(ActivityQuery.class);
+            verify(store).query(captor.capture());
+            ActivityQuery query = captor.getValue();
+            assertThat(query.instanceId()).isEqualTo("instance-reactive-a");
+            assertThat(query.type()).isEqualTo("SQL");
+            assertThat(query.severity()).isEqualTo("OK");
+            assertThat(query.text()).isEqualTo("select");
+            assertThat(query.since()).isNull();
+            assertThat(query.until()).isEqualTo(999L);
+            assertThat(query.cursor()).isEqualTo("cursor-1");
+            assertThat(query.pageSize()).isEqualTo(50);
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    @Test
+    void persistedPagesContinuePastRowsOfDisabledPanels() throws Exception {
+        InMemoryActivityStore history = new InMemoryActivityStore(10);
+        history.appendBatch(List.of(
+                new StoredActivityEntry("instance-reactive-a", 1, row("marker", "MARKER")),
+                new StoredActivityEntry("instance-reactive-a", 2, row("request", "REQUEST")),
+                new StoredActivityEntry("instance-reactive-a", 3, row("sql", "SQL"))));
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        when(store.query(any())).thenAnswer(invocation -> history.query(invocation.getArgument(0)));
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.SQL_TRACE).setEnabled(false);
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                enabledSettings("instance-reactive-a", Duration.ofSeconds(2)),
+                empty(DataSource.class),
+                properties);
+        try {
+            LiveActivityReport first = controller.activity(null, null, 0, 0, null, null, null, 1);
+            assertThat(first.entries()).extracting(ActivityEntryDto::id).containsExactly("request");
+            assertThat(first.pageInfo().hasMore()).isTrue();
+            LiveActivityReport second = controller.activity(
+                    null, null, 0, 0, null, null, first.pageInfo().nextCursor(), 1);
+            assertThat(second.entries()).extracting(ActivityEntryDto::id).containsExactly("marker");
+            assertThat(second.pageInfo().hasMore()).isFalse();
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    private static ActivityEntryDto row(String id, String type) {
+        return new ActivityEntryDto(
+                id, type, 1_000L, "OK", type, null, null, null, null, null, null, null, false, null, null, false);
+    }
+
+    @Test
+    void useExistingDatasourceReturns404WhenNoDataSourceIsAvailable() {
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                empty(DataSource.class),
+                new BootUiProperties());
+
+        ResponseEntity<ActivitySwitchResult> response =
+                controller.useExistingDatasource(new ActivitySwitchRequest(true));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(404);
+        assertThat(response.getBody().status()).isEqualTo("unavailable");
+    }
+
+    @Test
+    void useExistingDatasourceReturns400WhenNotConfirmed() {
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                provider(mock(DataSource.class)),
+                new BootUiProperties());
+
+        ResponseEntity<ActivitySwitchResult> response = controller.useExistingDatasource(null);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(400);
+        assertThat(response.getBody().status()).isEqualTo("blocked");
+    }
+
+    @Test
+    void useExistingDatasourceReturns200AndIsANoOpWhenAlreadyPersistent() {
+        SwitchableActivityStore store = mock(SwitchableActivityStore.class);
+        when(store.persistent()).thenReturn(true);
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                enabledSettings("instance-reactive-c", Duration.ofSeconds(5)),
+                provider(mock(DataSource.class)),
+                new BootUiProperties());
+        try {
+            ResponseEntity<ActivitySwitchResult> response =
+                    controller.useExistingDatasource(new ActivitySwitchRequest(true));
+
+            assertThat(response.getStatusCode().value()).isEqualTo(200);
+            assertThat(response.getBody().status()).isEqualTo("already-active");
+        } finally {
+            controller.shutdown();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsDisabledJournalBeforeCreatingTheTable() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        BootUiProperties properties = new BootUiProperties();
+        properties.getRuntimeJournal().setEnabled(false);
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                properties);
+        RuntimeJournal journal =
+                new RuntimeJournal(properties.getRuntimeJournal().toSettings(), RunIdentity.start());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            assertUnavailableSwitch(controller, store, dataSource);
+        } finally {
+            controller.shutdown();
+            journal.close();
+            store.close();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsAClosedJournalBeforeCreatingTheTable() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                new BootUiProperties());
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            journal.close();
+            assertThat(journal.settings().enabled()).isTrue();
+            assertUnavailableSwitch(controller, store, dataSource);
+        } finally {
+            controller.shutdown();
+            journal.close();
+            store.close();
+        }
+    }
+
+    @Test
+    void runtimeSwitchRejectsMissingJournalBeforeCreatingTheTableAndDoesNotDefer() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                new BootUiProperties());
+        try (RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start())) {
+            assertUnavailableSwitch(controller, store, dataSource);
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            assertThat(org.springframework.test.util.ReflectionTestUtils.getField(controller, "deferredCapture"))
+                    .isNull();
+        } finally {
+            controller.shutdown();
+            store.close();
+        }
+    }
+
+    private static void assertUnavailableSwitch(
+            ReactiveLiveActivityController controller, SwitchableActivityStore store, DataSource dataSource)
+            throws Exception {
+        ResponseEntity<ActivitySwitchResult> response =
+                controller.useExistingDatasource(new ActivitySwitchRequest(true));
+        try (var connection = dataSource.getConnection();
+                var tables = connection.getMetaData().getTables(null, null, "BOOTUI_ACTIVITY", null)) {
+            assertThat(tables.next())
+                    .as(
+                            "journal unavailable: response %s must not create an application database table",
+                            response.getStatusCode().value())
+                    .isFalse();
+        }
+        assertThat(response.getStatusCode().value()).isEqualTo(409);
+        assertThat(response.getBody().status()).isEqualTo("unavailable");
+        assertThat(response.getBody().message()).contains("runtime journal");
+        assertThat(store.persistent()).isFalse();
+    }
+
+    @Test
+    void runtimeSwitchReportsCaptureRegistrationFailureWithoutPublishingTheDurableStore() {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                new BootUiProperties());
+        RuntimeJournal journal = mock(RuntimeJournal.class);
+        when(journal.settings()).thenReturn(RuntimeJournalSettings.defaults());
+        when(journal.isOpen()).thenReturn(true);
+        when(journal.subscribe(any())).thenReturn(() -> {});
+        doThrow(new IllegalStateException("capture registration failed"))
+                .when(journal)
+                .addListener(any());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            ResponseEntity<ActivitySwitchResult> response =
+                    controller.useExistingDatasource(new ActivitySwitchRequest(true));
+            assertThat(response.getStatusCode().value()).isEqualTo(500);
+            assertThat(response.getBody().status()).isEqualTo("failed");
+            assertThat(response.getBody().message()).contains("capture", "table");
+            assertThat(store.persistent()).isFalse();
+        } finally {
+            controller.shutdown();
+            store.close();
+        }
+    }
+
+    @Test
+    void configuredStartupCaptureDefersUntilTheJournalSetterThenCaptures() throws Exception {
+        List<StoredActivityEntry> captured = new CopyOnWriteArrayList<>();
+        SwitchableActivityStore store = new SwitchableActivityStore(new ActivityStore() {
+            @Override
+            public void appendBatch(List<StoredActivityEntry> entries) {
+                captured.addAll(entries);
+            }
+
+            @Override
+            public ActivityPage query(ActivityQuery query) {
+                return ActivityPage.EMPTY;
+            }
+        });
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                enabledSettings("startup-deferred", Duration.ofHours(1)),
+                empty(DataSource.class),
+                new BootUiProperties());
+        try (RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start())) {
+            assertThat(org.springframework.test.util.ReflectionTestUtils.getField(controller, "deferredCapture"))
+                    .isNotNull();
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            controller.afterPropertiesSet();
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.HTTP,
+                    1_000,
+                    2_000_000,
+                    CorrelationContext.forRequest("startup-request"),
+                    "t",
+                    null,
+                    false,
+                    new HttpPayload("GET", "/startup", "/startup", null, 200)));
+            assertThat(journal.awaitDrained(Duration.ofSeconds(5))).isTrue();
+            assertThat(captured).hasSize(1);
+            assertThat(captured.get(0).instanceId()).isEqualTo("startup-deferred");
+        } finally {
+            controller.shutdown();
+            store.close();
+        }
+    }
+
+    @Test
+    void useExistingDatasourceSwitchesTheStoreAndStartsCapturingOnSuccess() throws Exception {
+        DataSource dataSource = newDataSource();
+        SwitchableActivityStore store = defaultActivityStore();
+        ReactiveLiveActivityController controller = controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                store,
+                disabledSettings(),
+                provider(dataSource),
+                buffersFeed());
+        RuntimeJournal journal = new RuntimeJournal(RuntimeJournalSettings.defaults(), RunIdentity.start());
+        try {
+            controller.setRuntimeJournal(journal, new JournalAggregates());
+            ResponseEntity<ActivitySwitchResult> response =
+                    controller.useExistingDatasource(new ActivitySwitchRequest(true));
+
+            assertThat(response.getStatusCode().value()).isEqualTo(200);
+            assertThat(response.getBody().status()).isEqualTo("success");
+            assertThat(response.getBody().tableName()).isEqualTo("bootui_activity");
+
+            LiveActivityReport afterSwitch = controller.activity(null, null, 0, 0, null, null, null, 0);
+            assertThat(afterSwitch.persistenceOption())
+                    .isEqualTo(new ActivityPersistenceOptionDto(true, true, "bootui_activity"));
+            assertThat(afterSwitch.pageInfo()).isNotNull();
+            journal.offer(RuntimeEvent.of(
+                    JournalSource.HTTP,
+                    1_000,
+                    2_000_000,
+                    CorrelationContext.forRequest("persisted-request"),
+                    "t",
+                    null,
+                    false,
+                    new HttpPayload("GET", "/persisted", "/persisted", null, 200)));
+            assertThat(journal.awaitDrained(Duration.ofSeconds(5))).isTrue();
+            assertThat(store.query(ActivityQuery.firstPage("instance-reactive-x"))
+                            .entryDtos())
+                    .extracting(ActivityEntryDto::type)
+                    .contains("REQUEST");
+        } finally {
+            controller.shutdown();
+            journal.close();
+            store.close();
+        }
+        try (var connection = dataSource.getConnection();
+                var statement = connection.createStatement();
+                var rows = statement.executeQuery("SELECT COUNT(*) FROM bootui_activity")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getInt(1)).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void mergedReportCombinesRequestsAndExceptionsAndMarksTracedRequestsProfileable() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        HttpExchangeDto tracedExchange = exchange("req-1", "GET", "/api/products", 200, "trace-abc");
+        HttpExchangeDto untracedExchange = exchange("req-2", "GET", "/api/orders", 200, null);
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        2,
+                        2,
+                        0,
+                        List.of(tracedExchange, untracedExchange),
+                        new PageMetadata(0, 0, 0, 0, 0, false),
+                        null));
+
+        ExceptionStore exceptionStore = new ExceptionStore(50, 20, 30);
+        exceptionStore.record(
+                new IllegalStateException("boom"), "reactor-http-nio-1", "GET", "/api/products", null, "test");
+
+        BootUiProperties properties = new BootUiProperties();
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                provider(exceptionStore),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        LiveActivityReport report = controller.mergedReport(0);
+
+        assertThat(report.entries()).hasSize(3); // 2 requests + 1 exception
+        assertThat(report.entries())
+                .filteredOn(entry -> "req-1".equals(entry.id()))
+                .singleElement()
+                .satisfies(entry -> {
+                    assertThat(entry.correlationId()).isEqualTo("trace-abc");
+                    assertThat(entry.profileable()).isTrue();
+                });
+        assertThat(report.entries())
+                .filteredOn(entry -> "req-2".equals(entry.id()))
+                .singleElement()
+                .satisfies(entry -> assertThat(entry.profileable()).isFalse());
+        assertThat(report.entries())
+                .anySatisfy(entry -> assertThat(entry.type()).isEqualTo("EXCEPTION"));
+    }
+
+    @Test
+    void mergedReportClassifiesSlowRequestsWithTheBoundRequestSlowThreshold() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        1,
+                        1,
+                        0,
+                        List.of(exchange("req-1", "GET", "/api/products", 200, null)),
+                        new PageMetadata(0, 0, 0, 0, 0, false),
+                        null));
+
+        assertThat(requestSeverity(httpExchanges, new BootUiProperties())).isEqualTo("OK");
+        BootUiProperties properties = new BootUiProperties();
+        properties.getActivity().setRequestSlowThresholdMs(5);
+        assertThat(requestSeverity(httpExchanges, properties)).isEqualTo("SLOW");
+    }
+
+    private String requestSeverity(HttpExchangesController httpExchanges, BootUiProperties properties) {
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+        return controller.mergedReport(0).entries().stream()
+                .filter(entry -> "req-1".equals(entry.id()))
+                .findFirst()
+                .orElseThrow()
+                .severity();
+    }
+
+    @Test
+    void mergedReportIncludesCacheEventsWhenRecorderPresent() {
+        CacheActivityRecorder cacheRecorder = new CacheActivityRecorder(true, 10);
+        cacheRecorder.recordMiss("cacheManager", "products", "product-1");
+        BootUiProperties properties = new BootUiProperties();
+
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                provider(cacheRecorder),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        LiveActivityReport report = controller.mergedReport(0);
+
+        assertThat(report.entries())
+                .singleElement()
+                .satisfies(entry -> assertThat(entry.type()).isEqualTo("CACHE"));
+        assertThat(report.sources()).contains("cache");
+    }
+
+    @Test
+    void mergedReportIncludesScheduledTaskEntriesWhenStoreIsPresent() {
+        ScheduledTaskRunStore scheduledTaskStore = new ScheduledTaskRunStore(10);
+        scheduledTaskStore.record("com.example.Job#run", 1_000L, 25L, true, null, null, "worker-1");
+        BootUiProperties properties = new BootUiProperties();
+
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                provider(scheduledTaskStore),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        LiveActivityReport report = controller.mergedReport(0);
+
+        assertThat(report.entries())
+                .singleElement()
+                .satisfies(entry -> assertThat(entry.type()).isEqualTo("SCHEDULED"));
+        assertThat(report.sources()).contains("scheduled-tasks");
+    }
+
+    @Test
+    void mergedReportOmitsRequestsWhenHttpExchangesPanelIsDisabled() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        1,
+                        1,
+                        0,
+                        List.of(exchange("req-1", "GET", "/api/products", 200, "trace-abc")),
+                        new PageMetadata(0, 0, 0, 0, 0, false),
+                        null));
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.HTTP_EXCHANGES).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        assertThat(controller.mergedReport(0).entries()).isEmpty();
+    }
+
+    @Test
+    void mergedReportOmitsExceptionsWhenExceptionsPanelIsDisabled() {
+        ExceptionStore exceptionStore = new ExceptionStore(50, 20, 30);
+        exceptionStore.record(
+                new IllegalStateException("boom"), "reactor-http-nio-1", "GET", "/api/products", null, "test");
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.EXCEPTIONS).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                provider(exceptionStore),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        assertThat(controller.mergedReport(0).entries()).isEmpty();
+    }
+
+    @Test
+    void mergedReportOmitsSecurityEventsWhenSecurityLogsPanelIsDisabled() {
+        ReactiveSecurityLogsController securityLogs = mock(ReactiveSecurityLogsController.class);
+        when(securityLogs.logs(null, null, null, null, null))
+                .thenReturn(new SecurityLogsReport(true, null, 100, List.of(), List.of(), null));
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.SECURITY_LOGS).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                provider(securityLogs),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        // logs() must never even be called once the panel is disabled.
+        controller.mergedReport(0);
+        org.mockito.Mockito.verifyNoInteractions(securityLogs);
+    }
+
+    @Test
+    void mergedReportMergesRestClientTraceEntriesWhenAvailable() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        HttpExchangeDto tracedExchange = exchange("req-1", "GET", "/api/products", 200, "trace-abc");
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        1, 1, 0, List.of(tracedExchange), new PageMetadata(0, 0, 0, 0, 0, false), null));
+        RestClientTraceRecorder recorder =
+                new RestClientTraceRecorder(true, true, false, false, 10, 1_000, 2_000, 200, 5);
+        recorder.setCorrelationContextProvider(() -> BootUiCorrelation.current().withTrace("trace-abc", null));
+        recorder.record(
+                "GET",
+                "https://api.example.com/orders",
+                "api.example.com",
+                "/orders",
+                200,
+                12,
+                true,
+                null,
+                "WebClient",
+                Map.of(),
+                "reactor-http-nio-1");
+
+        BootUiProperties properties = new BootUiProperties();
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                provider(recorder),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        LiveActivityReport report = controller.mergedReport(0);
+
+        assertThat(report.sources()).contains("rest-client");
+        assertThat(report.entries())
+                .filteredOn(entry -> "rest-1".equals(entry.id()))
+                .singleElement()
+                .satisfies(entry -> {
+                    assertThat(entry.type()).isEqualTo("REST_CLIENT");
+                    assertThat(entry.parentId()).isEqualTo("req-1");
+                    assertThat(entry.summary()).isEqualTo("GET api.example.com/orders → 200");
+                });
+    }
+
+    @Test
+    void mergedReportIncludesKafkaMessagesWhenRecorderPresent() {
+        KafkaActivityRecorder kafka = new KafkaActivityRecorder(true, true, 10, 16);
+        kafka.recordProduce("orders", 0, "order-1", 1L, true, null);
+
+        BootUiProperties properties = new BootUiProperties();
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                provider(kafka),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        assertThat(controller.mergedReport(0).entries()).singleElement().satisfies(entry -> {
+            assertThat(entry.type()).isEqualTo("MESSAGING");
+            assertThat(entry.detail()).contains(hashedKey("order-1"));
+            assertThat(entry.detail()).doesNotContain("order-1");
+        });
+    }
+
+    @Test
+    void mergedReportOmitsKafkaMessagesWhenKafkaPanelDisabled() {
+        KafkaActivityRecorder kafka = new KafkaActivityRecorder(true, true, 10, 16);
+        kafka.recordProduce("orders", 0, "order-1", 1L, true, null);
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.KAFKA).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                provider(kafka),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        assertThat(controller.mergedReport(0).entries()).isEmpty();
+    }
+
+    @Test
+    void mergedReportIncludesJmsMessagesWhenKafkaPanelDisabled() {
+        JmsActivityRecorder jms = new JmsActivityRecorder(true, true, 10, 50);
+        jms.recordConsume("orders", "ID:1", 4L, true, null, null, "listener");
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.KAFKA).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                provider(jms),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        assertThat(controller.mergedReport(0).entries()).singleElement().satisfies(entry -> {
+            assertThat(entry.id()).startsWith("jms-");
+            assertThat(entry.type()).isEqualTo("MESSAGING");
+        });
+    }
+
+    @Test
+    void mergedReportOmitsJmsMessagesWhenJmsPanelDisabled() {
+        JmsActivityRecorder jms = new JmsActivityRecorder(true, true, 10, 50);
+        jms.recordConsume("orders", "ID:1", 4L, true, null, null, "listener");
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.JMS).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                provider(jms),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        assertThat(controller.mergedReport(0).entries()).isEmpty();
+    }
+
+    @Test
+    void mergedReportTreatsEmptyMessagingRecordersAsAvailableSources() {
+        BootUiProperties properties = new BootUiProperties();
+        ReactiveLiveActivityController controller = controllerWithMessaging(
+                new KafkaActivityRecorder(true, true, 10, 16),
+                new JmsActivityRecorder(true, true, 10, 16),
+                new RabbitActivityRecorder(true, false, 10, 16),
+                properties);
+
+        LiveActivityReport report = controller.mergedReport(0);
+
+        assertThat(report.sources()).contains("kafka", "jms", "rabbitmq");
+        assertThat(report.entries()).isEmpty();
+    }
+
+    @Test
+    void mergedReportMergesRabbitMessagesAndHonorsRabbitPanelGate() {
+        RabbitActivityRecorder rabbit = new RabbitActivityRecorder(true, false, 10, 16);
+        rabbit.recordConsume("orders", "created", "workers", 4L, true, null, null);
+
+        LiveActivityReport enabled = controllerWithMessaging(null, null, rabbit, new BootUiProperties())
+                .mergedReport(0);
+
+        assertThat(enabled.sources()).contains("rabbitmq");
+        assertThat(enabled.entries()).singleElement().satisfies(entry -> {
+            assertThat(entry.id()).startsWith("rabbit-");
+            assertThat(entry.type()).isEqualTo("MESSAGING");
+        });
+
+        BootUiProperties disabledProperties = new BootUiProperties();
+        disabledProperties.panel(BootUiPanels.RABBITMQ).setEnabled(false);
+        LiveActivityReport disabled =
+                controllerWithMessaging(null, null, rabbit, disabledProperties).mergedReport(0);
+
+        assertThat(disabled.sources()).doesNotContain("rabbitmq");
+        assertThat(disabled.entries()).isEmpty();
+    }
+
+    @Test
+    void mergedReportIncludesEmailMessagesWhenAvailable() {
+        EmailController email = mock(EmailController.class);
+        EmailMessageDto message = new EmailMessageDto(
+                "email-1",
+                1_000L,
+                "noreply@example.com",
+                List.of("user@example.com"),
+                List.of(),
+                List.of(),
+                "Welcome",
+                "Hello",
+                null,
+                List.of(),
+                true,
+                null,
+                "worker-1");
+        when(email.list()).thenReturn(new EmailsReport(true, null, false, 200, 1, List.of(message)));
+        BootUiProperties properties = new BootUiProperties();
+
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                provider(email),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        LiveActivityReport report = controller.mergedReport(0);
+
+        assertThat(report.entries())
+                .singleElement()
+                .satisfies(entry -> assertThat(entry.type()).isEqualTo("MAIL"));
+        assertThat(report.sources()).contains("email");
+    }
+
+    @Test
+    void mergedReportSkipsHealthStatusWhenHealthPanelIsDisabled() {
+        HealthController health = mock(HealthController.class);
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.HEALTH).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                provider(health),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        controller.mergedReport(0);
+
+        org.mockito.Mockito.verifyNoInteractions(health);
+    }
+
+    @Test
+    void requestReturnsUnavailableProfileWhenExchangeIsNotFound() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        when(httpExchanges.exchanges(null, null, null, null, null)).thenReturn(HttpExchangesReport.unavailable("none"));
+
+        BootUiProperties properties = new BootUiProperties();
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        RequestProfileDto profile = controller.request("missing-id");
+
+        assertThat(profile).isEqualTo(RequestProfileDto.unavailable("Request missing-id is no longer in the buffer"));
+    }
+
+    @Test
+    void requestCorrelatesATraceWhenTheExchangeCarriesATraceIdAndTracesPanelIsEnabled() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        HttpExchangeDto tracedExchange = exchange("req-1", "GET", "/api/products", 200, "trace-abc");
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        1, 1, 0, List.of(tracedExchange), new PageMetadata(0, 0, 0, 0, 0, false), null));
+        TracesController traces = mock(TracesController.class);
+        TraceDetailDto detail =
+                new TraceDetailDto("trace-abc", List.of(mock(io.github.jdubois.bootui.core.dto.SpanDto.class)));
+        when(traces.detail("trace-abc")).thenReturn(detail);
+
+        BootUiProperties properties = new BootUiProperties();
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                provider(traces),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        RequestProfileDto profile = controller.request("req-1");
+
+        assertThat(profile.available()).isTrue();
+        assertThat(profile.trace()).isEqualTo(detail);
+    }
+
+    @Test
+    void requestSkipsTraceCorrelationWhenTracesPanelIsDisabled() {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        HttpExchangeDto tracedExchange = exchange("req-1", "GET", "/api/products", 200, "trace-abc");
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        1, 1, 0, List.of(tracedExchange), new PageMetadata(0, 0, 0, 0, 0, false), null));
+        TracesController traces = mock(TracesController.class);
+
+        BootUiProperties properties = new BootUiProperties();
+        properties.panel(BootUiPanels.TRACES).setEnabled(false);
+        ReactiveLiveActivityController controller = new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                provider(traces),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+
+        RequestProfileDto profile = controller.request("req-1");
+
+        assertThat(profile.trace()).isNull();
+        org.mockito.Mockito.verifyNoInteractions(traces);
+    }
+
+    @Test
+    void requestProfilesMaskedRestClientCallsAndHashedCacheAccessesByTraceIdOnly() {
+        // Built from parts so the raw values under test are real, unmasked strings in this fixture.
+        String rawQueryValue = "raw-query-" + 4242;
+        String rawHeaderValue = "Bearer raw-header-" + 4343;
+        String rawCacheKey = "customer-" + 4444;
+        for (ValueExposure exposure : List.of(ValueExposure.MASKED, ValueExposure.METADATA_ONLY)) {
+            BootUiProperties properties = new BootUiProperties();
+            properties.setExposeValues(exposure);
+            RestClientTraceRecorder restRecorder =
+                    new RestClientTraceRecorder(true, true, true, false, 10, 1_000, 2_000, 200, 5);
+            restRecorder.registerClientCustomization("WebClient");
+            restRecorder.setCorrelationContextProvider(
+                    () -> BootUiCorrelation.current().withTrace("trace-abc", null));
+            restRecorder.record(
+                    "GET",
+                    "https://api.example.com/orders?pass" + "word=" + rawQueryValue,
+                    "api.example.com",
+                    "/orders",
+                    200,
+                    12,
+                    true,
+                    null,
+                    "WebClient",
+                    Map.of("Authorization", rawHeaderValue),
+                    "reactor-http-nio-1");
+            restRecorder.setCorrelationContextProvider(BootUiCorrelation::current);
+            restRecorder.record(
+                    "GET",
+                    "https://api.example.com/untraced",
+                    "api.example.com",
+                    "/untraced",
+                    200,
+                    3,
+                    true,
+                    null,
+                    "WebClient",
+                    Map.of(),
+                    "reactor-http-nio-1");
+            CacheActivityRecorder cacheRecorder = new CacheActivityRecorder(true, 10);
+            cacheRecorder.markInstrumentedManager();
+            cacheRecorder.setCorrelationContextProvider(
+                    () -> BootUiCorrelation.current().withTrace("trace-abc", null));
+            cacheRecorder.recordMiss("cacheManager", "products", rawCacheKey);
+
+            RequestProfileDto profile =
+                    profileController(properties, restRecorder, cacheRecorder).request("req-1");
+
+            assertThat(profile.restCalls()).as("%s", exposure).singleElement().satisfies(call -> {
+                assertThat(call.path()).isEqualTo("/orders");
+                assertThat(call.uri()).doesNotContain(rawQueryValue);
+                // Exactly as the REST Client panel shows it: the name kept and the value masked, or, under
+                // METADATA_ONLY, the whole query string dropped.
+                if (exposure == ValueExposure.MASKED) {
+                    assertThat(call.uri()).contains("pass" + "word=");
+                } else {
+                    assertThat(call.uri()).isEqualTo("https://api.example.com/orders");
+                }
+                assertThat(call.requestHeaders().values()).noneMatch(value -> value.contains(rawHeaderValue));
+            });
+            assertThat(profile.cacheAccesses()).singleElement().satisfies(access -> {
+                assertThat(access.operation()).isEqualTo("MISS");
+                assertThat(access.keyHash()).isNotBlank().doesNotContain(rawCacheKey);
+            });
+            assertThat(profile.sections())
+                    .filteredOn(section -> List.of("REST_CLIENT", "CACHE").contains(section.type()))
+                    .allSatisfy(section -> assertThat(section.tier()).isEqualTo("TRACE_ID"));
+            assertThat(profile.sections())
+                    .filteredOn(section -> "SQL".equals(section.type()))
+                    .singleElement()
+                    .satisfies(section -> assertThat(section.available()).isFalse());
+            assertThat(profile.correlationTiers())
+                    .filteredOn(tier -> !List.of("REQUEST_ID", "TRACE_ID").contains(tier.tier()))
+                    .allSatisfy(tier -> assertThat(tier.available()).isFalse());
+            assertThat(profile.correlationTiers())
+                    .filteredOn(tier -> tier.tier().equals("PROPAGATED"))
+                    .singleElement()
+                    .satisfies(tier ->
+                            assertThat(tier.unavailableReason()).isEqualTo(ProfileCapabilities.PROPAGATION_REASON));
+        }
+    }
+
+    @Test
+    void requestReportsRestClientAndCacheUnavailableUntilAClientAndACacheManagerAreInstrumented() {
+        BootUiProperties properties = new BootUiProperties();
+        RestClientTraceRecorder restRecorder =
+                new RestClientTraceRecorder(true, true, false, false, 10, 1_000, 2_000, 200, 5);
+        CacheActivityRecorder cacheRecorder = new CacheActivityRecorder(true, 10);
+
+        RequestProfileDto profile =
+                profileController(properties, restRecorder, cacheRecorder).request("req-1");
+
+        assertThat(profile.sections())
+                .filteredOn(section -> List.of("REST_CLIENT", "CACHE").contains(section.type()))
+                .allSatisfy(section -> {
+                    assertThat(section.available()).isFalse();
+                    assertThat(section.unavailableReason()).isNotBlank();
+                });
+    }
+
+    private static HttpExchangeDto timedExchange(String id, long timestamp, int status, long durationMs) {
+        return new HttpExchangeDto(
+                id,
+                Instant.ofEpochMilli(timestamp),
+                "GET",
+                "/api/orders",
+                null,
+                "/api/orders",
+                status,
+                status / 100 + "xx",
+                durationMs,
+                null,
+                "127.0.0.1",
+                null,
+                null,
+                null,
+                List.of(),
+                List.of());
+    }
+
+    private static HttpExchangesReport exchangesReport(List<HttpExchangeDto> exchanges) {
+        return new HttpExchangesReport(
+                exchanges.size(),
+                exchanges.size(),
+                0,
+                exchanges,
+                new PageMetadata(exchanges.size(), exchanges.size(), 0, exchanges.size(), exchanges.size(), false),
+                null);
+    }
+
+    private ReactiveLiveActivityController profileController(
+            BootUiProperties properties, RestClientTraceRecorder restRecorder, CacheActivityRecorder cacheRecorder) {
+        HttpExchangesController httpExchanges = mock(HttpExchangesController.class);
+        HttpExchangeDto tracedExchange = exchange("req-1", "GET", "/api/products", 200, "trace-abc");
+        when(httpExchanges.exchanges(null, null, null, null, null))
+                .thenReturn(new HttpExchangesReport(
+                        1, 1, 0, List.of(tracedExchange), new PageMetadata(0, 0, 0, 0, 0, false), null));
+        return new ReactiveLiveActivityController(
+                provider(httpExchanges),
+                empty(SqlTraceRecorder.class),
+                provider(restRecorder),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                provider(cacheRecorder),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+    }
+
+    private static HttpExchangeDto exchange(String id, String method, String path, int status, String traceId) {
+        return new HttpExchangeDto(
+                id,
+                Instant.now(),
+                method,
+                path,
+                null,
+                path,
+                status,
+                "2xx",
+                5L,
+                100L,
+                "127.0.0.1",
+                null,
+                null,
+                traceId,
+                List.of(),
+                List.of());
+    }
+
+    private static DataSource newDataSource() {
+        JdbcDataSource dataSource = new JdbcDataSource();
+        dataSource.setURL(
+                "jdbc:h2:mem:reactive-live-activity-controller-" + DB_COUNTER.incrementAndGet() + ";DB_CLOSE_DELAY=-1");
+        dataSource.setUser("sa");
+        dataSource.setPassword("");
+        return dataSource;
+    }
+
+    private static SwitchableActivityStore defaultActivityStore() {
+        return new SwitchableActivityStore(new InMemoryActivityStore(200));
+    }
+
+    private static ActivityPersistenceSettings disabledSettings() {
+        return persistenceSettings(false, "instance-reactive-x", Duration.ofSeconds(5));
+    }
+
+    private static ActivityPersistenceSettings enabledSettings(String instanceId, Duration captureInterval) {
+        return persistenceSettings(true, instanceId, captureInterval);
+    }
+
+    private static ActivityPersistenceSettings persistenceSettings(
+            boolean enabled, String instanceId, Duration captureInterval) {
+        return persistenceSettings(enabled, instanceId, captureInterval, 500);
+    }
+
+    private static ActivityPersistenceSettings persistenceSettings(
+            boolean enabled, String instanceId, Duration captureInterval, int bufferMaxEntries) {
+        return new ActivityPersistenceSettings(
+                enabled,
+                ActivityPersistenceSettings.DataSourceMode.SHARED,
+                null,
+                null,
+                null,
+                null,
+                "bootui_activity",
+                Duration.ofSeconds(5),
+                bufferMaxEntries,
+                Duration.ofDays(7),
+                instanceId);
+    }
+
+    private static Thread awaitThreadNamed(String name) throws InterruptedException {
+        for (int i = 0; i < 100; i++) {
+            for (Thread thread : Thread.getAllStackTraces().keySet()) {
+                if (name.equals(thread.getName())) {
+                    return thread;
+                }
+            }
+            Thread.sleep(10);
+        }
+        return null;
+    }
+
+    private static boolean awaitNotAlive(Thread thread) throws InterruptedException {
+        for (int i = 0; i < 100 && thread.isAlive(); i++) {
+            Thread.sleep(10);
+        }
+        return !thread.isAlive();
+    }
+
+    private static ReactiveLiveActivityController controller(BootUiProperties properties) {
+        return controllerWith(
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(ExceptionStore.class),
+                properties);
+    }
+
+    private static ReactiveLiveActivityController controllerWith(
+            ObjectProvider<SqlTraceRecorder> recorder,
+            ObjectProvider<RestClientTraceRecorder> restClientTraceRecorder,
+            ObjectProvider<ExceptionStore> exceptionStore,
+            BootUiProperties properties) {
+        return controllerWith(
+                recorder,
+                restClientTraceRecorder,
+                exceptionStore,
+                defaultActivityStore(),
+                disabledSettings(),
+                empty(DataSource.class),
+                properties);
+    }
+
+    private static ReactiveLiveActivityController controllerWith(
+            ObjectProvider<SqlTraceRecorder> recorder,
+            ObjectProvider<RestClientTraceRecorder> restClientTraceRecorder,
+            ObjectProvider<ExceptionStore> exceptionStore,
+            SwitchableActivityStore activityStore,
+            ActivityPersistenceSettings persistenceSettings,
+            ObjectProvider<DataSource> dataSourceProvider,
+            BootUiProperties properties) {
+        return new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                recorder,
+                restClientTraceRecorder,
+                dataSourceProvider,
+                exceptionStore,
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                empty(KafkaActivityRecorder.class),
+                empty(JmsActivityRecorder.class),
+                empty(FaultToleranceEventRecorder.class),
+                empty(RabbitActivityRecorder.class),
+                activityStore,
+                persistenceSettings,
+                properties,
+                new BootUiExposure(properties));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> empty(Class<T> type) {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(null);
+        return provider;
+    }
+
+    private static ReactiveLiveActivityController controllerWithMessaging(
+            KafkaActivityRecorder kafka,
+            JmsActivityRecorder jms,
+            RabbitActivityRecorder rabbit,
+            BootUiProperties properties) {
+        return new ReactiveLiveActivityController(
+                empty(HttpExchangesController.class),
+                empty(SqlTraceRecorder.class),
+                empty(RestClientTraceRecorder.class),
+                empty(DataSource.class),
+                empty(ExceptionStore.class),
+                empty(ScheduledTaskRunStore.class),
+                empty(ReactiveSecurityLogsController.class),
+                empty(TracesController.class),
+                empty(HealthController.class),
+                empty(EmailController.class),
+                empty(EmailCaptureService.class),
+                empty(CacheActivityRecorder.class),
+                provider(kafka),
+                provider(jms),
+                empty(FaultToleranceEventRecorder.class),
+                provider(rabbit),
+                defaultActivityStore(),
+                disabledSettings(),
+                properties,
+                new BootUiExposure(properties));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> ObjectProvider<T> provider(T value) {
+        ObjectProvider<T> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(value);
+        return provider;
+    }
+
+    private static String hashedKey(String key) {
+        KafkaActivityRecorder recorder = new KafkaActivityRecorder(true, true, 1, 16);
+        recorder.recordProduce("orders", 0, key, 0L, true, null);
+        return recorder.recent().get(0).key();
+    }
+
+    /**
+     * Properties whose Live Activity feed comes from the panel buffers, which these tests drive: the default journal
+     * source, whose journal does not record here, so the buffers serve the feed.
+     */
+    private static BootUiProperties buffersFeed() {
+        return new BootUiProperties();
+    }
+}
