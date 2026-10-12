@@ -69,6 +69,16 @@ class SqlLiteralConcatenationRuleTests {
     }
 
     @Test
+    void doesNotCountAnInListOfAnotherLengthAsAnotherText() {
+        DatabaseAdvisorRuleResultDto result = evaluate(List.of(
+                statement("select * from earnings where owner_id=? and order_id in (?) and status<>'VOIDED'"),
+                statement("select * from earnings where owner_id=? and order_id in (?,?) and status<>'VOIDED'"),
+                statement("select * from earnings where owner_id=? and order_id in (?,?,?,?) and status<>'VOIDED'")));
+
+        assertThat(result.status()).isEqualTo(DatabaseAdvisorRuleSupport.PASS);
+    }
+
+    @Test
     void neverEchoesTheConcatenatedValuesItFoundBackIntoTheReport() {
         DatabaseAdvisorRuleResultDto result = evaluate(List.of(
                 statement("select * from users where token = 'secret-token-aaa'"),

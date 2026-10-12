@@ -86,6 +86,11 @@ class McpAgentViewsTests {
         assertThat(ids(orders.get("entries"))).hasSize(15).allMatch(id -> id % 2 == 0);
         assertThat((List<?>) orders.get("topStatements")).hasSize(1);
         assertThat(orders.get("page")).isEqualTo(new PageMetadata(30, 15, 0, 100, 15, false));
+
+        String shapeId = io.github.jdubois.bootui.engine.sqltrace.SqlStatementNormalizer.shapeId(
+                io.github.jdubois.bootui.engine.sqltrace.SqlShapes.fingerprint("select * from orders"));
+        Map<String, Object> byShape = McpAgentViews.sqlTraces(report, shapeId, 100);
+        assertThat(ids(byShape.get("entries"))).hasSize(15).allMatch(id -> id % 2 == 0);
     }
 
     @Test

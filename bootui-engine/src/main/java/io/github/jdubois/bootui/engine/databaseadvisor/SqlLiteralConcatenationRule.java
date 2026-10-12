@@ -18,7 +18,7 @@ import java.util.Set;
 /** Bounded observations of different retained SQL texts with the same normalized shape and predicate literals. */
 final class SqlLiteralConcatenationRule extends AbstractDatabaseAdvisorRule {
 
-    /** Distinct raw texts of one shape needed before the shape is reported at all. */
+    /** Distinct texts (placeholder lists folded) of one shape needed before the shape is reported at all. */
     private static final int MIN_VARIANTS = 2;
 
     /** Distinct raw texts tracked per shape, bounding memory under a high-cardinality workload. */
@@ -36,7 +36,7 @@ final class SqlLiteralConcatenationRule extends AbstractDatabaseAdvisorRule {
                 "Observes distinct retained SQL texts sharing a normalized shape and containing predicate literals. "
                         + "Text differences may be in projections, comments or whitespace; this does not identify "
                         + "which part changed or why. Examines at most 500 eligible shapes in the retained SQL Trace "
-                        + "window and counts at most 64 distinct texts per shape. No SQL text is displayed.",
+                        + "window and counts at most 64 distinct texts per shape. No SQL text is displayed; the opaque shape id is accepted by the get_sql_traces query.",
                 "Review the existing SQL Trace evidence and its capture window to understand these text variations. "
                         + "Framework-generated constants and formatting differences can explain this observation; "
                         + "it does not establish a defect or prescribe a query change.",
@@ -66,8 +66,7 @@ final class SqlLiteralConcatenationRule extends AbstractDatabaseAdvisorRule {
                 continue;
             }
             byShape.computeIfAbsent(
-                            normalized.fingerprint(),
-                            key -> new ShapeEvidence(digest(key).substring(0, 16)))
+                            normalized.fingerprint(), key -> new ShapeEvidence(SqlStatementNormalizer.shapeId(key)))
                     .add(statement);
         }
         if (readableStatements == 0) {
@@ -114,8 +113,9 @@ final class SqlLiteralConcatenationRule extends AbstractDatabaseAdvisorRule {
         private void add(SqlTraceEntryDto statement) {
             executions++;
             if (rawTextHashes.size() < MAX_TRACKED_VARIANTS) {
-                // Only the hash is kept: it proves two executions differed without retaining what differed.
-                rawTextHashes.add(digest(statement.sql()));
+                // Only the hash is kept, over the text with its IN lists folded: it proves two executions differed
+                // beyond the number of bound placeholders without retaining what differed.
+                rawTextHashes.add(digest(SqlStatementNormalizer.foldPlaceholderLists(statement.sql())));
             }
         }
 

@@ -24,6 +24,8 @@ import io.github.jdubois.bootui.core.dto.StartupReport;
 import io.github.jdubois.bootui.core.dto.StartupStepDto;
 import io.github.jdubois.bootui.core.dto.TagDto;
 import io.github.jdubois.bootui.engine.journal.JournalActivityReports;
+import io.github.jdubois.bootui.engine.sqltrace.SqlShapes;
+import io.github.jdubois.bootui.engine.sqltrace.SqlStatementNormalizer;
 import io.github.jdubois.bootui.engine.support.PagedList;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -238,6 +240,14 @@ public final class McpAgentViews {
                 report.overrideCount());
     }
 
+    /** Whether {@code needle} is the shape id the Database advisor reports for {@code sql}. */
+    private static boolean matchesShapeId(String sql, String needle) {
+        return sql != null
+                && needle != null
+                && needle.length() == 16
+                && SqlStatementNormalizer.shapeId(SqlShapes.fingerprint(sql)).equals(needle);
+    }
+
     /**
      * The newest {@code limit} SQL statements matching {@code query} (in their SQL, category, call site, error, or
      * request, trace, or execution id), and the top statements matching it, with every other field of the report.
@@ -252,7 +262,8 @@ public final class McpAgentViews {
                         || PagedList.contains(entry.errorMessage(), needle)
                         || PagedList.contains(entry.requestId(), needle)
                         || PagedList.contains(entry.traceId(), needle)
-                        || PagedList.contains(entry.executionId(), needle))
+                        || PagedList.contains(entry.executionId(), needle)
+                        || matchesShapeId(entry.sql(), needle))
                 .toList();
         List<SqlTraceEntryDto> listed = newest(matched, SqlTraceEntryDto::timestamp, limit);
         List<SqlTraceGroupDto> top = report.topStatements().stream()

@@ -1,5 +1,9 @@
 package io.github.jdubois.bootui.engine.sqltrace;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Locale;
 
 /**
@@ -171,6 +175,31 @@ public final class SqlStatementNormalizer {
     private static void record(Ranges ranges, int start, int end, int kind) {
         if (ranges != null) {
             ranges.add(start, end, kind);
+        }
+    }
+
+    /**
+     * {@code sql} with only its {@code IN (?, ?, ...)} placeholder lists folded, the way the fingerprint folds
+     * them, leaving every other character as executed. Two executions that differ only in how many placeholders a
+     * bound collection expanded to therefore yield the same text.
+     */
+    public static String foldPlaceholderLists(String sql) {
+        if (sql == null) {
+            return "";
+        }
+        String source = sql.length() > MAX_SCAN_LENGTH ? sql.substring(0, MAX_SCAN_LENGTH) : sql;
+        return collapsePlaceholderLists(source);
+    }
+
+    /** The short, stable, opaque identifier of a fingerprint, as the Database advisor reports it. */
+    public static String shapeId(String fingerprint) {
+        try {
+            return HexFormat.of()
+                    .formatHex(
+                            MessageDigest.getInstance("SHA-256").digest(fingerprint.getBytes(StandardCharsets.UTF_8)))
+                    .substring(0, 16);
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("SHA-256 is required by the Java platform", ex);
         }
     }
 

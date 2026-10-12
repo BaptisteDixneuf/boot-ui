@@ -462,7 +462,9 @@ and [MySQL 8.4 fixed-point types](https://dev.mysql.com/doc/refman/8.4/en/fixed-
 
 **LOW.** Describes distinct retained SQL texts sharing a normalized shape that contains predicate literals,
 within a bounded SQL Trace observation window. It issues no new query and reports bounded counts and an
-opaque shape identifier, not captured literal values or allegedly guaranteed literal-free SQL text.
+opaque shape identifier, not captured literal values or allegedly guaranteed literal-free SQL text. Executions
+that differ only in the number of bound `IN (?, ?)` placeholders count as one text. Pass the shape id as the
+`get_sql_traces` `query` to list its statements.
 
 Changed comments, whitespace, projection constants or legitimate framework discriminator literals can
 produce variation. This does **not** establish that predicate values changed, that code concatenated input,
