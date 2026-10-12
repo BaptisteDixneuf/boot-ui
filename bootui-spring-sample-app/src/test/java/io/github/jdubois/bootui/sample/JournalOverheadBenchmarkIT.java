@@ -28,7 +28,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
  * {@code target/journal-overhead/spring-mvc-journal.properties}. Each run checks that its arm measured what it claims:
  * the journal on and recording, or off.
  *
- * <p>The target is 5 %. It only reports, never fails on the figure: timings depend on the machine, and the release
+ * <p>The target is 10 %. It only reports, never fails on the figure: timings depend on the machine, and the release
  * sign-off reads the figure from CI. {@code bootui.benchmark.passes} sets the number of pairs, 3 by default:</p>
  *
  * <pre>./mvnw -pl bootui-spring-sample-app verify -Dbootui.benchmark=true -Dit.test=JournalOverheadBenchmarkIT
@@ -37,8 +37,8 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 @EnabledIfSystemProperty(named = "bootui.benchmark", matches = "true")
 class JournalOverheadBenchmarkIT {
 
-    /** The target from §2.2 and §8: throughput with the journal on within 5 % of the same run with it off. */
-    static final double TARGET_PERCENT = 5;
+    /** The target from §2.2 and §8: throughput with the journal on within 10 % of the same run with it off. */
+    static final double TARGET_PERCENT = 10;
 
     static final String REPORT = "spring-mvc-journal";
 
@@ -93,7 +93,7 @@ class JournalOverheadBenchmarkIT {
         double highOverheadPercent = (1 - interval[0]) * 100;
         double p99On = CaptureOverheadBenchmarkTest.median(on, result -> result.percentileMillis(99));
         double p99Off = CaptureOverheadBenchmarkTest.median(off, result -> result.percentileMillis(99));
-        String verdict = overheadPercent <= TARGET_PERCENT ? "PASS" : "FAIL";
+        String verdict = verdict(overheadPercent);
         long droppedEvents = dropped.stream().mapToLong(Long::longValue).sum();
 
         StringBuilder report = new StringBuilder("# Runtime journal overhead: spring-mvc executable jar\n\n`GET ")
@@ -190,6 +190,10 @@ class JournalOverheadBenchmarkIT {
                 TARGET_PERCENT);
 
         assertThat(results).allSatisfy(result -> assertThat(result.requests()).isPositive());
+    }
+
+    static String verdict(double overheadPercent) {
+        return overheadPercent <= TARGET_PERCENT ? "PASS" : "FAIL";
     }
 
     private record Run(Result result, long droppedEvents) {}

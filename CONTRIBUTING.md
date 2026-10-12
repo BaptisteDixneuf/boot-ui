@@ -315,7 +315,7 @@ to `target/capture-overhead/`:
 ```
 
 The runtime journal overhead benchmark (`JournalOverheadBenchmarkIT`) measures the journal's own cost against
-[PLAN-v2.md](docs/PLAN-v2.md) §2.2's 5 % target: the Spring sample's executable jar, BootUI on and no agent in both
+[PLAN-v2.md](docs/PLAN-v2.md) §2.2's 10 % target: the Spring sample's executable jar, BootUI on and no agent in both
 configurations, with the journal on and with `bootui.runtime-journal.enabled=false`, on the same route and load as the
 capture overhead benchmark. Like the agent overhead benchmark below, it runs the configurations in pairs whose order
 alternates and reports each pair's throughput ratio, their median, and the median's 95 % interval, with p99 latency, to

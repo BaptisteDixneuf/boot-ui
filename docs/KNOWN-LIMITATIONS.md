@@ -145,7 +145,7 @@ These are the targets 2.0 is measured against. The measured values are recorded 
 | Path | Budget |
 | --- | --- |
 | Application thread: capture into the journal | < 2 µs p99 on a reference machine; never blocks |
-| Sample-app throughput, journal on versus off | Within 5 % |
+| Sample-app throughput, journal on versus off | Within 10 % |
 | Retained journal rows | At most the smaller of 32 MB and 5 % of the maximum heap; evictions are counted |
 | Java agent, default sensors claimed | Sample-app throughput within 10 % of the same scenario without the agent |
 | Java agent claim | Retransformation of already-loaded classes within 1 second on Spring PetClinic |
@@ -153,6 +153,11 @@ These are the targets 2.0 is measured against. The measured values are recorded 
 BootUI itself, with or without the journal, is not free: on a worst-case route that answers in about 0.7 ms, the
 Spring MVC sample sustains about 83 to 87 % of the throughput it reaches with BootUI off. Slower, realistic requests
 dilute this cost. The 2026-10-09 journal-on/off CI benchmark measured 14.1 % lower median throughput with the journal
-on for one Spring MVC sample route, against the 5 % target; its 96 % distribution-free interval for overhead was
+on for one Spring MVC sample route, against the then-current 5 % target; its 96 % distribution-free interval for overhead was
 9–16 %. This is one workload, not a general application estimate. The maintainer explicitly decided to keep the
 journal enabled by default despite this measured miss; see the [validation report](V2-VALIDATION-REPORT.md#release-sign-off).
+
+On 2026-10-12 the maintainer increased the journal throughput target to 10 %, without changing the workload or
+historical results. The latest validated source (`58e4936`, CI run `38167277335`) measured 10.1 % overhead, with a
+96.5 % interval of 8.0–12.7 % and zero reported drops, so it still misses the revised median target. This is not a
+throughput improvement or release approval; the capture-p99, memory and agent budgets remain unchanged.

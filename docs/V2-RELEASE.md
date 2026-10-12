@@ -107,6 +107,34 @@ It never pushes the temporary branch or dispatches either workflow while any pre
 A merge conflict fails the rehearsal: merge `main` into `v2` first. Prerequisites that are not done yet are reported as
 `PENDING`; `--release-day` turns them into failures.
 
+The read-only rehearsal also runs `main`'s complete release-policy test suite. On macOS this can take several
+minutes: progress remains captured until the suite exits, so a short external timeout can look like a stalled test.
+An interrupted rehearsal is incomplete, not a passing preflight or proof of a failed assertion. If an external
+timeout stopped it, preserve the log, distinguish an actual assertion failure from the timeout, and rerun the same
+read-only command with enough time for the full suite. Do not skip the maintenance-line tests or weaken a guard
+to get past a timeout.
+
+### Showcase video
+
+The homepage MP4 lives outside Git as `bootui-showcase.mp4` on a media-only GitHub Release. Each branch selects
+that release in `docs/.vuepress/showcase-video.json`: the 1.x site uses `showcase-video`, and the 2.0 site uses
+`showcase-video-v2-r2`. Keep the v1 release and asset intact. These media tags do not start with `v`, so they do not
+trigger the Maven Release workflow or count as a product version.
+
+Published media releases can be immutable. If an approved correction is needed, publish a new revisioned media
+release, such as `showcase-video-v2-r2`, and update the manifest after verifying its assets. Do not delete or move
+the previous media tag or overwrite immutable assets. A superseded render is not the final approved video.
+
+Upload only the verified final render. Commit its matching JPEG poster and English WebVTT captions at
+`docs/.vuepress/public/videos/bootui-showcase-poster.jpg` and `bootui-showcase.en.vtt` on the corresponding
+documentation branch; do not pair the new narration with old captions. Pages downloads the selected MP4 during
+the site build, fails on a missing config or asset, and checks all three assets in the generated site.
+
+Keep `pages.yml` byte-identical on `main` and `v2` as required by the rehearsal: backport the config-driven
+download step to `main` together with a manifest selecting `showcase-video`, while `v2` selects
+the approved v2 media revision. This preserves the current v1 homepage. The normal release-line gate still prevents
+deploying the v2 homepage before 2.0.0 is published; uploading a media asset is not permission to bypass that gate.
+
 ### Release sign-off format
 
 The maintainer records the decision in the single `Release sign-off` section of

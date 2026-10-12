@@ -474,9 +474,11 @@ its buffers while the console is idle (`bootui.free-on-idle`), stops only what t
 recording SQL statements, connections, transactions, REST client calls, AI calls, and security events.
 
 The journal is enabled by default. In one 2026-10-09 Spring MVC sample-route CI benchmark, its median throughput was
-14.1 % lower than with the journal disabled, against the 5 % target; zero events were dropped. This is a single
+14.1 % lower than with the journal disabled, against the then-current 5 % target; zero events were dropped. This is a single
 workload, not a universal application estimate. The maintainer decided to keep the default enabled; the
 [validation report](../V2-VALIDATION-REPORT.md#release-sign-off) records both the measurement and the exception.
+The throughput budget became 10 % on 2026-10-12. The latest validated source measured 10.1 % overhead on the same
+sample route, still above the revised target; this budget change does not alter earlier results or imply a speedup.
 
 **Recording** in the panel header opens the journal's status: the events and memory it retains against its bounds,
 when its oldest event happened, how many events each source recorded in this run, and how many were evicted or
