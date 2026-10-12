@@ -14,8 +14,8 @@ activates only in local development.
 
 Read the documentation at <https://www.julien-dubois.com/boot-ui/>.
 
-> **The `v2` branch contains BootUI 2.0**, with exact correlation, a runtime journal, Runtime Insights, run comparison,
-> and optional Java-agent instrumentation. It is not published yet: [build it locally to try it](docs/V2-EARLY-ADOPTERS.md), read its
+> **BootUI 2.0 is available on Maven Central**, with exact correlation, a runtime journal, Runtime Insights, run comparison,
+> and optional Java-agent instrumentation. Follow the [setup guide](docs/SETUP.md), read its
 > [known limitations](docs/KNOWN-LIMITATIONS.md), and share feedback in
 > [GitHub Discussions](https://github.com/jdubois/boot-ui/discussions).
 

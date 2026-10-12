@@ -1,8 +1,14 @@
 # Try BootUI 2.0 early
 
-BootUI 2.0 is built on the long-lived `v2` branch ([v2 plan](PLAN-v2.md)) and nothing from it is published before
-2.0.0. To try it on your own application, build the branch into a Maven repository of its own and point your
-application at that repository. Your regular `~/.m2` repository and the released BootUI versions stay untouched.
+::: tip BootUI 2.0 is released
+BootUI 2.0.0 is available on Maven Central. For normal installation, use [Setup](SETUP.md) and
+[Command line](CLI.md). This contributor guide records the early-adopter workflow and describes how to keep
+source builds isolated from published artifacts.
+:::
+
+BootUI 2.0 was developed on the long-lived `v2` branch ([v2 plan](PLAN-v2.md)). To test source changes on your own
+application, build the checkout into a Maven repository of its own and point your application at that repository.
+Your regular `~/.m2` repository and the released BootUI versions stay untouched.
 
 ## What 2.0 adds
 
@@ -31,8 +37,9 @@ git checkout v2
 ./mvnw -B -ntp -Dmaven.repo.local="$HOME/.m2/bootui-v2" -DskipTests install
 ```
 
-The branch still carries the 1.x version number, so the separate repository is what keeps a 2.0 build from replacing
-the released artifact of the same version in `~/.m2`. To pick up later changes, run `git pull` and the same command.
+Before publication, the branch carried the 1.x version number. A source checkout can still declare the same
+version as a published artifact, so the separate repository keeps local changes from replacing that artifact in
+`~/.m2`. To pick up later source changes, run `git pull` and the same command.
 
 ## Use it in your application
 
