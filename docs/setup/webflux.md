@@ -3,9 +3,6 @@
 BootUI's one Spring Boot starter serves Spring WebFlux applications too. It serves the same console and the same JSON
 contract as on Spring MVC, backed by the same framework-neutral engine. Only the request binding differs.
 
-Before publication, use the [locally built v2 artifacts](../V2-EARLY-ADOPTERS.md): the branch still uses the
-released line's `1.21.0` version, so Maven Central alone does not provide this unified starter.
-
 ## Prerequisites
 
 - Java 17 or later
