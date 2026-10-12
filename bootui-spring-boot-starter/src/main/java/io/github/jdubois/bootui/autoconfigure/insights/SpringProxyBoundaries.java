@@ -104,7 +104,10 @@ public final class SpringProxyBoundaries implements ProxyBoundaries {
             return Boundary.NONE;
         }
         MergedAnnotations onMethod = MergedAnnotations.from(method, SearchStrategy.TYPE_HIERARCHY);
-        MergedAnnotations onType = MergedAnnotations.from(type, SearchStrategy.TYPE_HIERARCHY);
+        // Spring never applies a class-level annotation to a private method, so only its own annotations count.
+        MergedAnnotations onType = Modifier.isPrivate(method.getModifiers())
+                ? MergedAnnotations.from(new java.lang.annotation.Annotation[0])
+                : MergedAnnotations.from(type, SearchStrategy.TYPE_HIERARCHY);
         MergedAnnotation<?> transactional = present(onMethod.get(TRANSACTIONAL), onType.get(TRANSACTIONAL));
         boolean requiresTransaction = transactional != null
                 && REQUIRING.contains(

@@ -43,6 +43,14 @@ class SpringProxyBoundariesTests {
     }
 
     @Test
+    void aPrivateMethodTakesNoBoundaryFromTheClassButKeepsItsOwnAnnotation() {
+        assertThat(boundaries.resolve(frame(ClassLevel.class, "entry"))).isEqualTo(new Boundary(true, Set.of(), false));
+        assertThat(boundaries.resolve(frame(ClassLevel.class, "helper"))).isEqualTo(Boundary.NONE);
+        assertThat(boundaries.resolve(frame(ClassLevel.class, "deadAnnotation")))
+                .isEqualTo(new Boundary(true, Set.of(), false));
+    }
+
+    @Test
     void unknownClassesAndOverloadsThatDisagreeAreNotResolvedWhileUnannotatedMethodsHaveNoBoundary() {
         assertThat(boundaries.resolve("com.example.Missing.run(Missing.java:1)"))
                 .isNull();
@@ -156,6 +164,20 @@ class SpringProxyBoundariesTests {
 
         @Transactional(propagation = Propagation.SUPPORTS)
         public void browse() {}
+    }
+
+    @Transactional
+    static class ClassLevel {
+
+        public void entry() {
+            helper();
+            deadAnnotation();
+        }
+
+        private void helper() {}
+
+        @Transactional
+        private void deadAnnotation() {}
     }
 
     @Async
