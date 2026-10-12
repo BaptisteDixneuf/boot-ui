@@ -239,8 +239,13 @@ class SignOffTests(unittest.TestCase):
         for report in (None, "# Report\n", SIGN_OFF * 2):
             self.assert_not_authorized(report)
 
-    def test_repository_report_remains_pending(self):
-        self.assert_not_authorized((ROOT / "docs/V2-VALIDATION-REPORT.md").read_text(encoding="utf-8"))
+    def test_repository_report_without_positive_decision_remains_pending(self):
+        report = (ROOT / "docs/V2-VALIDATION-REPORT.md").read_text(encoding="utf-8")
+        decisions = [line for line in report.splitlines() if line.startswith("| Decision |")]
+        self.assertEqual(len(decisions), 1)
+        for decision in ("PENDING", "HOLD"):
+            with self.subTest(decision=decision):
+                self.assert_not_authorized(report.replace(decisions[0], f"| Decision | {decision} |"))
 
 
 class ReleaseRunbookTests(unittest.TestCase):
