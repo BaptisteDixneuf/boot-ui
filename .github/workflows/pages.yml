@@ -7,9 +7,9 @@ name: Pages
 # once the artifacts are available. check-release-integrity.sh pins the gate.
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -66,15 +66,26 @@ jobs:
       - name: Check analytics consent handling
         run: npm run test:analytics
 
-      # The showcase video is too large for Git, so it lives as an asset of the non-version
-      # `showcase-video` GitHub Release and is served from Pages next to its committed poster
-      # and captions. A missing asset fails the build rather than publishing a broken player.
+      - name: Check showcase media selection
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_showcase_video.py'
+
+      # Each release line selects its media-only GitHub Release, preserving older showcase assets.
+      # The large MP4 is served from Pages next to that line's committed poster and captions.
+      # A missing config or asset fails the build rather than publishing a broken player.
       - name: Download showcase video
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release download showcase-video \
+          SHOWCASE_RELEASE="$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const { release } = JSON.parse(readFileSync("docs/.vuepress/showcase-video.json", "utf8"));
+            if (typeof release !== "string" || !/^showcase-video(?:-v[0-9]+(?:-r[1-9][0-9]*)?)?$/.test(release)) {
+              throw new Error("Invalid showcase media release");
+            }
+            console.log(release);
+          ')"
+          gh release download "$SHOWCASE_RELEASE" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern bootui-showcase.mp4 \
             --dir docs/.vuepress/public/videos \
