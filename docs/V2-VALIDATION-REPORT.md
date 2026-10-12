@@ -442,13 +442,38 @@ The maintainer explicitly accepted this measured exception: **"Yes I sign off fo
 The journal stays enabled by default. The benchmark's FAIL verdict, 10 % target, report-only enforcement,
 capture-p99 and memory bounds, agent budgets, and all historical results remain unchanged. This acceptance
 does not accept every other missed target, select a final candidate, fill the maintainer metadata, or
-authorize the overall 2.0.0 release; the release decision below remains `PENDING`.
+authorize the overall 2.0.0 release; the release decision was still `PENDING` at the time of that scoped
+exception. The maintainer's subsequent overall decision is recorded in the sign-off below.
+
+### Synced-source validation, 2026-10-12
+
+After merging `main` into `v2`, source `b113a72162d08235fce31f1d9930aa9718c2fc1b`, version `1.21.0`,
+passed all 37 jobs in its [Java 17 build](https://github.com/jdubois/boot-ui/actions/runs/38251418783)
+and all six jobs in its [JDK compatibility run](https://github.com/jdubois/boot-ui/actions/runs/38251418677),
+with no failed or skipped jobs. Its runtime and test bytes are unchanged from `60749f232`; the merge
+and subsequent commit changed only release evidence and the Docker verification runbook.
+
+The new fifteen-pair journal report measured **16.8 % median overhead against the 10 % target: Not met**,
+with a **96.5 % distribution-free interval of 10.6–20.6 %**, median p99 24.05 ms on versus 21.15 ms off,
+and zero reported drops. This materially higher measurement is separate from the maintainer's earlier
+12.1 % exception. Unchanged source does not establish that this difference is a code regression, and it
+does not prove that the difference is infrastructure noise. No retry, benchmark adjustment or target
+increase was used to replace this result. The `journal-overhead` artifact preserves the report and properties.
+
+The distinct default-agent report measured **6.6 % median overhead against its 10 % budget**, with a
+96.5 % interval of 4.2–12.4 %: **Met on the median only**, not an interval-wide bound. Opt-in sensor reports
+retain their separate results. These are sample-workload measurements, not universal overhead estimates.
+
+The read-only release rehearsal against `main` source `e1f79bbfd674479beeafad3f8e0cc5d819bc20b6` reported
+36 passes, no failures, one pending overall maintainer sign-off, and one informational post-release Pages
+policy reminder. It dispatched nothing and published nothing. Overall approval must be recorded below
+with the selected source and accepted limitations; green CI does not supply that human metadata.
 
 ## Release sign-off
 
-**Not signed off.** This section is the release decision for 2.0.0 ([v2 plan](PLAN-v2.md) §4.3). M4-20's registered
+**Maintainer sign-off recorded.** This section is the release decision for 2.0.0 ([v2 plan](PLAN-v2.md) §4.3). M4-20's registered
 rerun supplies its external-validation results; CI and separately identified supplementary measurements supply the
-other evidence. The final candidate, release decision, and maintainer signature remain pending.
+other evidence. The maintainer selected the validated source and entered the decision, rationale, name, and date below.
 Done is not passed: a measure that
 was run but missed its target is recorded as **Not met**, with its exception, never left out or rounded up. 2.0.0 is
 not released while any cell is still pending.
@@ -459,14 +484,14 @@ make the decision or supply the maintainer's signature.
 
 | Field | Value |
 | --- | --- |
-| Release candidate | TODO: `v2` commit and its BootUI version. The rerun's build: `5bd7cb76e` (version `1.19.0`, engine SHA-256 `e913e36b…`), not yet a release candidate |
+| Release candidate | `b113a72162d08235fce31f1d9930aa9718c2fc1b` (version `1.21.0`) |
 | Rerun date | 2026-10-05 (runs 09:38–10:29, time to first observation 10:53–11:23, Europe/Paris) |
 | Registered protocol | [Protocol for the rerun](#protocol-for-the-rerun), registered on 2026-10-05 (M4-20); `m4-20-protocol-2`, which superseded `m4-20-protocol-1` (see the amendment below): tag object `5f38a51affaeb11a8c35f9a1b0185d964dd23f7d`, commit `5bd7cb76eb532f1a72bf3a1ab8b018190c6214a2` |
 | Applications | Tuned: Spring PetClinic `500158f`, JHipster sample `6b000b5d`, Quarkus Super Heroes `d472e71d6`, WebFlux gateway `73b700b`, Kafka saga `a76daeb`. Holdouts: bookstore `2933f5f`, Timeless `0a90516` (pins and patches in [`validation/apps/`](https://github.com/jdubois/boot-ui/tree/v2/validation/apps)) |
 | Reviewers and adjudicator | r1 on claude-opus-5.5 and r2 on gpt-6-sol, independent and one after the other; Julien Dubois, the maintainer, adjudicated the 26 disputed rows, advised by three blind models; his coordinator agent set the recall marks under his rule, and he approved them (see [Adjudication](#adjudication)) |
 | Known limitations | [Known limitations](KNOWN-LIMITATIONS.md) audited against delivered v2 source in [#1407](https://github.com/jdubois/boot-ui/pull/1407), reviewed head `312ddf2b7572c391b2d3a728b3b78cd32888bab9`, merged as `7d72176e1e5045bf345435e4bbe4c498bd29cef0`: shipped/deferred agent scope, all-generation snapshot bounds and ownership caveat, unavailable measurements, stack-specific gaps, and workload-specific overhead remain explicit |
-| Decision | PENDING |
-| Decision rationale | TODO: maintainer decision on releasing 2.0.0, or holding it, and why |
+| Decision | APPROVE_RELEASE_2_0_0 |
+| Decision rationale | The features have been sufficiently tested, and the app is ready for being used |
 
 ### Success measures
 
@@ -476,8 +501,8 @@ One row per §2.2 measure. **Result** is the measured value; **Status** is **Met
 | --- | --- | --- | --- | --- |
 | Exact correlation | ≥ 99 % of request-thread events carry their request id on Spring MVC and Quarkus, with and without tracing; WebFlux reports its measured coverage | The concurrency scenario on the sample apps, in CI | CI run [37893526010](https://github.com/jdubois/boot-ui/actions/runs/37893526010), source `6cefe135f698cfcae75e1880f1b9229a63034613`: Spring MVC passed with tracing on and off; Quarkus passed its 100 % SQL/exception nesting floors with tracing on and off; WebFlux measured 100 % SQL/cache correlation with tracing on. Per-source evidence and limits below | **Met on the exercised sample sources**; refresh the evidence on the final candidate |
 | Capture overhead, application thread | < 2 µs p99 for the full application-thread path on a reference machine | The timed engine test | Local `JournalCaptureBudgetBenchmarkTest` (2026-10-09, JDK 27, macOS aarch64, 10 processors): snapshot, envelope, and offer p99 was 0.67 µs with one producer and 51.04 µs with eight | **Not met** at eight producers |
-| Capture overhead, throughput | Sample-app throughput within 10 % with the journal on versus off (D52, revised 2026-10-12) | The sample-app benchmark scenario, BootUI on in both runs | CI run [38229746745](https://github.com/jdubois/boot-ui/actions/runs/38229746745), source `60749f232`: 12.1 % median overhead; 96.5 % interval 8.8–16.0 %; median p99 25.81 ms on versus 23.30 ms off; zero drops. Earlier 14.1 % and 10.1 % measurements retain their own sources and verdicts above | **Not met**; maintainer accepted this measured 12.1 % exception on 2026-10-12 (one sample workload; not a universal application estimate). Overall release approval remains pending |
-| Java agent overhead | Sample-app throughput within 10 % with the default sensors claimed | The `agent-overhead` job | In CI run [37887180472](https://github.com/jdubois/boot-ui/actions/runs/37887180472), default sensors reduced median throughput by 6.0 %; 96 % distribution-free interval −1.0 to 14.9 % | **Met on the median only**; interval crosses the 10 % target |
+| Capture overhead, throughput | Sample-app throughput within 10 % with the journal on versus off (D52, revised 2026-10-12) | The sample-app benchmark scenario, BootUI on in both runs | CI run [38251418783](https://github.com/jdubois/boot-ui/actions/runs/38251418783), source `b113a7216`: 16.8 % median overhead; 96.5 % interval 10.6–20.6 %; median p99 24.05 ms on versus 21.15 ms off; zero drops. Earlier measurements retain their own sources and verdicts above | **Not met**. This fresh result is part of the report covered by the maintainer's overall decision above, not an implicit extension of the earlier 12.1 % acceptance or a claim that the target passed (one sample workload; not a universal application estimate) |
+| Java agent overhead | Sample-app throughput within 10 % with the default sensors claimed | The `agent-overhead` job | CI run [38251418783](https://github.com/jdubois/boot-ui/actions/runs/38251418783), source `b113a7216`: default sensors reduced median throughput by 6.6 %; 96.5 % distribution-free interval 4.2–12.4 %. The historical `37887180472` run measured 6.0 %, with a −1.0 to 14.9 % interval | **Met on the median only**; interval crosses the 10 % target |
 | External validity, tuned applications | ≥ 70 % of default-visible distinct facts judged actionable or informative by both reviewers, none misleading | The rerun on the five tuned applications | 7 of 20 facts (35 %) useful to both reviewers; 0 misleading after adjudication (4 judged misleading by one reviewer, all adjudicated otherwise) | **Not met** (35 % < 70 %) |
 | External validity, holdout applications | The same target, scored apart | The rerun on the two holdout applications | 3 of 11 facts (27.3 %) useful to both; 2 misleading after adjudication: the bookstore's `connections-per-request` (both reviewers) and Timeless's `ai-usage-by-route` (adjudicated) | **Not met** |
 | Agent effectiveness | Ten scripted investigations answered correctly from tool output alone, with fewer tool calls than with 1.x tools; five refusal fixtures where the right answer is not to edit | The local agent benchmark, 1.x baseline measured first | 2.0: 6 correct, 3 partial, 1 wrong, 73 calls (10 `--help`); 1.x: 6 correct, 2 partial, 2 wrong, 138 calls (20 `--help`). The refusal fixtures are not part of the registered rerun and were not rerun | **Not met** (not all ten correct) |
@@ -560,7 +585,7 @@ definition and criterion-by-criterion grades remain preserved as session artifac
 | After M1 | Exact correlation ≥ 95 % on Spring MVC and Quarkus | Passed: 100 % on every stack (M1-6f) | Recorded |
 | After M3, global | Default-visible score ≥ 30 %, otherwise every kind missing its per-kind gate folds and Runtime Insights is presented as a Live Activity view | 10 of 31 default-visible facts on the seven applications (32.3 %) useful to both reviewers | Passed: no escalation |
 | After M3, holdouts | Holdout applications no more than 20 points below the tuned ones, with the same consequence | Tuned 35 % (7 of 20), holdouts 27.3 % (3 of 11): 7.7 points below; neither holdout is empty | Passed: no escalation |
-| Before 2.0.0, overhead | Journal throughput within 10 % (D52) | Source `60749f232`, CI run `38229746745`: 12.1 % median overhead, 96.5 % interval 8.8–16.0 %. Historical 14.1 % and 10.1 % measurements retain their own sources above | **Not met**; maintainer accepted the measured 12.1 % exception and retained the default enabled. Overall release approval is still pending |
+| Before 2.0.0, overhead | Journal throughput within 10 % (D52) | Source `b113a7216`, CI run `38251418783`: 16.8 % median overhead, 96.5 % interval 10.6–20.6 %. Historical measurements retain their own sources above | **Not met**; the journal remains enabled by maintainer direction. This fresh result is included in the report covered by the overall decision, separate from the earlier 12.1 % exception |
 
 **Measuring the journal's overhead.** Both overhead rows, "Capture overhead, throughput" and "Before 2.0.0, overhead",
 read one measurement: `JournalOverheadBenchmarkIT`, a paired A/B on the Spring sample's executable jar with BootUI on
@@ -583,7 +608,7 @@ It writes `bootui-spring-sample-app/target/journal-overhead/spring-mvc-journal.m
 (`overheadPercent`, `lowOverheadPercent` and `highOverheadPercent` for the interval, `p99OnMillis`, `p99OffMillis`). Each
 run starts on a free port of its own. A loaded machine widens the interval.
 
-The latest journal result above is from CI run `38229746745` (Java 17.0.20.1, four processors); the historical
+The latest journal result above is from CI run `38251418783` (Java 17.0.20.1, four processors); the historical
 14.1 % result is from `37887180472`. Neither is a cross-application estimate:
 one Spring MVC sample route, one concurrency level, and one CI runner provide no universal application overhead
 figure. The journal remains enabled by default by explicit maintainer direction; the missed target and that exception
@@ -660,7 +685,7 @@ protocol, with who accepted it and what the release notes say.
 
 | Role | Name | Date |
 | --- | --- | --- |
-| Maintainer | TODO | TODO |
+| Maintainer | Julien Dubois | 2026-10-12 |
 
 <a id="acceptance-pass-agent-detached"></a>
 

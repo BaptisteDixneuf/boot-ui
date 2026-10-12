@@ -163,3 +163,9 @@ historical results. Source `58e4936` (CI run `38167277335`) measured 10.1 % over
 8.8–16.0 %, median p99 25.81 ms on versus 23.30 ms off, and zero reported drops. It still misses the 10 % target.
 The maintainer accepted this measured 12.1 % exception on 2026-10-12; that is not a throughput improvement,
 a universal overhead bound, or overall release approval. The capture-p99, memory and agent budgets remain unchanged.
+
+The synced source `b113a7216` (CI run `38251418783`) subsequently measured **16.8 % journal overhead**,
+with a 96.5 % interval of 10.6–20.6 %, median p99 24.05 ms on versus 21.15 ms off, and zero reported drops.
+Its runtime bytes are unchanged from `60749f232`; this difference establishes neither a code regression nor
+infrastructure noise. The 10 % target remains **Not met**, and the new result must be included in overall
+release sign-off rather than extending the earlier 12.1 % acceptance implicitly.

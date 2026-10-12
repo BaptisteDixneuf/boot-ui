@@ -481,6 +481,9 @@ The throughput budget became 10 % on 2026-10-12. Source `60749f232` subsequently
 same sample route (CI run `38229746745`, 96.5 % interval 8.8–16.0 %, zero reported drops), still above the target.
 The maintainer accepted this measured exception while retaining the journal's default; neither that acceptance nor
 the budget change alters earlier results, implies a speedup, or authorizes the overall release.
+The synced source `b113a7216` later measured 16.8 % on that workload (CI run `38251418783`, 96.5 % interval
+10.6–20.6 %, zero reported drops). The target is still not met; this new measurement remains separate from the
+earlier 12.1 % acceptance and must be covered in the overall release decision.
 
 **Recording** in the panel header opens the journal's status: the events and memory it retains against its bounds,
 when its oldest event happened, how many events each source recorded in this run, and how many were evicted or
