@@ -122,13 +122,6 @@ The request's journal profile lists them under **Handoffs**, each with its threa
 
 :::
 
-::: details Mail rows
-
-A buffer-backed `MAIL` row opens that message's detail drawer. A runtime-journal `MAIL` row has no Email-panel message
-id, so it opens the Email panel without selecting a message.
-
-:::
-
 ## The per-request profiler
 
 ![Live Activity request profile drawer: request details, runtime-journal correlation, resource use, a timeline of SQL, cache and REST calls, touched resources, and performance deep dives](../images/bootui-activity-profile.webp)
@@ -432,50 +425,6 @@ there when the run ends and read back at the next start.
 
 :::
 
-::: details Journal-rendered feed details
-
-An AI row shows its model, provider, tokens, and finish reason, nested under its request. It is an error when the call
-failed and a warning when the model stopped at its length limit.
-
-**Route** takes a route such as `GET /api/orders/{id}` and keeps its requests' children. **Run id** is the run named in
-the **Recording** status, so a restart or live reload can be isolated. **No request** keeps only work outside any request.
-These filters and the selector are hidden while durable activity storage serves the feed, because stored rows keep no run
-or request grouping and are always journal-rendered.
-
-The journal keeps no exception or log messages, principals, or email subjects, so a row shows them only while the panel
-that captured them still holds them.
-
-In the profile timeline, each item sits at its start, with a GC lane for collections that completed while the request ran.
-Where CPU, memory, and GC pauses cannot be measured, as on a virtual thread, the reason is shown. A **Hibernate** row sums
-its sessions' statements, flushes, auto-flushes, and the most entities their persistence context held.
-
-:::
-
-::: details How Work outside requests is measured
-
-The **Unclassified** remainder includes GC, JIT, and VM threads, plus threads that ended, went unread, or lacked
-consecutive CPU readings; it can include request work that could not be attributed. A first-seen or reappearing thread
-sets a baseline and never charges its lifetime CPU or allocation to one interval. Missing or decreasing allocation
-counters make that interval's allocation unknown.
-
-Process CPU always comes from the process counter. When consecutive process readings are unavailable or decrease, or
-measured thread CPU exceeds the process delta, the remainder is **Unknown**, the run's ledger stays incomplete until
-**Clear recording**, and percentage shares and the stacked bar are suppressed while measured times stay visible.
-
-:::
-
-::: details Journal overhead measurements
-
-In a 2026-10-09 Spring MVC sample-route CI benchmark, median throughput with the journal was 14.1 % lower than without it
-(zero drops), against a 5 % target. Later measurements on the same route were 12.1 % (source `60749f232`, CI run
-`38229746745`, 96.5 % interval 8.8–16.0 %) against a budget raised to 10 % on 2026-10-12, and 16.8 % (source `b113a7216`,
-CI run `38251418783`, 96.5 % interval 10.6–20.6 %). These are single-workload figures, not universal estimates. The
-maintainer kept the journal enabled by default and accepted the 12.1 % result as an exception; that acceptance does not
-cover the 16.8 % result, which the overall release decision must address. See the
-[validation report](../V2-VALIDATION-REPORT.md#release-sign-off).
-
-:::
-
 ## Safety and limits
 
 The panel inherits BootUI's safety model: loopback filter, Host allow-list, cross-site write defenses, and value masking.
@@ -534,38 +483,6 @@ audit event when both are known.
 
 For per-panel detail see [Framework support](../FRAMEWORK-SUPPORT.md).
 
-::: details How each adapter obtains a trace id and request id
-
-Both Spring adapters stamp the server-created trace id onto Actuator's trace-id-less HTTP exchange model through the
-same bounded `HttpExchangeTraceRegistry`. MVC reads the SLF4J MDC value its SQL, cache, and REST capture already use;
-WebFlux reads the active OpenTelemetry span across Reactor hops. Each record carries the request's BootUI request id, so
-an exchange BootUI's own repository recorded finds its own record and keeps its trace id and route template even when
-identical requests overlap. An exchange from an application-provided repository has no request id, so it is matched by
-method, path, and overlapping time, and reads no trace id when two identical requests overlap.
-
-On Quarkus, `quarkus-opentelemetry` stamps the active server span's trace id at each capture point (HTTP filter, REST
-Client recorder, SQL recorder, exception store, CDI security-event observer) and propagates it across the
-event-loop-to-worker hop. Trace-id matching is exact, so the profiler reports `sqlCorrelationApproximate: false`.
-
-Quarkus also stamps BootUI's request id on each exchange, SQL statement, exception occurrence, security event, REST
-client call, email, and fault-tolerance event, with or without OpenTelemetry. It travels on the request's Vert.x context to
-the worker or virtual thread that continues it, and signals nest under the request whose id they carry before the trace
-id is tried.
-
-Spring MVC stamps the same request id on each exchange and the same signals, plus cache accesses. Actuator's audit
-events have no field for it, so BootUI keeps the id current beside each published event. `RequestCorrelationFilter`
-generates it when the request starts and keeps it current on the servlet thread, including asynchronous redispatch and
-the container's `/error` dispatch.
-
-Spring WebFlux does the same without a serving thread. BootUI's reactive correlation wraps the whole HTTP handler, writes
-the request id into the Reactor context, and registers a Micrometer context-propagation accessor, so Reactor restores it
-on the event loop, `boundedElastic`, and `parallel` threads the request hops to. BootUI contributes
-`spring.reactor.context-propagation=auto` as an overridable default for this. If the application sets `limited`, or has no
-Micrometer context propagation, only the thread that assembles the request sees the id, and statements on other threads
-carry none rather than a guessed one.
-
-:::
-
 ## Live flow (service map)
 
 A compact service map sits between the KPI summary and the feed controls, served by
@@ -588,47 +505,3 @@ remote system, because BootUI has not contacted it.
 The map is keyboard navigable (arrows move between nodes, Enter or Space selects) and supports protocol and free-text
 filters plus zoom. You can minimize it for a denser event-first view; the preference is remembered in the browser.
 
-::: details Identity, caps, and what each stack draws
-
-Statement evidence is attributed to a pool only when attribution is unambiguous: exactly one configured pool and exactly
-one traced datasource whose name matches it. Otherwise statements are summarized on their own **SQL statements** node,
-the pools stay configured-only, and the reason is stated as a warning.
-
-Identity is subtractive. An HTTP dependency is only ever an origin: user-info credentials, paths, query strings, and
-fragments are dropped before serialization, and a call that cannot be reduced to a safe origin is left off the map with a
-visible warning rather than shown under a guessed identity. JDBC targets independently lose authority and Oracle
-credentials plus any driver parameter tail, even under full value exposure. SQL text, bound parameters, message keys,
-payloads, and headers never reach this contract. Cardinality is capped at 28 dependencies before rendering; anything
-withheld is reported as a visible count.
-
-Cache is a dependency on Spring MVC and WebFlux whenever at least one `CacheManager` was successfully instrumented,
-grouped by cache manager and cache name, never the key or value. An enabled recorder without an instrumented manager does
-not advertise a source that cannot receive evidence. Quarkus reports no cache dependency at all: `quarkus-cache`'s
-built-in interceptors leave no comparable seam, the same reason its feed has no `CACHE` entries.
-
-Evidence from a disabled or unavailable source panel never reaches the map. The viewport adapts to the graph's content, up
-to a bounded scrolling height.
-
-:::
-
-::: details Motion, layout, and accessibility
-
-Motion is evidence, not decoration. The map refreshes on the feed's Server-Sent Events tick and animates a particle only
-when an edge present before and after the refresh carries a new interaction id. A first load animates nothing, a new
-dependency simply appears, and an idle application is still. Bursts are coalesced to a small per-edge count and a hard
-concurrent cap. When interactions share an opaque flow id, downstream pulses replay after the inbound pulse would have
-arrived; sequencing changes pacing, never evidence.
-
-Slow interactions pulse amber for longer than normal completions or failures, with a trailing halo and a temporary
-`SLOW · 1.3 s` or `ERROR` chip, so timing does not rely on color alone. Retained failures stay in counts, details, and
-accessible text, but never leave nodes or edges permanently red.
-
-The layout is deterministic: inbound lane left, application hub centre, and a right-facing fan for up to six
-dependencies before denser maps switch to a two-column rack, bounded at 1,228 by 1,046 pixels at the 28-dependency cap
-inside the scrollable stage. Each pulse and slow trail follows the same connector route.
-
-The map carries a hidden textual list of every node and relationship for screen readers. Under `prefers-reduced-motion`,
-particles are replaced by a brief static highlight plus a polite live-region sentence naming what changed and its
-duration.
-
-:::

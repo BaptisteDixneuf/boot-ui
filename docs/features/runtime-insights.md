@@ -130,32 +130,12 @@ changed-method evidence. The table says what each counts; the drawers below hold
 
 :::
 
-::: details Observation details: Spring proxies and events
-
-- `proxy-bypass` (Spring only): a `@Transactional` method whose statement ran outside every transaction, a `@Cacheable` method whose statement ran before any access to its cache, or an `@Async` method whose statement ran on the request's own thread, named with the frame that called it. The proxy was bypassed, as by a call from inside the bean, a `private` or `final` method, or an instance created with `new`; the Architecture advisor's ARCH-SPRING-004 finds such calls in the code.
-  - Cache methods with `sync = true` or a nonblank `condition` are not judged: the synchronous miss follows the loader's SQL, and a condition can skip cache access. `unless` only vetoes the later put and remains judgeable; other annotations on the method still count.
-  - Not applicable with AspectJ weaving or on Quarkus, whose ArC intercepts self-invocation.
-- `transactional-listener-skipped` (Spring): a `@TransactionalEventListener` that never ran because its event was published with no transaction active, from one event. Not applicable on Quarkus, where CDI notifies a transactional observer at once.
-- `after-commit-writes` (Spring): timed JDBC INSERT, UPDATE, or DELETE statements run by an effectively after-commit, after-rollback, or after-completion listener outside every recorded transaction that began within it. No-transaction fallback execution is excluded. With thread-bound transactions, writes can join resources whose transaction already finished; timing does not prove whether a write committed.
-
-:::
-
 ::: details Observation details: anonymous access
 
 - `anonymous-data-reach`: successful requests an authorization decision proved anonymous that wrote a table, per route and table, including every captured statement of a JDBC batch. A confidently identified INSERT INTO, UPDATE, DELETE FROM, or MERGE INTO target excludes SELECT, subquery, and FROM source tables. Ambiguous dialect forms such as multi-table writes retain lexical candidates, not proven writes; CTE-headed statements are not parsed. Quarkus Hibernate statements are captured on preparation, so their targets are named as unverified preparations, never proven writes; with Hibernate evidence hidden, they are omitted and timed JDBC writes remain. Anonymous reads and authenticated writes produce no finding; requests whose anonymity is unproven are outside the eligible count. Intended public writes such as sign-up or contact forms still produce a fact to verify, and each row says not to add authorization from it alone.
 - `anonymous-success-on-restricted-route`: 2xx answers to proven-anonymous requests on a route whose rules this run saw deny another anonymous caller or require an authority: "a successful anonymous response, not proof that the rule is wrong".
 - Both checks use only proven anonymity on every stack. With the required sources recorded and visible but no request proving anonymity, they report an **INSUFFICIENT** check with zero eligible requests, not invented anonymous requests or per-route findings. A missing required source makes the check **NOT_APPLICABLE**.
 - Anonymous-write evidence counts **captured DML texts**, not affected rows or prepared-batch executions. Plain JDBC statement batches retain at most five previews, each truncated at 256 characters; prepared batches retain one SQL text. A truncation may hide targets, so every finding states the capture limits and the check explicitly flags requests with possibly truncated SQL. Truncation-marked captures yield candidates only, including later previews recovered after a truncated literal. Unparsed hash syntax, nested or executable block comments, and DELETE … USING also prevent exact write claims. Proven targets and ambiguous lexical candidates stay in separate findings.
-
-:::
-
-::: details Observation details: JVM, AI, agent-backed checks
-
-- `gc-inflated-latency`: the share of a route's slowest tenth of requests, at least five, during which a stop-the-world pause completed, against the share of its other requests, with the pauses' total. Pauses join requests by collector and collection id, never by time, and are worded "a pause completed during", never "caused by".
-- `heap-growth-after-gc`: old-generation occupancy after the full or mixed collections that reclaimed it, rising across the run from three such collections. The Memory panel links to it and to `gc-inflated-latency`. It is never called a leak, since a warming cache rises too before it levels off.
-- `ai-usage-by-route`: AI operations per route, job, or listener: model calls per request, tokens, input that grew by half or more across a request's model calls, and length-limited answers. Two calls in one request, the shape of a tool call and its answer, are not called growth. Spring AI's model observation and Quarkus LangChain4j's chat listener stamp each call with its request when it is made, so no tracing is needed; GenAI spans received over OTLP fill in what they do not report, without counting a call twice. Each route shows the tier its calls were linked by, and only calls joined from GenAI spans carry the trace-id limitation.
-- `work-after-response`: work a request handed to a JDK executor that was still running once its response started, and that ran SQL, called a REST service, sent or received a message, or failed, from one request. Needs the [BootUI agent](java-agent.md)'s `executors` sensor, and is not applicable, with the reason, unless the agent is attached and armed for the application, the sensor is installed and not disabled, and BootUI attached its handoffs to the claim. A task that recorded nothing, such as a library's housekeeping, is never counted.
-- `changed-code-not-executed`: per class, the methods changed or added since the previous run that the agent tracked and that nothing executed in this run, worded "your change has not run yet". Its check names the declared routes mapped to the changed methods, by their own HTTP method and path, or says no route is known to be mapped to them, as when another class's handler of the same name may inherit it, since Spring and Quarkus name an inherited handler by its concrete class; never another route of the class. The routes that executed the class's other methods are listed among its limitations. It reads [Code Inventory](java-agent.md#code-inventory): it needs the [BootUI agent](java-agent.md)'s `inventory` sensor and a previous run of the application kept in this JVM, and is not applicable, with the reason, without either, or while the Code Inventory panel is disabled. A changed method that executed, or one the agent could not track, is never reported.
 
 :::
 
@@ -219,35 +199,6 @@ naming what is missing, and a source that dropped events marks its findings **pa
 - A new drop refreshes the report, coverage, and observation details even before another event is dispatched. A drop can hide a finding or make one appear, such as a statement whose transaction or cache access was dropped, so a partial finding is never read as a floor.
 - A request or execution that started before an event the journal evicted or **Clear recording** removed may be missing some of its own events, so it is left out whole, with a limitation counting it, rather than judged on what was left of it. This includes a failed or slow request the journal kept in its reserved share after its routine events were evicted: its exception and response stay in Live Activity, but Runtime Insights no longer judges it.
 - When BootUI changed something during the window, the report names it among its limitations, and a finding whose evidence names the logger, cache, or key that a change targeted says so.
-
-:::
-
-::: details Limits: disabled panels
-
-Disabling a panel that opens a request, job, or message leaves out that whole unit and any trace-only AI call uniquely
-owned by it. Checks confined to HTTP requests say **not applicable** when HTTP exchanges are disabled, but do not blame
-a hidden job or message they never examine. Checks that can also count jobs or messages name only the disabled opening
-panels for the kinds of work they examine, or say **not applicable** when none of those units remain visible. On
-Quarkus, when the journal records ORM but the Hibernate panel is disabled, `safe-method-dml` leaves out unverified
-prepared writes, names that limitation, and still counts timed JDBC executions.
-
-:::
-
-::: details Limits: SQL provenance and retries
-
-SQL capture retains explicit **execution**, **preparation**, or **unknown** provenance from its feeder. In particular,
-Quarkus Hibernate's statement inspector observes preparations only: an event-loop preparation is not confirmed JDBC
-blocking, even when it carries the request's identity and monotonic timestamp. Confirmed blocking, repeated SELECTs,
-observed table access, and after-response JDBC work require execution provenance. Zero-duration executed JDBC remains
-eligible; neither duration nor the `PREPARED` statement type establishes provenance. Preparation rows remain visible in
-the journal timeline with no measured duration and an explicit qualification. Write-preparation findings remain
-separate, qualified facts rather than proof of executed writes.
-
-Recovery attribution requires a recorded terminal success for the same policy name, type, and target after its retry, or
-a successful fallback. Each failed attempt matches at most one earlier exception of its reported class on the same
-thread; this is bounded evidence, not causal proof. Logs, failed downstream calls, and root rollbacks remain in the
-unrecovered group, and a request can appear in both groups. The current Spring retry feeders report retries and
-exhaustion but not terminal success, and Quarkus reports breaker transitions, so these alone never establish recovery.
 
 :::
 
@@ -333,15 +284,6 @@ available, comparison reports **Unavailable**, with the baseline file as the rem
 
 :::
 
-::: details Comparison rules: allocation, ORM, routes, and restarts
-
-- Allocation compares a bounded histogram's median, not its mean; summaries from the previous codec remain readable but cannot supply an allocation median or execution aggregates.
-- Hibernate flushes and entities in the persistence context are compared per request or execution when both runs' start facts record the ORM source, including flush counts changing to or from zero. Entity counts still require measured persistence-context sizes in both runs. If only one run recorded ORM events, a limitation explains that zero assumes its capture listener was active: an application-provided `hibernate.session.events.auto` listener can prevent BootUI from recording sessions. Legacy summaries without both runs' source settings require ORM events in both runs.
-- For HTTP routes, the share of 4xx and 5xx answers and the memory allocated per request are compared, each once the route served 3 requests in both runs. New exceptions and routes are listed from their first occurrence.
-- Restart cost is compared only between immediately adjacent restarts in the same JVM, never with a cold start or a baseline file, and on Spring. Quarkus's `StartupEvent` supplies no complete live-reload duration or reload start timestamp; restart cost explicitly reports this limitation instead of estimating it.
-
-:::
-
 ## Change impact
 
 **Change impact** answers "what does my change reach?" for a route, a bean, a class, a repository, a table, a cache, or an
@@ -367,16 +309,6 @@ cannot be read, the impact says so rather than listing nothing.
 - A handler method, such as `ProductController#list` or `com.example.ProductController#list`, narrows the impact to the routes mapped to it, so the class's other routes appear only when they share what it touched. A method no route is mapped to is reported not found rather than widened to its class, and the class name alone still checks the whole bean.
 - With the BootUI agent's `code-paths` sensor, any application method can be named, as `OrderService#total`, `OrderService.total(long)`, or `OrderService#total(J)J` for one overload (without parameters, every overload counts as one method). Its observed routes become those whose requests' own call trees ran it, read from each route's tree at any depth, the first request, executor work the agent followed, and fragments that arrived after their tree settled included, or the route of the first request Code Inventory saw run it. They are never composed from the calls observed across requests, and each lists how many of its requests ran the method, marked **partial** when its trees folded methods away or a late fragment arrived after its tree was forgotten.
 - The routes that reach its bean are then split: those with no traffic are listed as **Reaches it, but didn't run it**. Those that ran without their call trees showing it are listed apart, **ran without showing it**, with why that proves nothing (a private, static, or lambda method the sensor does not time, a method it excluded, trees still settling, requests without a tree, an assembly-only handler). A route that ran joins them only when Code Inventory saw the method never run in this run.
-
-:::
-
-::: details Change impact limits
-
-- Route traffic is counted over the whole run even when its request has left the journal's retained evidence; shared resources and example request ids still depend on retained events.
-- When the route-count limit is exceeded, a route without retained evidence is not claimed to be unexercised: `notExercisedUndetermined` marks the list incomplete instead of claiming every mapped route ran.
-- Disabled source panels leave their facts out and are named in the limitations only when relevant evidence was recorded. When HTTP Exchanges is disabled, change impact cannot classify traffic at all.
-- Symbol suggestions reuse a policy-filtered projection until the journal or panel policy changes.
-- HTTP journal capture being off, dropped HTTP completions, or **Clear recording** also make whole-run absence unknown: the impact and the app-wide unexercised-route list do not call an absent route unexercised. Positive observed routes remain usable, including a completion that straddled a clear; its missing pre-clear work is not treated as zero.
 
 :::
 
@@ -412,21 +344,3 @@ This tab shows how the run's events were linked to requests, the checks that did
 this run**: the application's declared routes that no request of this run reached, so nothing in the panel is mistaken
 for a verdict on a route that never ran.
 
-::: details How not-exercised routes are read
-
-Framework endpoints, such as the error controller, Actuator, and Quarkus's own extension and `/q/` endpoints, and
-catch-all patterns are left out. An application whose packages start with `io.quarkus`, such as the Quarkus samples,
-keeps its routes. Spring WebFlux routes, annotated or functional, are read from Actuator's mappings like Spring MVC's.
-When the declared routes cannot be read, as without Actuator's mappings endpoint, the report says so among its
-limitations instead of listing no route. While the HTTP Exchanges panel is disabled, or the journal does not record HTTP
-requests, no route is listed and a limitation says why, since which routes were reached is that panel's evidence.
-
-:::
-
-::: details Copy for AI after a failed refresh
-
-When a refresh cannot reload the open observation's evidence, the panel says so, keeps the earlier evidence marked as
-from an earlier refresh, and closes an open **Copy for AI** preview and turns **Copy for AI** off until a refresh
-succeeds.
-
-:::
