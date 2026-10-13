@@ -4769,6 +4769,21 @@ const activityServiceMap = {
   warnings: []
 }
 
+const activityJournalProfile = {
+  available: true,
+  route: 'GET /api/sample/products',
+  durationMicros: 1240000,
+  timeline: [
+    {source: 'SQL', label: 'select … from products', detail: '6 statements', offsetMillis: 12, durationMicros: 48000},
+    {source: 'CACHE', label: 'sample-products', detail: 'miss', offsetMillis: 70, durationMicros: null},
+    {source: 'REST', label: 'inventory.internal', detail: '200', offsetMillis: 130, durationMicros: 410000}
+  ],
+  resources: {availability: 'AVAILABLE', cpuNanos: 310000000, allocatedBytes: 18400000, gcPauses: 1, segments: 3},
+  routeComparison: {requests: 64, p50Micros: 101000, p95Micros: 480000, minimumRequests: 20, standing: 'ABOVE_P95'},
+  touched: {tables: ['products'], caches: ['sample-products'], restCalls: ['inventory.internal']},
+  notes: []
+}
+
 const activityProfile = {
   available: true,
   unavailableReason: null,
@@ -6293,6 +6308,39 @@ const screenshots = [
       await page.getByRole('heading', {name: /^What the routes and executions did/}).waitFor()
     }
   ],
+  [
+    'activity',
+    'Live Activity',
+    'bootui-activity-profile.webp',
+    async (page) => {
+      await page.getByText('GET /api/sample/products').first().waitFor()
+      await page
+        .locator('tr', {hasText: 'GET /api/sample/products'})
+        .first()
+        .getByRole('button', {name: /Profile/})
+        .click()
+      await page.getByRole('dialog', {name: 'Request profile'}).waitFor()
+    }
+  ],
+  [
+    'runtime-insights',
+    'Runtime Insights',
+    'bootui-runtime-insights-profile.webp',
+    async (page) => {
+      await page.getByRole('tab', {name: /JFR profile/}).click()
+      await page.getByRole('tabpanel').first().waitFor()
+    }
+  ],
+  [
+    'runtime-insights',
+    'Runtime Insights',
+    'bootui-runtime-insights-coverage.webp',
+    async (page) => {
+      await page.getByRole('tab', {name: /Coverage & limits/}).click()
+      await page.getByRole('heading', {name: 'How this run was linked'}).waitFor()
+      await page.getByRole('heading', {name: 'Checks and their limits'}).waitFor()
+    }
+  ],
   ['traces', 'Traces', 'bootui-traces.webp', waitForText('/api/chat')],
   ['log-tail', 'Log Tail', 'bootui-log-tail.webp', waitForText('Started BootUI sample application')],
   [
@@ -6827,6 +6875,7 @@ async function handleApiRoute(route) {
   const endpoint = decodeURIComponent(url.pathname.replace(/^\/bootui\/api\/?/, ''))
 
   if (endpoint === 'overview') return fulfillJson(route, isQuarkusPlatform ? quarkusOverview : overview)
+  if (/^activity\/request\/[^/]+\/journal$/.test(endpoint)) return fulfillJson(route, activityJournalProfile)
   if (endpoint === 'github' || endpoint === 'github/refresh') return fulfillJson(route, github)
   if (endpoint === 'panels')
     return fulfillJson(route, {

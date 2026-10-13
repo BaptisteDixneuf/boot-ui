@@ -81,10 +81,10 @@ A ✅ node has shipped. The BootUI 2.0 milestones that use each item are specifi
 | —     | Command-line endpoint, `bootui` CLI, and Command Line panel                | 1.16.0     | [Command Line](features/developer-tools.md#command-line), [CLI](CLI.md)              |
 | 3.17  | MySQL operational view, tested on Oracle MySQL 8.4 LTS                     | 1.18.0     | [MySQL](features/database.md#mysql)                                                  |
 | 3.19  | Structured violation locations in advisor findings                         | Unreleased | [Violation locations](features/advisors.md#violation-locations)                      |
-| 3.20a | Shared profile assembler with REST client and cache evidence               | Unreleased | [Per-request profiler](features/overview.md#the-per-request-profiler)                |
+| 3.20a | Shared profile assembler with REST client and cache evidence               | Unreleased | [Per-request profiler](features/live-activity.md#the-per-request-profiler)           |
 | 3.22  | Route performance rankings in HTTP Exchanges                               | Unreleased | [Route rankings](features/diagnostics.md#route-rankings)                             |
 | 3.24a | Failure-preserving retention in HTTP Exchanges, SQL Trace, and REST Client | Unreleased | [Failure-preserving retention](features/diagnostics.md#failure-preserving-retention) |
-| 3.25  | Agent-ready profiles and exception export in Live Activity and Exceptions  | Unreleased | [Copy profile and Copy for AI](features/overview.md#copy-profile-and-copy-for-ai)    |
+| 3.25  | Agent-ready profiles and exception export in Live Activity and Exceptions  | Unreleased | [Copy profile and Copy for AI](features/live-activity.md#copy-profile-and-copy-for-ai) |
 | 3.27  | Log exposure policy for Log Tail and Dev Services                          | Unreleased | [Log message exposure](features/diagnostics.md#log-message-exposure)                 |
 
 Earlier deliveries were removed from this plan when they shipped; `CHANGELOG.md` records every release. The MySQL panel

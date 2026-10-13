@@ -5,7 +5,7 @@ straight to a panel by name.
 
 | Group | Panels | What it answers |
 | ----- | ------ | --------------- |
-| [Home](./overview.md) | Scorecard · Live Activity · Runtime Insights | Is my app healthy, and what did it just do? |
+| [Home](./scorecard.md) | Scorecard · Live Activity · Runtime Insights | What should I fix first, what did my application just do, and what did this run do that no single panel shows? Each panel has its own page: [Scorecard](./scorecard.md), [Live Activity](./live-activity.md), [Runtime Insights](./runtime-insights.md). |
 | [Advisors](./advisors.md) | Architecture · REST API · Spring · Quarkus · Database · Hibernate · Memory · Security · Pentesting · Vulnerabilities | What is wrong with my app, and how do I fix it? |
 | [Runtime](./runtime.md) | Health · HTTP Sessions · Metrics · Live Memory · JVM Tuning · Heap Dump · Threads · Startup Timeline · GraalVM · CRaC | How is the JVM behaving right now? |
 | [Configuration](./configuration.md) | Configuration · Profile Diff · Loggers · Beans · Conditions · Mappings | What configuration and wiring is actually effective? |

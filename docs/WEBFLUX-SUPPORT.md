@@ -426,7 +426,7 @@ The runtime datasource switch shares MVC and Quarkus's journal admission: an abs
 HTTP `409` before schema or store mutation, while configured startup capture may still wait for journal injection.
 A successful switch owns one subscriber writing directly to the candidate durable store before it is published.
 Capture-start failure leaves in-memory storage active and reports that schema verification may already have created
-the table ([Durable history](features/overview.md#durable-history)).
+the table ([Durable history](features/live-activity.md#durable-history)).
 
 | Panel         | Reactive source                                                                                                          |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -436,7 +436,7 @@ the table ([Durable history](features/overview.md#durable-history)).
 
 The original four — HTTP Exchanges, SQL Trace, Exceptions, and Security Logs — are already captured reactively by the
 panels in §6.2/§6.3. The six additional entry types (see
-[Live Activity](features/overview.md#feed-types)) reuse the same framework-neutral engine buffers regardless of
+[Live Activity](features/live-activity.md#feed-types)) reuse the same framework-neutral engine buffers regardless of
 stack, because their capture wiring (`BootUiEngineConfiguration`) is gated purely on classpath/bean presence, never on
 `ConditionalOnWebApplication`:
 

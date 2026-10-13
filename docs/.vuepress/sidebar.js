@@ -48,7 +48,9 @@ const sidebarLabels = {
 
 const featureDocs = [
   'features/README.md',
-  'features/overview.md',
+  'features/scorecard.md',
+  'features/live-activity.md',
+  'features/runtime-insights.md',
   'features/advisors.md',
   'features/runtime.md',
   'features/configuration.md',
