@@ -44,7 +44,7 @@ give the details.
   ("The Live Activity persistence poller is removed" under Removed). A custom `TraceIdProvider` becomes a
   `CorrelationContextProvider` (under Removed).
 - Durable Live Activity history no longer keeps principals, exception or log messages, or email subjects; the live
-  panels still show them ([Durable history](docs/features/overview.md#durable-history)).
+  panels still show them ([Durable history](docs/features/live-activity.md#durable-history)).
 - The new BootUI agent is optional. When attached, it turns on its default sensors; the others are opt-in, and an
   unknown id in `bootui.agent.sensors` stops the application's start
   ([Java Agent](docs/features/java-agent.md#configuration)).
@@ -102,7 +102,7 @@ give the details.
   their hooks are reinstalled, so Runtime Insights does not compare that run for them ([Java Agent](docs/features/java-agent.md#switching-sensors-at-run-time)).
 - **Side effects in the run comparison.** With the BootUI agent, Runtime Insights' comparison lists the hosts,
   files, processes, and variable names a route, job, or startup newly uses or no longer uses, for sensors that recorded
-  both runs whole ([Runtime Insights](docs/features/overview.md#runtime-insights)).
+  both runs whole ([Runtime Insights](docs/features/runtime-insights.md)).
 - **Agent guidance for the BootUI agent.** MCP instructions check `get_agent_status` first and read an
   agent-gated `NOT_APPLICABLE` as not measured; `verify_after_change` and the skill add verify-then-probe.
 - **Request input reaching a sink.** Opt-in Security sinks rows show a request parameter reaching SQL, a
@@ -132,7 +132,7 @@ give the details.
   decorators. Runtime Insights names first among its limitations what the journal cannot record: R2DBC statements on
   Spring (also stated up front in the WebFlux documentation), and Kafka Streams processing when Kafka Streams is on the
   classpath, on Spring MVC, Spring WebFlux, and Quarkus. No new observation kind ([Runtime
-  Insights](docs/features/overview.md#runtime-insights)).
+  Insights](docs/features/runtime-insights.md)).
 - **Known limitations of 2.0.** A [Known limitations](docs/KNOWN-LIMITATIONS.md) page lists what 2.0 does not do, per
   stack (R2DBC statements not recorded on WebFlux, no transaction capture on Quarkus, and the panels each stack lacks),
   the BootUI Java agent's shipped and still-planned scope, and the overhead budget. The validation report gains a
@@ -163,7 +163,7 @@ give the details.
   in the comparison, on Spring MVC, Spring WebFlux, and Quarkus; `get_runtime_impact` takes the method form,
   `get_runtime_run_comparison` leads with `codeChanges`, and the `verify_after_change` prompt checks each changed
   method's impact. Without the agent, only handler methods are checked and the comparison is unchanged
-  ([Runtime Insights](docs/features/overview.md#runtime-insights)).
+  ([Runtime Insights](docs/features/runtime-insights.md)).
 - **Runtime reach in the Vulnerabilities panel.** With the BootUI agent's `inventory` sensor, the Vulnerabilities panel
   gains a **Runtime reach** column and filter: per dependency, whether its jar's classes loaded in this JVM (with how
   many in this run and the first route), whether a class its advisory names loaded (**Named class loaded**), **Not
@@ -520,7 +520,7 @@ give the details.
 - **Runtime Insights leads with its verdict.** The panel opens on how many things this run lists to check and how many
   the default list leaves out. Findings are one list filtered by theme,
   whose rows open in place; the comparison and change impact, the resource profiler, and the run's coverage and check
-  limits move to tabs of their own ([Runtime Insights](docs/features/overview.md#runtime-insights),
+  limits move to tabs of their own ([Runtime Insights](docs/features/runtime-insights.md),
   [#1328](https://github.com/jdubois/boot-ui/pull/1328)).
 
 - **Tabs that look like tabs, in every theme.** Every panel tab strip now shares one component, with muted labels
@@ -528,7 +528,7 @@ give the details.
 
 - **A shorter Runtime Insights default list.** Some kinds move to the panels showing the same evidence or appear only
   on request, each row saying where, and five wording and attribution bugs are fixed
-  ([Runtime Insights](docs/features/overview.md#runtime-insights)).
+  ([Runtime Insights](docs/features/runtime-insights.md)).
 - **Seven Maven Central artifacts instead of thirteen; one Spring Boot starter for Spring MVC and WebFlux.** BootUI
   2.0 publishes `bootui-engine`, `bootui-ui`, `bootui-spring-boot-starter`, `bootui-quarkus`,
   `bootui-quarkus-deployment`, `bootui-cli`, and `bootui-agent`. To migrate:
@@ -568,7 +568,7 @@ give the details.
   collection and heap rows are reached from the Memory panel, which counts them and opens the **Memory** theme with
   every row. **Show all routes**, a search, a deep link, and the agent query `all` (formerly a plain text search), a
   kind, or a route still reach every row, which says why it was left out ([Runtime
-  Insights](docs/features/overview.md#runtime-insights)).
+  Insights](docs/features/runtime-insights.md)).
 - **The documentation site and the Docker Hub sample images follow the released major.** Every branch declares its
   release line in `.github/release-line`, and `pages.yml` and `docker-publish.yml` publish a branch only when its line
   has a release on Maven Central and no newer major does, so merging `v2` into `main` publishes no 2.0 site or image
@@ -610,7 +610,7 @@ give the details.
   `bootui.activity.persistence.enabled=true`, persisted rows now contain the journal's `MASKED` view rather than
   polling panel buffers. They no longer retain principals, exception or log messages, or email subjects. **Migration:**
   use the bounded live panels when those details are needed; durable history retains safe summaries and metadata
-  ([Live Activity](docs/features/overview.md#durable-history)).
+  ([Live Activity](docs/features/live-activity.md#durable-history)).
 
 - **Faster, quieter CI builds.** The per-extension Quarkus integration-test modules and the three Spring Playwright
   suites now run on parallel runners instead of competing with the coverage build or running back to back. Surefire
@@ -620,7 +620,7 @@ give the details.
 - **The sidebar's pinned top is now Home: Scorecard, Live Activity, and Runtime Insights.** The Overview panel is
   renamed **Scorecard**, which is what it shows, at `#/scorecard`; `#/overview` and the root still land there. Its
   `overview` panel id, `bootui.panels.overview.*` properties, `GET /bootui/api/overview`, and the `get_overview` tool
-  are unchanged. GitHub moves to the Developer tools group ([Home](docs/features/overview.md),
+  are unchanged. GitHub moves to the Developer tools group ([Home](docs/features/scorecard.md),
   [GitHub](docs/features/developer-tools.md#github)).
 
 - **The MySQL panel reads every Oracle MySQL version instead of only 8.4.** It previously skipped every server outside
@@ -850,21 +850,21 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
 - **Diagnostic acknowledgements stay honest.** Comparisons qualify outside-JVM evidence, mutation reads cannot restore
   stale state, malformed acknowledgements report unknown outcomes, and MCP panel refusals preserve their policy reason.
 - **Durable history requires a running capture.** The datasource action fails before switching storage when capture
-  cannot run ([Durable history](docs/features/overview.md#durable-history)).
+  cannot run ([Durable history](docs/features/live-activity.md#durable-history)).
 - **MVC push streams recover after reconnect.** Disconnecting the last subscriber cancels its pending flush without
   blocking later subscriptions, and stale scheduler callbacks cannot consume a new generation's update.
 - **Resource sampler interval accounting.** Thread baselines prevent lifetime charges, and incomplete CPU ledgers show
-  measured times without misleading shares ([Live Activity](docs/features/overview.md#live-activity)).
+  measured times without misleading shares ([Live Activity](docs/features/live-activity.md)).
 - **Agent sensor lifecycle.** Reclaims during release preserve bean instrumentation, and failed class restoration prevents
   reinstallation ([Java Agent](docs/features/java-agent.md#claims-and-lifecycle)).
 - **Incomplete runs no longer invent absent work.** Capture gaps yield partial comparisons and unknown unexercised
   routes without hiding reliable observations ([#1418](https://github.com/jdubois/boot-ui/pull/1418)).
 - **Transactional-event fallback is immediate execution.** Spring listeners running without a transaction no longer
-  produce false writes-after-commit findings ([Runtime Insights](docs/features/overview.md#runtime-insights)).
+  produce false writes-after-commit findings ([Runtime Insights](docs/features/runtime-insights.md)).
 - **WebSocket execution profiles open from retained handlers.** Visible inbound anchors now show their recorded work by
-  execution id, while hidden, missing, and outbound anchors stay unavailable ([Profiles](docs/features/overview.md#the-per-request-profiler)).
+  execution id, while hidden, missing, and outbound anchors stay unavailable ([Profiles](docs/features/live-activity.md#the-per-request-profiler)).
 - **Diagnostic state stays current.** Late reads cannot undo sensor switches or repopulate old activity queries,
-  and invalid action replies report an unknown outcome ([Live Activity](docs/features/overview.md#live-activity)).
+  and invalid action replies report an unknown outcome ([Live Activity](docs/features/live-activity.md)).
 - **SQL preparation is not confirmed JDBC execution.** Quarkus ORM inspection no longer manufactures blocking,
   execution counts, or observed table access ([SQL Trace](docs/features/database.md#sql-trace)).
 - **CLI failures are not successful answers or policy skips.** Empty tool replies, wrong targets, and outages now
@@ -978,7 +978,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   defines. Then it records no application event, and says so: `transactional-listener-skipped` and
   `after-commit-writes` report `UNAVAILABLE` with the reason, Runtime Insights, change impact, and the run comparison
   name it among their limitations, and the run's comparability facts leave the `app-event` source out, on Spring MVC
-  and Spring WebFlux ([Runtime Insights](docs/features/overview.md#runtime-insights)).
+  and Spring WebFlux ([Runtime Insights](docs/features/runtime-insights.md)).
 - **Runtime Insights no longer judges a request that lost events to eviction or a clear.** A request or execution that
   started before an event the runtime journal evicted, could not fit, or cleared (**Clear recording** while it ran) was
   projected with only the events it kept, so `proxy-bypass` reported a `@Cacheable` method as bypassed when the
@@ -990,7 +990,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   recording cleared and the ring overflowing at every point, and each stack, SQL capture, source, and panel missing;
   every kind passes it, including the four kinds held out of the default list until it did, which the list therefore now shows, and a container's `ERROR`
   written after a request left out this way is not counted in Framework warnings' **No request** row
-  ([Runtime Insights](docs/features/overview.md#runtime-insights)).
+  ([Runtime Insights](docs/features/runtime-insights.md)).
 - **A method probe reported active catches a class loaded right after.** A probe was marked active just before its
   transformer was registered, so a class its run loaded in that gap ran unprobed, and the probe waited for an
   invocation that had already happened. The transformer is now registered first, and its advice records nothing until
@@ -1037,7 +1037,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   the feed, and no `source` is sent, because stored rows are always journal-rendered. A persisted page whose rows are all
   hidden now reads "No visible rows on this page" beside **Load older activity** instead of "No activity recorded yet".
   The prompt inventory now names all four MCP prompts including `verify_after_change`, and the runtime journal page says
-  the BootUI agent propagates raw executors and `CompletableFuture` ([Live Activity](docs/features/overview.md#durable-history)).
+  the BootUI agent propagates raw executors and `CompletableFuture` ([Live Activity](docs/features/live-activity.md#durable-history)).
 - **Code Inventory and Code Paths honor a disabled HTTP Exchanges panel.** Code Inventory, its API, and
   `get_code_inventory` no longer show the first request and route that ran a method, and `changed-code-not-executed`
   names no route, while HTTP Exchanges is disabled; Code Paths, its API, `get_code_paths`, and the handler split of
@@ -1050,7 +1050,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   change impact, and run comparison attribute DML writes only to exact lexical targets rather than read-side tables;
   older run summaries do not compare incompatible table edges. Transactions held across captured AI calls are detected
   alongside REST calls without double-counting a nested transport call
-  ([Runtime Insights](docs/features/overview.md#runtime-insights); follow-up to #1230).
+  ([Runtime Insights](docs/features/runtime-insights.md); follow-up to #1230).
 - **Clear recording and trace-only AI route attribution.** Runtime-journal offers now stamp and enqueue atomically
   against **Clear recording**, so an application event cannot be offered after a clear returns with the previous
   recording's generation and then disappear. AI calls imported with only a trace id now use the same bounded,
@@ -1066,7 +1066,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   samples and hot frames to the wrong route. An ordinary response was already attributed correctly, because the
   worker writes it itself and the request is taken inline on that thread. A suspended chain — a blocking method
   returning a `Uni` or a `CompletionStage`, a `Multi`, SSE — releases its worker at a point Quarkus 3.33 exposes no
-  hook for, and stays attributed to that worker until the request is taken ([Runtime Insights](docs/features/overview.md#runtime-insights)). ([#1239](https://github.com/jdubois/boot-ui/pull/1239))
+  hook for, and stays attributed to that worker until the request is taken ([Runtime Insights](docs/features/runtime-insights.md)). ([#1239](https://github.com/jdubois/boot-ui/pull/1239))
 
 - **Runtime Insights completeness and zero-ORM comparisons.** Drops of scheduled, messaging, and WebSocket
   completion events now mark observations that examine those executions partial, while disabled optional evidence
@@ -1090,7 +1090,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   **Profile resources** lists no per-route row; each says why. On Quarkus, Live Activity no longer adds Security Logs
   principals, exception messages, email details, or buffered requests and SQL while their panel is disabled. Durable
   history no longer shows a stored principal under `METADATA_ONLY`, and its search no longer matches text masked or
-  withheld on read, on Spring MVC, Spring WebFlux, and Quarkus ([Live Activity](docs/features/overview.md#durable-history)). ([#1237](https://github.com/jdubois/boot-ui/pull/1237))
+  withheld on read, on Spring MVC, Spring WebFlux, and Quarkus ([Live Activity](docs/features/live-activity.md#durable-history)). ([#1237](https://github.com/jdubois/boot-ui/pull/1237))
 
 - **Work after the response.** Follow-up to [#1218](https://github.com/jdubois/boot-ui/pull/1218):
   task-body completion restores fast late-starting tasks and earlier SQL followed by long-running
@@ -1101,7 +1101,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
 - **Runtime Insights error and connection evidence.** A recovered retry or fallback no longer hides unrelated errors
   in a successful request. Connections held together now use the known pool maximum and the corrected first possible
   hold-and-wait concurrency estimate. Exception checks follow captured subclasses and causes rather than only the
-  top-level wrapper ([Runtime Insights](docs/features/overview.md#runtime-insights)). ([#1234](https://github.com/jdubois/boot-ui/pull/1234))
+  top-level wrapper ([Runtime Insights](docs/features/runtime-insights.md)). ([#1234](https://github.com/jdubois/boot-ui/pull/1234))
 - **Runtime Insights agent list.** `requests` counts completed HTTP exchanges only: zero is not proof the run was idle
   when an observation names a request or execution, retained scheduled runs or consumed messages, or evicted events
   say otherwise. A run-level observation with no exemplar, such as heap growth after one collection, does not. The
@@ -1116,7 +1116,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   off; per-request SELECT tracking is capped and uses the same literal-free fingerprints for live and persisted N+1
   badges, replacing the least frequent shape when full so a later repeated SELECT remains detectable; and persisted
   activity pages scan past rows hidden by a disabled panel
-  while keeping a continuation cursor ([Live Activity](docs/features/overview.md#durable-history);
+  while keeping a continuation cursor ([Live Activity](docs/features/live-activity.md#durable-history);
   follow-up to #1216).
 
 - **The Java agent's self-test checks every hook on its own, and its report matches what runs.** A thread pool's
@@ -1158,7 +1158,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   this application cannot serve, such as Security Logs on a Quarkus application without
   `quarkus.security.events.enabled`, now names what would make it available instead of reporting the panel as disabled
   or the evidence as insufficient. The panel's evidence stays out of the projection either way
-  ([Runtime Insights](docs/features/overview.md#runtime-insights)). ([#1224](https://github.com/jdubois/boot-ui/pull/1224))
+  ([Runtime Insights](docs/features/runtime-insights.md)). ([#1224](https://github.com/jdubois/boot-ui/pull/1224))
 
 - **Quarkus reports application-event publications as unrecorded.** Quarkus records which observers ran but not who
   fired the event, so a change impact that reaches code only through an event now says so in its limitations, rather
@@ -1185,7 +1185,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   writes. Truncated batch literals no longer hide later previews; truncation, uncertain comments, and DELETE … USING
   never produce exact write claims. Possible batch truncation is explicit. The anonymous-access documentation now describes intended public
   writes and unproven anonymity honestly
-  ([Runtime Insights](docs/features/overview.md#runtime-insights)). ([#1230](https://github.com/jdubois/boot-ui/pull/1230))
+  ([Runtime Insights](docs/features/runtime-insights.md)). ([#1230](https://github.com/jdubois/boot-ui/pull/1230))
 
 - **Late runtime-journal events keep their request attribution.** AI exports, managed-executor work, SQL, exceptions,
   connection releases, authorization decisions, and ORM sessions that finish after the HTTP response now update the
@@ -1256,7 +1256,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   every exposure mode, including in kept runs and the baseline file; legacy fingerprints are sanitized on read,
   and masking-indistinguishable groups retain summed counts and histograms
   ([#1222](https://github.com/jdubois/boot-ui/pull/1222),
-  [Run comparison](docs/features/overview.md#runtime-insights)).
+  [Run comparison](docs/features/runtime-insights.md)).
 
 - **Runtime Insights no longer reports what it could not see.** From the 2.0 validation run
   ([report](docs/V2-VALIDATION-REPORT.md)): `route-time-breakdown` stops calling time "application code" when a request
@@ -1448,7 +1448,7 @@ These removals ship with BootUI 2.0.0, from the `v2` branch.
   structural label but dropping free text under `METADATA_ONLY`, and are read only while the panel that owns them is
   enabled. Runtime Insights quote a statement's literal-free shape, never its grouping fingerprint, which kept MySQL
   double-quoted strings and a truncated dollar quote verbatim. Applies on Spring MVC, Spring WebFlux, and Quarkus
-  ([Live Activity safety](docs/features/overview.md#safety-and-limits),
+  ([Live Activity safety](docs/features/live-activity.md#safety-and-limits),
   [#1216](https://github.com/jdubois/boot-ui/pull/1216)).
 - **Trace data now follows the value-exposure policy.** `GET /bootui/api/traces/{id}`, the trace embedded in the
   per-request profile (`GET /bootui/api/activity/request/{id}`), and their `get_request_profile` MCP tool and

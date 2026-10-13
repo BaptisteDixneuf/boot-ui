@@ -336,7 +336,7 @@ correlation tier, and coverage limits. A 2xx alone is not success.
 **Optional challenge:** issue two bounded overlapping reads and verify their captured SQL belongs to the correct
 request, or inspect a scheduled execution rather than pretending all work is HTTP.
 
-**References:** [Runtime journal](../docs/features/overview.md#runtime-journal),
+**References:** [Runtime journal](../docs/features/live-activity.md#runtime-journal),
 [diagnostics](../docs/features/diagnostics.md), [database](../docs/features/database.md).
 
 ### 04 - Explain behavior with Runtime Insights (25 minutes)
@@ -371,7 +371,7 @@ Scorecard penalty.
 **Checkpoint:** two observations with a concrete verification step and a counterexample, plus one explicit limitation
 or unexercised route.
 
-**References:** [Runtime Insights](../docs/features/overview.md#runtime-insights),
+**References:** [Runtime Insights](../docs/features/runtime-insights.md),
 [known limitations](../docs/KNOWN-LIMITATIONS.md).
 
 ### 05 - Look inside application code (25 minutes)
@@ -459,7 +459,7 @@ remain unapproved.
 A better overall score is not an acceptance criterion.
 
 **References:** [Assessment workflow](../docs/AI-AGENTS.md#assess-an-application-and-approve-an-action-plan),
-[advisors](../docs/features/advisors.md), [change impact](../docs/features/overview.md#runtime-insights).
+[advisors](../docs/features/advisors.md), [change impact](../docs/features/runtime-insights.md).
 
 ### 07 - Coding-agent fix and change verification (35 minutes)
 

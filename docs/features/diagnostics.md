@@ -31,7 +31,7 @@ started before the clear cannot restore old traces; newly captured traces in the
 
 Spans are stored as captured, and every read applies the live `bootui.expose-values` and `bootui.mask-secrets` policy,
 so a runtime change takes effect on the next read without a restart. The same rule covers `GET /bootui/api/traces/{id}`,
-the trace embedded in the [per-request profile](overview.md#the-per-request-profiler), and the `get_request_profile` MCP
+the trace embedded in the [per-request profile](live-activity.md#the-per-request-profiler), and the `get_request_profile` MCP
 tool and `bootui request-profile` command on Spring MVC, Spring WebFlux, and Quarkus:
 
 - **Status messages and exception events.** A span's status message and its `exception.message` and
@@ -127,7 +127,7 @@ withheld its message.
 The Exceptions panel captures exceptions thrown by the running application and groups repeated failures into one entry
 with an occurrence count.
 
-Exception groups per route, from the runtime journal, are in [Runtime Insights](overview.md#runtime-insights)
+Exception groups per route, from the runtime journal, are in [Runtime Insights](runtime-insights.md)
 (`exception-hotspots`), which does not list them by default; this panel links to them, and the link opens Runtime Insights with
 every row shown.
 
@@ -254,7 +254,7 @@ statement with N+1 groups and the call sites that issued them.
 The full document is shown before anything is copied, with a list of what it leaves out, such as masked values, a
 message withheld under `METADATA_ONLY`, bounded frames or occurrences, or why no correlated SQL could be added.
 Preparing it reads only the existing Live Activity feed and profile endpoints; the copy itself sends nothing and
-changes no state. It renders through the same helper as the [profile drawer's export](overview.md#copy-profile-and-copy-for-ai),
+changes no state. It renders through the same helper as the [profile drawer's export](live-activity.md#copy-profile-and-copy-for-ai),
 so captured text cannot break the Markdown, and identical evidence reads identically on every stack.
 
 ## HTTP Exchanges
@@ -301,7 +301,7 @@ The share is 25% of each buffer by default. Set `bootui.http-exchanges.reserved-
 to evict strictly oldest first. A slow threshold of `0` disables slow classification for that buffer, so only failures
 are reserved.
 
-With [Live Activity durable history](overview.md#durable-history) on, persistence recognizes a reserved record by the
+With [Live Activity durable history](live-activity.md#durable-history) on, persistence recognizes a reserved record by the
 same rule and slow threshold as the buffer that holds it, including a slow `4xx` request, which Live Activity shows as
 `WARN` rather than `SLOW`. A reserved record that newer entries pushed out of the stream and that later reappears is
 therefore not stored twice. Persistence remembers each kind of entry separately, so a burst of another kind, such as a
@@ -320,7 +320,7 @@ evicted first, and BootUI's own requests are hidden at read time instead. In bot
 managed by the application.
 
 Every exchange carries the route it belongs to, shown under its path when the two differ, and a **Profile** link that
-opens the request's profile in [Live Activity](overview.md#the-per-request-profiler). WebFlux and Quarkus require an
+opens the request's profile in [Live Activity](live-activity.md#the-per-request-profiler). WebFlux and Quarkus require an
 exact request id or an unambiguous trace id for a buffer-backed profile and explain when neither is available.
 
 Every exchange also carries BootUI's own `requestId`, generated when the request starts, whether or not OpenTelemetry

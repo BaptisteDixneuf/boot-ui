@@ -231,6 +231,8 @@ function parseFrameworkSupportQuarkusGaps(markdown) {
   return {notApplicable, notYet: new Set([notYet[1]])}
 }
 
+const HOME_PAGES = ['scorecard.md', 'live-activity.md', 'runtime-insights.md']
+
 function sidebarGroupRoutes(groupTitle) {
   const group = [HOME_NAVIGATION_GROUP, ...NAVIGATION_GROUPS].find((candidate) => candidate.title === groupTitle)
   return group ? namedRoutes.filter((route) => route.meta.group === group.key) : []
@@ -497,7 +499,9 @@ describe('routes', () => {
 
       // Each panel's section in the group page follows the sidebar order. A title can head both the page and a
       // section (Configuration), so only its first heading counts.
-      const page = readRepositoryFile(path.join('docs/features', row.file))
+      // The Home group spans one page per panel; every other group is a single page.
+      const pageFiles = row.group === 'Home' ? [...new Set([row.file, ...HOME_PAGES])] : [row.file]
+      const page = pageFiles.map((file) => readRepositoryFile(path.join('docs/features', file))).join('\n')
       const panelTitles = new Set(expectedPanels)
       const headings = [
         ...new Set(

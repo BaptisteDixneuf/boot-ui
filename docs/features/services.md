@@ -60,7 +60,7 @@ unlike SQL Trace there are two failure counters:
 A **Most frequent calls** table groups calls by method, host, and normalized path, and flags high-frequency groups as
 _chatty_. Rows filter by HTTP method, a slow-only toggle, or free text, and each expands for full detail. Local-only
 **Pause**, **Resume**, and **Clear** actions stop recording or empty the buffer without removing instrumentation.
-Pausing stops only this panel's buffer: the [runtime journal](overview.md#runtime-journal) keeps recording calls.
+Pausing stops only this panel's buffer: the [runtime journal](live-activity.md#runtime-journal) keeps recording calls.
 **Clear** empties the retained window — the entries, the aggregate stats, and the top calls — and resets nothing else:
 the header's "captured since startup" count and the evictions are lifetime counts. Over MCP and the CLI, the controls
 answer with a [compact acknowledgement](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls) instead of the
@@ -259,7 +259,7 @@ received message, through BootUI's `WebSocketHandlerAdapter`; on Quarkus, each `
 call. `bootui.websockets.enabled=false` turns it off with the panel's capture.
 
 A retained, completed inbound handler can also be opened by execution id in a
-[journal-backed profile](overview.md#the-per-request-profiler), with its recorded SQL, exceptions, and other enabled-panel
+[journal-backed profile](live-activity.md#the-per-request-profiler), with its recorded SQL, exceptions, and other enabled-panel
 work. The WebSockets panel must remain enabled; missing or hidden anchors never produce a profile from children alone.
 This does not extend capture to later asynchronous completion or add frame/session support on any stack.
 
@@ -292,7 +292,7 @@ The AI Framework panel summarizes Spring AI and LangChain4j activity from the Op
 observability emits. It groups chat client and chat model spans by conversation, showing request count, token usage for
 prompt, completion, and total, latency, model, and the prompt and response snippet when content capture is configured.
 
-AI calls and tokens per route, from the runtime journal, are in [Runtime Insights](overview.md#runtime-insights)
+AI calls and tokens per route, from the runtime journal, are in [Runtime Insights](runtime-insights.md)
 (`ai-usage-by-route`), which does not list them by default; this panel links to them, and the link opens Runtime Insights with
 every row shown.
 

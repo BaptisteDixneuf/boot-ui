@@ -305,7 +305,7 @@ user; BootUI's own panel and read-only gates still apply.
   `get_http_routes` returns the [HTTP Exchanges route rankings](features/diagnostics.md#route-rankings): per method and
   route template, request and status-class counts, p50/p95/p99 and maximum duration, share of request time, and the
   evidence window they cover; its optional `limit` is the number of routes each ranking criterion contributes.
-  `get_live_activity` returns the correlated feed the [Live Activity panel](features/overview.md#live-activity) shows (HTTP requests, SQL
+  `get_live_activity` returns the correlated feed the [Live Activity panel](features/live-activity.md) shows (HTTP requests, SQL
   statements, exceptions, and security events grouped by request/trace); `get_request_profile` takes the required `id`
   of a profileable request, scheduled run, or consumed message (also an insight exemplar). It returns a selection
   with `source: "journal"`, `"buffers"`, or `"none"`; a retained journal `journal` profile is preferred,
@@ -392,7 +392,7 @@ previewed with what it omits before anything reaches the clipboard. It sends not
 
 ### Runtime Insights for agents
 
-[Runtime Insights](features/overview.md#runtime-insights) answers what this run did that no single panel shows. Its four
+[Runtime Insights](features/runtime-insights.md) answers what this run did that no single panel shows. Its four
 read tools return short, stable facts rather than a dashboard:
 
 | Tool | CLI | Returns |

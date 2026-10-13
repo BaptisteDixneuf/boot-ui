@@ -11,7 +11,7 @@ The Database Connection Pools panel inspects supported JDBC pool beans. It is re
 borrows a connection, or resizes a pool, and it fails closed when no supported pool implementation or pool bean is
 present.
 
-The connections each request held at once, from the runtime journal, are in [Runtime Insights](overview.md#runtime-insights)
+The connections each request held at once, from the runtime journal, are in [Runtime Insights](runtime-insights.md)
 (`connections-per-request`), which does not list them by default; this panel links to them, and the link opens Runtime Insights with
 every row shown.
 
@@ -496,7 +496,7 @@ Executions are retained in a bounded buffer, most recent first, alongside aggreg
 maximum time, slow-query and failure counts, per-category counters, and evictions. A configurable slow-query threshold
 highlights expensive statements, and local-only **Pause**, **Resume**, and **Clear** actions stop recording or empty
 the buffer without unwrapping the data source. Pausing stops only this panel's buffer: the
-[runtime journal](overview.md#runtime-journal) keeps recording statements and connections.
+[runtime journal](live-activity.md#runtime-journal) keeps recording statements and connections.
 **Clear** empties the retained window — the entries, the aggregate stats, and the top statements — and resets nothing
 else: the header's "captured since startup" count and the evictions are lifetime counts. Over MCP and the CLI, the
 controls answer with a [compact acknowledgement](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls)
@@ -689,7 +689,7 @@ The panel renders a parent and child tree, so a root transaction's nested calls 
 row expands to its thread, trace id, read-only flag, and any error. Configurable slow-transaction and
 connection-hold-time thresholds flag transactions worth a closer look, and local-only **Pause**, **Resume**, and
 **Clear** actions stop recording or empty the buffer without deregistering the listener. Pausing stops only this
-panel's buffer: the [runtime journal](overview.md#runtime-journal) keeps recording transactions.
+panel's buffer: the [runtime journal](live-activity.md#runtime-journal) keeps recording transactions.
 **Clear** empties the retained window — the entries and the aggregate stats — and resets nothing else: the header's
 "captured since startup" count and the evictions are lifetime counts. Over MCP and the CLI, the controls answer with a
 [compact acknowledgement](../AI-AGENTS.md#compact-answers-from-scans-and-capture-controls) instead of the panel.

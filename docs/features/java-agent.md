@@ -1683,7 +1683,7 @@ its requests took, not of what a change can reach. Change impact by method reads
 route counts, per method, the requests whose tree ran it, at any depth and before its tree folds methods into Other
 nodes, the first request and executor work included, at most 4,096 methods per route and 200,000 per run; a fragment
 that arrives after its request's tree was merged amends its route rather than opening a second tree, and a route whose
-trees may miss methods says so ([Change impact](overview.md#runtime-insights)).
+trees may miss methods says so ([Change impact](runtime-insights.md)).
 
 `get_code_paths` and `bootui code paths` return at most `limit` (10) routes matching `query` (a route, or part of a
 route or of a method its requests ran), slowest warm median first, each with its top methods; for a single route, its
@@ -1822,7 +1822,7 @@ How it works:
   read, makes the scan partial (failed when nothing could be read), so its methods are never reported as removed. While the scan runs,
   or after it failed, the **Changed** tab says so rather than "no previous run", and nothing is compared.
 - The previous run's method hashes are kept across restarts in the same JVM, at most 1 MB a run (12 bytes a method),
-  per application, beside the run summaries of [run comparison](overview.md). Only classes both scans covered are
+  per application, beside the run summaries of [run comparison](runtime-insights.md). Only classes both scans covered are
   compared. When another application claimed the agent in between, the panel says the runs are mixed. A full JVM
   restart, or BootUI itself loaded by the restart class loader, keeps no previous run, which the panel says too.
 - Which methods executed comes from the agent's hit flags, exactly, and the first request, route, and time from its
@@ -1873,7 +1873,7 @@ that a switchable sensor's section (`files`, `environment`, `thread-activity`, `
 switch](#switching-sensors-at-run-time), an action of the Java Agent panel shown while that panel is enabled,
 with `bootui.agent.sensors` as the other way to turn it on or off.
 
-Runtime Insights' [run comparison](overview.md#runtime-insights) reads these rows too: under **Outside the JVM**, it
+Runtime Insights' [run comparison](runtime-insights.md) reads these rows too: under **Outside the JVM**, it
 lists the hosts, file patterns, processes, and variable names a route, a job, or startup uses now and did not in the
 previous run, or no longer uses, for each sensor that recorded the whole of both runs.
 

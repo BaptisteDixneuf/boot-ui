@@ -73,7 +73,7 @@ makes outbound calls to OSV.dev.
 scanning again. On Quarkus, the `spring` tools run and read the Quarkus application advisor.
 
 **Runtime Insights reads** — `get_runtime_insights`, `get_runtime_insight`, `get_runtime_impact`, and
-`get_runtime_run_comparison`: the [Runtime Insights](overview.md#runtime-insights) report, one observation, change
+`get_runtime_run_comparison`: the [Runtime Insights](runtime-insights.md) report, one observation, change
 impact, and the run comparison, compacted for agents, with `INSUFFICIENT` and `NOT_COMPARABLE` never read as success.
 
 **Diagnostics reads** — `get_live_activity`, `get_request_profile`, `get_exceptions`, `get_exception_detail`,
@@ -82,11 +82,11 @@ impact, and the run comparison, compacted for agents, with `INSUFFICIENT` and `N
 `get_http_exchanges`, `get_http_routes`, and
 `get_rest_client_traces`. `get_live_activity` returns the correlated feed of HTTP requests, SQL statements, exceptions,
 security events, scheduled-task runs, messaging, and the other retained journal signal types described in
-[Live Activity](overview.md#feed-types), grouped by request or execution id; the panel-buffer fallback uses its
+[Live Activity](live-activity.md#feed-types), grouped by request or execution id; the panel-buffer fallback uses its
 available exact ids and, on MVC, the documented weaker tiers.
 `get_request_profile` takes a profileable request or execution id and returns a selection with `available`,
 `unavailableReason`, `source`, `journal`, and `buffers`. It consults the retained journal first; when an HTTP exchange
-is also retained, `buffers` carries the richer [per-request profile](overview.md#the-per-request-profiler), including
+is also retained, `buffers` carries the richer [per-request profile](live-activity.md#the-per-request-profiler), including
 each exception's `exceptionGroupId`. An unknown, cleared, or expired id returns an explicit tool error rather than a successful empty profile.
 `source: "none"` instead accompanies an unavailable selection, such as evidence hidden by panel policy or an
 uncorrelatable request.

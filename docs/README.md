@@ -23,8 +23,8 @@ features:
     linkText: Advisor catalog
   - title: Diagnostics toolbox
     details: Follow Live Activity, inspect Runtime Insights, compare application runs, and drill into traces, log tail, exceptions, and HTTP exchanges.
-    link: /features/overview
-    linkText: Activity and Runtime Insights
+    link: /features/live-activity
+    linkText: Live Activity and Runtime Insights
   - title: Database insight
     details: Inspect connection pools, PostgreSQL and MySQL vital signs, SQL traces, Hibernate statistics, transactions, Spring Data repositories, Flyway, and Liquibase.
     link: /features/database

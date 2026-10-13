@@ -16,7 +16,7 @@ Question: What remains after the buffers or process end?
 
 The runtime datasource switch is not automatically persisted to configuration. The sample's H2 database is
 in-memory, so it does **not** demonstrate survival across full JVM stops. To prove that, use an intentionally prepared
-persistent datasource and [documented history settings](../features/overview.md#durable-history), then verify its rows.
+persistent datasource and [documented history settings](../features/live-activity.md#durable-history), then verify its rows.
 
 A `bootui.runtime-journal.baseline-file` stores a prior **run summary**, not complete history. A same-JVM Code Inventory
 method-change comparison is a third mechanism; a baseline file cannot restore it after a process stop.

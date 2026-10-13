@@ -414,7 +414,7 @@ from source — the [Traces panel's aggregator topology](../docs/features/diagno
 the Quarkus app's own Traces panel, which keeps recording its own spans in-process independently, and it is
 disabled in the published Quarkus Docker image, which has no Spring app nearby.
 
-> **Why not the Live Activity panel?** [Live Activity](../docs/features/overview.md#live-activity) reads one JVM's
+> **Why not the Live Activity panel?** [Live Activity](../docs/features/live-activity.md) reads one JVM's
 > runtime journal by default and supplements its rows with retained local panel details. There is no API for one BootUI instance to pull or receive
 > another instance's Live Activity stream, and BootUI never forwards that raw data off-process (a stated
 > non-goal). The Traces panel's OTLP aggregator topology above is the supported mechanism for seeing

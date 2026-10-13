@@ -227,7 +227,7 @@ not how many checks could not run, because limitations can be aggregated or capp
 
 Advisor panels use neutral score colors. The Scorecard restores green, amber, and red at the 80 and 50 thresholds to
 help prioritize review, without changing eligibility or implying application safety. See
-[Scorecard](overview.md#scorecard) for its own eligibility policy.
+[Scorecard](scorecard.md) for its own eligibility policy.
 
 #### Dependency findings
 
