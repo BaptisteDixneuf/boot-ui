@@ -201,6 +201,16 @@ function itemTitle(item) {
       <h4 class="h6 small text-muted mb-1">Timeline</h4>
       <p v-if="!timeline.length && !gcPauses.length" class="small text-muted">No work of this request was recorded.</p>
       <ol v-else class="list-unstyled small mb-2 request-journal__timeline">
+        <li class="request-journal__row request-journal__ruler" aria-hidden="true">
+          <span>Source</span>
+          <span>Work</span>
+          <span class="request-journal__ticks">
+            <span>0</span>
+            <span>{{ formatDuration(durationMillis * 500000) }}</span>
+            <span>{{ formatDuration(durationMillis * 1000000) }}</span>
+          </span>
+          <span class="text-end">Time</span>
+        </li>
         <li v-for="(item, index) in timeline" :key="index" class="request-journal__row">
           <span class="request-journal__source">{{ item.source }}</span>
           <span class="request-journal__label" :title="item.label">
@@ -292,17 +302,57 @@ function itemTitle(item) {
 </template>
 
 <style scoped>
+.request-journal__timeline {
+  border: 1px solid var(--bootui-border);
+  border-radius: var(--bootui-radius-sm);
+  overflow: hidden;
+  font-size: 0.8125rem;
+}
+
 .request-journal__row {
   display: grid;
-  grid-template-columns: 6rem minmax(0, 1fr) 30% 9rem;
-  gap: 0.5rem;
+  grid-template-columns: 4.5rem minmax(0, 1fr) 34% 6.5rem;
+  gap: 0.75rem;
   align-items: center;
-  padding: 0.15rem 0;
-  border-bottom: 1px solid var(--bootui-border);
+  min-height: 2rem;
+  padding: 0.2rem 0.75rem;
+  border-bottom: 1px solid var(--bootui-border-subtle, var(--bootui-border));
+  transition: background-color 0.12s ease;
+}
+
+.request-journal__row:last-child {
+  border-bottom: 0;
+}
+
+.request-journal__row:not(.request-journal__ruler):hover {
+  background: var(--bootui-surface-alt);
+}
+
+.request-journal__ruler {
+  min-height: 0;
+  padding-block: 0.375rem;
+  background: var(--bootui-surface-alt);
+  border-bottom-color: var(--bootui-border);
+  color: var(--bootui-text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.request-journal__ticks {
+  display: flex;
+  justify-content: space-between;
+  font-weight: 500;
 }
 
 .request-journal__source {
+  justify-self: start;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--bootui-radius-pill);
+  background: var(--bootui-surface-alt);
+  border: 1px solid var(--bootui-border);
   font-family: var(--bs-font-monospace);
+  font-size: 0.6875rem;
   color: var(--bootui-text-muted);
 }
 
@@ -314,21 +364,30 @@ function itemTitle(item) {
 
 .request-journal__track {
   position: relative;
-  height: 0.6rem;
-  background: var(--bootui-surface-alt);
-  border-radius: var(--bootui-radius-xs);
+  height: 1.25rem;
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--bootui-border-subtle, var(--bootui-border)) 0,
+    var(--bootui-border-subtle, var(--bootui-border)) 1px,
+    transparent 1px,
+    transparent 50%
+  );
 }
 
 .request-journal__bar {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: 0.3rem;
+  bottom: 0.3rem;
+  min-width: 3px;
   background: var(--bootui-green-dark);
   border-radius: var(--bootui-radius-xs);
 }
 
 .request-journal__bar--instant {
+  top: 0.15rem;
+  bottom: 0.15rem;
   width: 2px;
+  min-width: 2px;
 }
 
 .request-journal__bar--slow,
@@ -346,8 +405,18 @@ function itemTitle(item) {
 }
 
 .request-journal__when {
-  color: var(--bootui-text-muted);
+  color: var(--bootui-text);
   text-align: end;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .request-journal__row {
+    transition: none;
+  }
 }
 
 .request-journal__slow {

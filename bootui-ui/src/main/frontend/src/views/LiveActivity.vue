@@ -14,6 +14,7 @@ import RequestCodePath from './components/RequestCodePath.vue'
 import RequestJournalProfile from './components/RequestJournalProfile.vue'
 import RuntimeJournalStatus from './components/RuntimeJournalStatus.vue'
 import RuntimeResources from './components/RuntimeResources.vue'
+import TraceWaterfall from './components/TraceWaterfall.vue'
 import {formatBytes, formatClockTime, formatMillis, formatNumber} from '../utils/format.js'
 import {formatLoadError} from '../utils/loadError.js'
 import {panelProps, usePanelState} from '../utils/panelState.js'
@@ -1791,11 +1792,7 @@ function toggleFlow() {
 
             <section v-if="profile.trace && profile.trace.spans.length" class="mb-3">
               <h3 class="h6">Trace waterfall</h3>
-              <ul class="list-unstyled small mb-0">
-                <li v-for="(span, index) in profile.trace.spans" :key="index">
-                  <code>{{ span.name }}</code>
-                </li>
-              </ul>
+              <TraceWaterfall :spans="profile.trace.spans" compact />
             </section>
 
             <section v-if="profile.notes.length || tiersNote">

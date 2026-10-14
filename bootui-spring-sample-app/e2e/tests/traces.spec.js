@@ -86,7 +86,7 @@ test.describe('Traces view', () => {
 
     await page.getByRole('button', {name: 'Open'}).click()
     await expect(page.locator('.trace-drawer')).toContainText(traceId)
-    await expect(page.locator('.waterfall-row')).toHaveCount(2)
+    await expect(page.locator('.waterfall-span')).toHaveCount(2)
     await expect(page.locator('.trace-drawer')).toContainText('SELECT sample_products')
   })
 
