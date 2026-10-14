@@ -13,6 +13,7 @@ import PanelHeader from './components/PanelHeader.vue'
 import PanelSkeleton from './components/PanelSkeleton.vue'
 import ReadOnlyNotice from './components/ReadOnlyNotice.vue'
 import SpinnerButton from './components/SpinnerButton.vue'
+import TraceWaterfall from './components/TraceWaterfall.vue'
 
 const props = defineProps(panelProps)
 const {readOnly, readOnlyReason} = usePanelState(props)
@@ -118,29 +119,13 @@ const filteredTraces = computed(() => {
   )
 })
 
-const waterfall = computed(() => {
-  if (!detail.value || !detail.value.spans || detail.value.spans.length === 0) return null
-  const spans = [...detail.value.spans]
-  const minStart = spans.reduce((m, s) => Math.min(s.startEpochNanos, m), spans[0].startEpochNanos)
-  const maxEnd = spans.reduce((m, s) => Math.max(s.endEpochNanos, m), spans[0].endEpochNanos)
-  const totalNanos = Math.max(maxEnd - minStart, 1)
-  const sorted = spans
-    .map((s) => ({
-      ...s,
-      offsetPct: ((s.startEpochNanos - minStart) / totalNanos) * 100,
-      widthPct: Math.max((s.durationNanos / totalNanos) * 100, 0.5)
-    }))
-    .sort((a, b) => a.startEpochNanos - b.startEpochNanos)
-  return {spans: sorted, totalNanos}
+const traceSummary = computed(() => {
+  const spans = detail.value?.spans
+  if (!spans || spans.length === 0) return null
+  const start = Math.min(...spans.map((s) => s.startEpochNanos))
+  const end = Math.max(...spans.map((s) => s.endEpochNanos))
+  return {count: spans.length, totalNanos: Math.max(end - start, 1)}
 })
-
-function spanColor(span) {
-  if (span.statusCode === 'ERROR') return 'bg-danger'
-  if ((span.kind || '').includes('SERVER')) return 'bg-primary'
-  if ((span.kind || '').includes('CLIENT')) return 'bg-info'
-  if ((span.kind || '').includes('PRODUCER') || (span.kind || '').includes('CONSUMER')) return 'bg-warning'
-  return 'bg-secondary'
-}
 
 function attrValue(span, key) {
   const attr = (span.attributes || []).find((a) => a.key === key)
@@ -310,10 +295,10 @@ const {autoRefresh, loading, load, loadAfterCurrent} = useAutoRefresh(fetchTrace
                       </div>
                       <div class="card-body">
                         <div v-if="detailLoading" class="text-muted small">Loading spans…</div>
-                        <template v-else-if="waterfall">
+                        <template v-else-if="traceSummary">
                           <div class="text-muted small mb-2">
-                            {{ waterfall.spans.length }} span{{ waterfall.spans.length === 1 ? '' : 's' }} · total
-                            {{ formatDuration(waterfall.totalNanos) }}
+                            {{ traceSummary.count }} span{{ traceSummary.count === 1 ? '' : 's' }} · total
+                            {{ formatDuration(traceSummary.totalNanos) }}
                           </div>
                           <div v-if="enrichment" class="enrichment-summary mb-3">
                             <span
@@ -346,25 +331,7 @@ const {autoRefresh, loading, load, loadAfterCurrent} = useAutoRefresh(fetchTrace
                               ><code>{{ t }}</code></span
                             >
                           </div>
-                          <div class="waterfall">
-                            <div v-for="(s, i) in waterfall.spans" :key="s.spanId + '-' + i" class="waterfall-row">
-                              <div :title="s.name" class="waterfall-label">
-                                <span class="text-muted small">{{ s.serviceName || '—' }}</span>
-                                <div class="text-truncate">{{ s.name }}</div>
-                              </div>
-                              <div class="waterfall-track">
-                                <div
-                                  :class="spanColor(s)"
-                                  :style="{marginLeft: s.offsetPct + '%', width: s.widthPct + '%'}"
-                                  :title="formatDuration(s.durationNanos)"
-                                  class="waterfall-bar"
-                                ></div>
-                              </div>
-                              <div class="waterfall-duration small text-muted">
-                                {{ formatDuration(s.durationNanos) }}
-                              </div>
-                            </div>
-                          </div>
+                          <TraceWaterfall :spans="detail.spans" />
                         </template>
                         <div v-else class="text-muted">No spans in this trace.</div>
                       </div>
@@ -381,41 +348,6 @@ const {autoRefresh, loading, load, loadAfterCurrent} = useAutoRefresh(fetchTrace
 </template>
 
 <style scoped>
-.waterfall {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  overflow-x: auto;
-}
-
-.waterfall-row {
-  display: grid;
-  grid-template-columns: 220px minmax(220px, 1fr) 80px;
-  align-items: center;
-  gap: 8px;
-  min-width: 540px;
-}
-
-.waterfall-label {
-  overflow: hidden;
-}
-
-.waterfall-track {
-  position: relative;
-  height: 16px;
-  background: var(--bootui-border);
-  border-radius: var(--bootui-radius-xs);
-}
-
-.waterfall-bar {
-  height: 100%;
-  border-radius: var(--bootui-radius-xs);
-}
-
-.waterfall-duration {
-  text-align: right;
-}
-
 .trace-drawer {
   border: 1px solid var(--bootui-border);
 }
