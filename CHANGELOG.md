@@ -7,6 +7,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-14
+
+This release adds a low-footprint mode that pauses BootUI's recording and frees its memory, and makes the Database
+advisor's runtime check more accurate.
+
 ### Added
 
 - **Low-footprint mode** pauses BootUI's recording and frees its memory until switched off, through
