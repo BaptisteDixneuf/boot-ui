@@ -580,6 +580,7 @@ class BootUiReactiveAutoConfigurationTests {
                                                             io.github.jdubois.bootui.engine.safety.ApiTokenAuthenticator
                                                                     .class)
                                                     .token())
+                            .responseTimeout(Duration.ofSeconds(30))
                             .build();
                     client.get()
                             .uri("/bootui/api/architecture")
