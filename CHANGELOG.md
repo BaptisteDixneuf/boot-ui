@@ -7,22 +7,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Agent no longer hangs beside the OpenTelemetry agent** when claimed while another thread loads classes.
-
 ## [2.1.0] - 2026-10-14
 
-This release adds a low-footprint mode that pauses BootUI's recording and frees its memory, and makes the Database
-advisor's runtime check more accurate.
+This release redesigns the trace waterfall and request timeline, adds a low-footprint mode that pauses BootUI's
+recording and frees its memory, and fixes an agent hang beside the OpenTelemetry agent.
 
 ### Added
 
 - **Low-footprint mode** pauses BootUI's recording and frees its memory until switched off, through
   `POST /api/live-memory/footprint` ([Live Memory](docs/features/runtime.md#low-footprint-mode)).
 
+### Changed
+
+- **Trace waterfall and request timeline redesigned** as a parent/child span tree with a time ruler and a legend, in the
+  Traces panel and the Live Activity request profile ([Traces](docs/features/diagnostics.md#traces); #1464).
+
 ### Fixed
 
+- **Agent no longer hangs beside the OpenTelemetry agent** when claimed while another thread loads classes (#1465).
 - The Database advisor's `DB-RUNTIME-001` no longer counts executions that differ only in the length of a bound
   `IN (?, ?)` list as distinct texts, and `get_sql_traces` accepts the
   reported shape id as its `query`.
