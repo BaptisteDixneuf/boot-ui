@@ -2724,21 +2724,20 @@ final class HttpClientsShouldUseBootBuildersRule extends AbstractArchitectureRul
     }
 
     HttpClientsShouldUseBootBuildersRule(java.util.function.Predicate<String> classPresent) {
-        super(
-                new ArchitectureRuleDefinition(
-                        "ARCH-SPRING-025",
-                        "HTTP clients should be built from Spring Boot's auto-configured builder",
-                        ArchitectureCategory.SPRING_STEREOTYPES,
-                        "LOW",
-                        "Detects calls to RestClient.builder(..), RestClient.create(..), WebClient.builder(), or"
-                                + " WebClient.create(..) when Spring Boot's matching builder is available. Clients built"
-                                + " this way skip the context's message converters, the ObservationRegistry"
-                                + " (http.client.requests metrics and trace propagation), and every RestClientCustomizer"
-                                + " or WebClientCustomizer, so their calls are invisible to metrics, traces, and BootUI.",
-                        "Inject Spring Boot's RestClient.Builder or WebClient.Builder and build from it. The builder bean"
-                                + " is a prototype; call clone() before building several clients from one instance. To"
-                                + " start from Boot's defaults on a fresh builder, use RestClientBuilderConfigurer.",
-                        "https://docs.spring.io/spring-boot/reference/io/rest-client.html"));
+        super(new ArchitectureRuleDefinition(
+                "ARCH-SPRING-025",
+                "HTTP clients should be built from Spring Boot's auto-configured builder",
+                ArchitectureCategory.SPRING_STEREOTYPES,
+                "LOW",
+                "Detects calls to RestClient.builder(..), RestClient.create(..), WebClient.builder(), or"
+                        + " WebClient.create(..) when Spring Boot's matching builder is available. Clients built"
+                        + " this way skip the context's message converters, the ObservationRegistry"
+                        + " (http.client.requests metrics and trace propagation), and every RestClientCustomizer"
+                        + " or WebClientCustomizer, so their calls are invisible to metrics, traces, and BootUI.",
+                "Inject Spring Boot's RestClient.Builder or WebClient.Builder and build from it. The builder bean"
+                        + " is a prototype; call clone() before building several clients from one instance. To"
+                        + " start from Boot's defaults on a fresh builder, use RestClientBuilderConfigurer.",
+                "https://docs.spring.io/spring-boot/reference/io/rest-client.html"));
         this.classPresent = classPresent;
     }
 

@@ -110,7 +110,8 @@ class HttpClientsShouldUseBootBuildersRuleTests {
                 new AdvisorViolationCollector(100),
                 handwritten);
 
-        assertThat(evaluate(ArchitecturePlatform.SPRING, BOTH_MODULES, GeneratedApiClient.class).status())
+        assertThat(evaluate(ArchitecturePlatform.SPRING, BOTH_MODULES, GeneratedApiClient.class)
+                        .status())
                 .as("the same class is reported while it is not known to be generated")
                 .isEqualTo(ArchitectureRuleSupport.VIOLATION);
         assertThat(BOTH_MODULES.evaluate(context).status()).isEqualTo(ArchitectureRuleSupport.PASS);
